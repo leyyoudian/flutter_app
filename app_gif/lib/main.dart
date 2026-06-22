@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
@@ -79,6 +81,7 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
   String? _connectedAddress;
   SelectedMedia? _media;
   PreparedAsset? _asset;
+  CropTransform _cropTransform = const CropTransform();
 
   @override
   void initState() {
@@ -144,6 +147,16 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
           _uploadProgress = _readDouble(event['progress']);
           _status = (event['message'] as String?) ?? _status;
         });
+        break;
+      case 'videoPreviewReady':
+        final warmPreviewPath = _readNullableString(
+          event['animatedPreviewPath'],
+        );
+        if (event['uri'] == _media?.uri && _hasPreviewPath(warmPreviewPath)) {
+          setState(() {
+            _media = _media?.copyWith(animatedPreviewPath: warmPreviewPath);
+          });
+        }
         break;
     }
   }
@@ -226,26 +239,46 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
       if (!mounted || picked == null) {
         return;
       }
+      final media = SelectedMedia.fromMap(_asStringMap(picked));
       setState(() {
-        _media = SelectedMedia.fromMap(_asStringMap(picked));
+        _media = media;
         _asset = null;
+        _cropTransform = const CropTransform();
         _prepareProgress = 0;
+        _pageIndex = 2;
+        _status = '素材已导入';
       });
-      await _prepareSelectedMedia();
+      unawaited(_warmSelectedVideoPreview(media));
     } on PlatformException catch (error) {
       _showSnack(error.message ?? error.code);
     }
   }
 
-  Future<void> _prepareSelectedMedia() async {
+  Future<void> _warmSelectedVideoPreview(SelectedMedia media) async {
+    if (!_isVideoMime(media.mime) ||
+        _hasPreviewPath(media.animatedPreviewPath)) {
+      return;
+    }
+    try {
+      await _invokeNative<void>('warmVideoAnimatedPreview', {
+        'uri': media.uri,
+        'name': media.name,
+      });
+    } on PlatformException {
+      // Preview warmup is opportunistic; saving can still regenerate it.
+    }
+  }
+
+  Future<void> _saveMakerAsset() async {
     final media = _media;
     if (media == null) {
+      _showSnack('请先导入 GIF、图片或视频');
       return;
     }
     setState(() {
       _preparing = true;
       _prepareProgress = 0;
-      _status = '处理素材';
+      _status = '保存素材';
     });
     try {
       final prepared = await _invokeNative<Map<dynamic, dynamic>>(
@@ -253,27 +286,36 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
         {
           'uri': media.uri,
           'name': media.name,
-          'fps': 30,
+          'fps': 25,
           'maxPackageBytes': resolveBadgePackageBudget(
             sdAvailable: _sdAvailable,
           ),
+          'cropScale': _cropTransform.scale,
+          'cropOffsetX': _cropTransform.offset.dx,
+          'cropOffsetY': _cropTransform.offset.dy,
+          'warmPreviewPath': _isDefaultCrop ? media.animatedPreviewPath : null,
         },
       );
       if (!mounted || prepared == null) {
         return;
       }
-      final asset = PreparedAsset.fromMap(_asStringMap(prepared));
-      final entry = HistoryEntry.fromAsset(asset);
+      final rawAsset = PreparedAsset.fromMap(_asStringMap(prepared));
+      final asset = rawAsset.copyWith(cropTransform: _cropTransform);
+      final entry = HistoryEntry.fromAsset(
+        asset,
+        cropTransform: _cropTransform,
+      );
       setState(() {
         _asset = asset;
         _preparing = false;
         _prepareProgress = 1;
+        _pageIndex = 1;
         _history.removeWhere((item) => item.assetPath == asset.assetPath);
         _history.insert(0, entry);
         if (_history.length > 20) {
           _history.removeRange(20, _history.length);
         }
-        _status = '素材就绪';
+        _status = '已保存';
       });
       unawaited(_saveHistory());
     } on PlatformException catch (error) {
@@ -285,16 +327,12 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
     }
   }
 
-  Future<void> _uploadCurrentAsset() async {
-    final asset = _asset;
-    if (asset == null) {
-      _showSnack('请先导入 GIF、图片或视频');
+  Future<void> _uploadAsset(PreparedAsset asset) async {
+    if (!_connected) {
+      _showSnack('请先连接设备');
+      setState(() => _pageIndex = 0);
       return;
     }
-    await _uploadAsset(asset);
-  }
-
-  Future<void> _uploadAsset(PreparedAsset asset) async {
     setState(() {
       _uploading = true;
       _uploadProgress = 0;
@@ -346,6 +384,11 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
     }
   }
 
+  bool get _isDefaultCrop {
+    return (_cropTransform.scale - 1).abs() < 0.0001 &&
+        _cropTransform.offset.distance < 0.0001;
+  }
+
   Future<void> _uploadHistoryEntry(HistoryEntry entry) async {
     if (_preparing || _uploading) {
       return;
@@ -361,6 +404,9 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
       frameCount: entry.frameCount,
       fps: entry.fps,
       crc32: entry.crc32,
+      cropScale: entry.cropScale,
+      cropOffsetX: entry.cropOffsetX,
+      cropOffsetY: entry.cropOffsetY,
     );
     setState(() {
       _media = null;
@@ -380,6 +426,34 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
       _status = '已删除历史记录';
     });
     await _saveHistory();
+  }
+
+  Future<void> _confirmDeleteHistoryEntry(HistoryEntry entry) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xff151515),
+        title: const Text('删除素材'),
+        content: Text(entry.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await _deleteHistoryEntry(entry);
+    }
+  }
+
+  void _resetCrop() {
+    setState(() => _cropTransform = const CropTransform());
   }
 
   void _showSnack(String message) {
@@ -407,36 +481,44 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
   @override
   Widget build(BuildContext context) {
     final pages = [
-      _ConnectionPage(
+      _DevicePage(
         devices: _devices,
         scanning: _scanning,
         connecting: _connecting,
+        connected: _connected,
+        status: _status,
+        sdAvailable: _sdAvailable,
+        brightness: _brightness,
         connectedAddress: _connectedAddress,
         onScan: _scan,
         onConnect: _connect,
         onDisconnect: _disconnect,
+        onBrightness: _setBrightness,
       ),
-      _GifPage(
+      _DisplayLibraryPage(
+        active: _pageIndex == 1,
         connected: _connected,
         status: _status,
-        media: _media,
         asset: _asset,
         history: _history,
+        uploading: _uploading,
+        uploadProgress: _uploadProgress,
+        onHistoryTap: (entry) => unawaited(_uploadHistoryEntry(entry)),
+        onHistoryDelete: (entry) =>
+            unawaited(_confirmDeleteHistoryEntry(entry)),
+      ),
+      _MakerPage(
+        active: _pageIndex == 2,
+        media: _media,
+        asset: _asset,
+        cropTransform: _cropTransform,
         preparing: _preparing,
         uploading: _uploading,
         prepareProgress: _prepareProgress,
-        uploadProgress: _uploadProgress,
         onPick: _pickMedia,
-        onUpload: _uploadCurrentAsset,
-        onHistoryTap: (entry) => unawaited(_uploadHistoryEntry(entry)),
-        onHistoryDelete: (entry) => unawaited(_deleteHistoryEntry(entry)),
-      ),
-      _ControlPage(
-        connected: _connected,
-        status: _status,
-        brightness: _brightness,
-        onBrightness: _setBrightness,
-        onDisconnect: _disconnect,
+        onSave: _saveMakerAsset,
+        onCropChanged: (value) => setState(() => _cropTransform = value),
+        onResetCrop: _resetCrop,
       ),
     ];
 
@@ -468,17 +550,23 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
                 NavigationDestination(
                   icon: Icon(Icons.wifi_find),
                   selectedIcon: Icon(Icons.wifi, color: Colors.black),
-                  label: '连接',
+                  label: '设备',
                 ),
                 NavigationDestination(
-                  icon: Icon(Icons.perm_media_outlined),
-                  selectedIcon: Icon(Icons.perm_media, color: Colors.black),
-                  label: '素材',
+                  icon: Icon(Icons.grid_view_rounded),
+                  selectedIcon: Icon(
+                    Icons.grid_view_rounded,
+                    color: Colors.black,
+                  ),
+                  label: '主页',
                 ),
                 NavigationDestination(
-                  icon: Icon(Icons.tune),
-                  selectedIcon: Icon(Icons.tune, color: Colors.black),
-                  label: '控制',
+                  icon: Icon(Icons.add_photo_alternate_outlined),
+                  selectedIcon: Icon(
+                    Icons.add_photo_alternate,
+                    color: Colors.black,
+                  ),
+                  label: '制作',
                 ),
               ],
             ),
@@ -489,117 +577,221 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
   }
 }
 
-class _GifPage extends StatelessWidget {
-  const _GifPage({
+class _DisplayLibraryPage extends StatelessWidget {
+  const _DisplayLibraryPage({
+    required this.active,
     required this.connected,
     required this.status,
-    required this.media,
     required this.asset,
     required this.history,
-    required this.preparing,
     required this.uploading,
-    required this.prepareProgress,
     required this.uploadProgress,
-    required this.onPick,
-    required this.onUpload,
     required this.onHistoryTap,
     required this.onHistoryDelete,
   });
 
+  final bool active;
   final bool connected;
   final String status;
-  final SelectedMedia? media;
   final PreparedAsset? asset;
   final List<HistoryEntry> history;
-  final bool preparing;
   final bool uploading;
-  final double prepareProgress;
   final double uploadProgress;
-  final VoidCallback onPick;
-  final VoidCallback onUpload;
   final ValueChanged<HistoryEntry> onHistoryTap;
   final ValueChanged<HistoryEntry> onHistoryDelete;
 
   @override
   Widget build(BuildContext context) {
-    final assetInfo = asset == null
-        ? '480 x 480'
-        : '${asset!.frameCount} 帧  ${asset!.fps} fps  ${_formatBytes(asset!.packageSize)}';
-
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 14, 18, 104),
+    return Column(
       children: [
-        Row(
-          children: [
-            _ConnectionStatusText(
-              connected: connected,
-              text: connected ? '已连接' : '未连接',
-            ),
-            const Spacer(),
-            IconButton.filled(
-              tooltip: '导入',
-              onPressed: preparing || uploading ? null : onPick,
-              icon: const Icon(Icons.add_photo_alternate_outlined),
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        Center(
-          child: _PreviewDial(
-            media: media,
-            asset: asset,
-            preparing: preparing,
-            progress: prepareProgress,
-          ),
-        ),
-        const SizedBox(height: 22),
-        Text(
-          asset?.name ?? media?.name ?? 'ESP-BAJI',
-          textAlign: TextAlign.center,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0,
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          assetInfo,
-          textAlign: TextAlign.center,
-          style: TextStyle(color: Colors.white.withValues(alpha: 0.62)),
-        ),
-        const SizedBox(height: 22),
-        _GlassPanel(
+        Padding(
+          padding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
           child: Column(
             children: [
               Row(
                 children: [
+                  _ConnectionStatusText(
+                    connected: connected,
+                    text: connected ? status : '未连接',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              Center(
+                child: _PreviewDial(
+                  active: active,
+                  media: null,
+                  asset: asset,
+                  preparing: uploading,
+                  progress: uploadProgress,
+                ),
+              ),
+              const SizedBox(height: 16),
+              if (uploading) ...[
+                LinearProgressIndicator(
+                  value: _clamp01(uploadProgress),
+                  minHeight: 6,
+                  borderRadius: BorderRadius.circular(99),
+                ),
+                const SizedBox(height: 18),
+              ],
+            ],
+          ),
+        ),
+        Expanded(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  const Color(0xff171717).withValues(alpha: 0),
+                  const Color(0xff060606).withValues(alpha: 0.98),
+                  Colors.black,
+                ],
+                stops: const [0, 0.12, 1],
+              ),
+            ),
+            child: history.isEmpty
+                ? const Padding(
+                    padding: EdgeInsets.fromLTRB(18, 28, 18, 104),
+                    child: _EmptyHistory(),
+                  )
+                : GridView.builder(
+                    padding: const EdgeInsets.fromLTRB(18, 28, 18, 104),
+                    itemCount: history.length,
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3,
+                          mainAxisSpacing: 12,
+                          crossAxisSpacing: 12,
+                          childAspectRatio: 1,
+                        ),
+                    itemBuilder: (context, index) {
+                      final entry = history[index];
+                      return _HistoryGridTile(
+                        entry: entry,
+                        selected: asset?.assetPath == entry.assetPath,
+                        onTap: uploading ? null : () => onHistoryTap(entry),
+                        onLongPress: () => onHistoryDelete(entry),
+                      );
+                    },
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _MakerPage extends StatelessWidget {
+  const _MakerPage({
+    required this.active,
+    required this.media,
+    required this.asset,
+    required this.cropTransform,
+    required this.preparing,
+    required this.uploading,
+    required this.prepareProgress,
+    required this.onPick,
+    required this.onSave,
+    required this.onCropChanged,
+    required this.onResetCrop,
+  });
+
+  final bool active;
+  final SelectedMedia? media;
+  final PreparedAsset? asset;
+  final CropTransform cropTransform;
+  final bool preparing;
+  final bool uploading;
+  final double prepareProgress;
+  final VoidCallback onPick;
+  final VoidCallback onSave;
+  final ValueChanged<CropTransform> onCropChanged;
+  final VoidCallback onResetCrop;
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = preparing || uploading;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(18, 14, 18, 104),
+      children: [
+        _PageHeader(
+          title: '制作',
+          trailing: IconButton.filled(
+            tooltip: '导入',
+            onPressed: disabled ? null : onPick,
+            icon: const Icon(Icons.file_open_outlined),
+          ),
+        ),
+        const SizedBox(height: 22),
+        Center(
+          child: _CropPreview(
+            active: active && !preparing,
+            media: media,
+            asset: asset,
+            transform: cropTransform,
+            preparing: preparing,
+            progress: prepareProgress,
+            onChanged: disabled ? null : onCropChanged,
+          ),
+        ),
+        const SizedBox(height: 24),
+        _GlassPanel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.zoom_in_map),
+                  const SizedBox(width: 10),
+                  Text('${cropTransform.scale.toStringAsFixed(2)}x'),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: '重置',
+                    onPressed: disabled ? null : onResetCrop,
+                    icon: const Icon(Icons.refresh),
+                  ),
+                ],
+              ),
+              Slider(
+                value: cropTransform.scale,
+                min: 1,
+                max: 4,
+                divisions: 30,
+                onChanged: disabled
+                    ? null
+                    : (value) =>
+                          onCropChanged(cropTransform.copyWith(scale: value)),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: preparing || uploading ? null : onPick,
+                      onPressed: disabled ? null : onPick,
                       icon: const Icon(Icons.file_open_outlined),
-                      label: const Text('导入'),
+                      label: const Text('导入素材'),
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: preparing || uploading || asset == null
-                          ? null
-                          : onUpload,
-                      icon: const Icon(Icons.upload_rounded),
-                      label: Text(uploading ? '上传中' : '上传'),
+                      onPressed: disabled || media == null ? null : onSave,
+                      icon: const Icon(Icons.save_alt),
+                      label: Text(preparing ? '保存中' : '保存'),
                     ),
                   ),
                 ],
               ),
-              if (preparing || uploading) ...[
+              if (preparing) ...[
                 const SizedBox(height: 16),
                 LinearProgressIndicator(
-                  value: preparing
-                      ? _clamp01(prepareProgress)
-                      : _clamp01(uploadProgress),
+                  value: prepareProgress == 0
+                      ? null
+                      : _clamp01(prepareProgress),
                   minHeight: 6,
                   borderRadius: BorderRadius.circular(99),
                 ),
@@ -607,79 +799,47 @@ class _GifPage extends StatelessWidget {
             ],
           ),
         ),
-        const SizedBox(height: 18),
-        Text(
-          '历史导入',
-          style: Theme.of(
-            context,
-          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-        ),
-        const SizedBox(height: 10),
-        if (history.isEmpty)
-          const _EmptyHistory()
-        else
-          ...history.map(
-            (entry) => Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: Dismissible(
-                key: ValueKey(entry.assetPath),
-                direction: DismissDirection.endToStart,
-                background: const SizedBox.shrink(),
-                secondaryBackground: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: const Color(0xffff5b5b).withValues(alpha: 0.9),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: const Align(
-                    alignment: Alignment.centerRight,
-                    child: Padding(
-                      padding: EdgeInsets.only(right: 18),
-                      child: Icon(Icons.delete_outline, color: Colors.white),
-                    ),
-                  ),
-                ),
-                onDismissed: (_) => onHistoryDelete(entry),
-                child: _HistoryTile(
-                  entry: entry,
-                  onTap: () => onHistoryTap(entry),
-                  onLongPress: () => onHistoryDelete(entry),
-                ),
-              ),
-            ),
-          ),
       ],
     );
   }
 }
 
-class _ConnectionPage extends StatelessWidget {
-  const _ConnectionPage({
+class _DevicePage extends StatelessWidget {
+  const _DevicePage({
     required this.devices,
     required this.scanning,
     required this.connecting,
+    required this.connected,
+    required this.status,
+    required this.sdAvailable,
+    required this.brightness,
     required this.connectedAddress,
     required this.onScan,
     required this.onConnect,
     required this.onDisconnect,
+    required this.onBrightness,
   });
 
   final List<BadgeDevice> devices;
   final bool scanning;
   final bool connecting;
+  final bool connected;
+  final String status;
+  final bool sdAvailable;
+  final int brightness;
   final String? connectedAddress;
   final VoidCallback onScan;
   final ValueChanged<BadgeDevice> onConnect;
   final VoidCallback onDisconnect;
+  final ValueChanged<int> onBrightness;
 
   @override
   Widget build(BuildContext context) {
-    final connected = connectedAddress != null;
-
     return ListView(
       padding: const EdgeInsets.fromLTRB(18, 14, 18, 104),
       children: [
         _PageHeader(
-          title: '设备连接',
+          title: '设备',
           trailing: IconButton.filled(
             tooltip: '扫描',
             onPressed: scanning ? null : onScan,
@@ -693,46 +853,87 @@ class _ConnectionPage extends StatelessWidget {
         ),
         const SizedBox(height: 18),
         _GlassPanel(
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(
-                connected ? Icons.wifi : Icons.wifi_off,
-                color: _connectionColor(connected),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      connected ? '已连接' : '未连接',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: _connectionColor(connected),
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    if (connectedAddress != null) ...[
-                      const SizedBox(height: 3),
-                      Text(
-                        connectedAddress!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.56),
+              Row(
+                children: [
+                  Icon(
+                    connected ? Icons.wifi : Icons.wifi_off,
+                    color: _connectionColor(connected),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          connected ? status : '未连接',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: _connectionColor(connected),
+                            fontWeight: FontWeight.w800,
+                          ),
                         ),
-                      ),
-                    ],
-                  ],
-                ),
+                        if (connectedAddress != null) ...[
+                          const SizedBox(height: 3),
+                          Text(
+                            connectedAddress!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.56),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  if (connected)
+                    IconButton(
+                      tooltip: '断开',
+                      onPressed: onDisconnect,
+                      icon: const Icon(Icons.link_off),
+                    ),
+                ],
               ),
-              if (connectedAddress != null)
-                IconButton(
-                  tooltip: '断开',
-                  onPressed: onDisconnect,
-                  icon: const Icon(Icons.link_off),
-                ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Icon(
+                    sdAvailable ? Icons.sd_card : Icons.sd_card_alert,
+                    size: 20,
+                    color: sdAvailable
+                        ? const Color(0xff32d583)
+                        : Colors.white.withValues(alpha: 0.54),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    sdAvailable ? 'TF 卡可用' : 'TF 卡未确认',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.72),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  const Icon(Icons.brightness_6_outlined),
+                  const SizedBox(width: 10),
+                  Text('$brightness%'),
+                ],
+              ),
+              Slider(
+                value: brightness.toDouble(),
+                min: 0,
+                max: 100,
+                divisions: 20,
+                onChanged: connected
+                    ? (value) => onBrightness(value.round())
+                    : null,
+              ),
             ],
           ),
         ),
@@ -740,10 +941,10 @@ class _ConnectionPage extends StatelessWidget {
         if (devices.isEmpty)
           _GlassPanel(
             child: SizedBox(
-              height: 180,
+              height: 170,
               child: Center(
                 child: Text(
-                  scanning ? '扫描中' : '未发现 ESP-BAJI',
+                  scanning ? '扫描中' : '未发现设备',
                   style: TextStyle(color: Colors.white.withValues(alpha: 0.62)),
                 ),
               ),
@@ -784,91 +985,353 @@ class _ConnectionPage extends StatelessWidget {
   }
 }
 
-class _ControlPage extends StatelessWidget {
-  const _ControlPage({
-    required this.connected,
-    required this.status,
-    required this.brightness,
-    required this.onBrightness,
-    required this.onDisconnect,
+class _HistoryGridTile extends StatelessWidget {
+  const _HistoryGridTile({
+    required this.entry,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
   });
 
-  final bool connected;
-  final String status;
-  final int brightness;
-  final ValueChanged<int> onBrightness;
-  final VoidCallback onDisconnect;
+  final HistoryEntry entry;
+  final bool selected;
+  final VoidCallback? onTap;
+  final VoidCallback onLongPress;
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 14, 18, 104),
-      children: [
-        const _PageHeader(title: '设备控制'),
-        const SizedBox(height: 18),
-        _GlassPanel(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Icon(
-                    connected ? Icons.power_settings_new : Icons.power_off,
-                    color: _connectionColor(connected),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      connected ? status : '未连接',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: _connectionColor(connected),
-                        fontWeight: FontWeight.w800,
-                      ),
+    final previewPath = entry.previewPath ?? entry.animatedPreviewPath;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+        child: Material(
+          color: Colors.black,
+          child: InkWell(
+            onTap: onTap,
+            onLongPress: onLongPress,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: selected ? Colors.white : Colors.transparent,
+                  width: selected ? 1.5 : 1,
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(8),
+                child: ClipOval(
+                  child: SizedBox.expand(
+                    child: _HistoryPreview(
+                      entry: entry,
+                      previewPath: previewPath,
+                      transform: entry.cropTransform,
                     ),
                   ),
-                ],
+                ),
               ),
-              const SizedBox(height: 22),
-              Row(
-                children: [
-                  const Icon(Icons.brightness_6_outlined),
-                  const SizedBox(width: 10),
-                  Text('$brightness%'),
-                ],
-              ),
-              Slider(
-                value: brightness.toDouble(),
-                min: 0,
-                max: 100,
-                divisions: 20,
-                onChanged: connected
-                    ? (value) => onBrightness(value.round())
-                    : null,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CropPreview extends StatefulWidget {
+  const _CropPreview({
+    required this.active,
+    required this.media,
+    required this.asset,
+    required this.transform,
+    required this.preparing,
+    required this.progress,
+    required this.onChanged,
+  });
+
+  final bool active;
+  final SelectedMedia? media;
+  final PreparedAsset? asset;
+  final CropTransform transform;
+  final bool preparing;
+  final double progress;
+  final ValueChanged<CropTransform>? onChanged;
+
+  @override
+  State<_CropPreview> createState() => _CropPreviewState();
+}
+
+class _CropPreviewState extends State<_CropPreview> {
+  CropTransform _startTransform = const CropTransform();
+  final Map<int, Offset> _activePointers = {};
+  Offset _startFocalPoint = Offset.zero;
+  double _startPointerDistance = 1;
+  double _previewSize = 284;
+
+  @override
+  void dispose() {
+    _activePointers.clear();
+    super.dispose();
+  }
+
+  void _beginPointerTransform() {
+    _startTransform = widget.transform;
+    _startFocalPoint = _currentFocalPoint();
+    _startPointerDistance = _currentPointerDistance();
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    final onChanged = widget.onChanged;
+    if (onChanged == null) {
+      return;
+    }
+    _activePointers[event.pointer] = event.localPosition;
+    _beginPointerTransform();
+  }
+
+  void _handlePointerMove(PointerMoveEvent event) {
+    final onChanged = widget.onChanged;
+    if (onChanged == null || !_activePointers.containsKey(event.pointer)) {
+      return;
+    }
+    _activePointers[event.pointer] = event.localPosition;
+    final focalPoint = _currentFocalPoint();
+    final scaleDelta = _currentPointerDistance() / _startPointerDistance;
+    final nextScale = (_startTransform.scale * scaleDelta)
+        .clamp(1.0, 4.0)
+        .toDouble();
+    final delta = focalPoint - _startFocalPoint;
+    final nextOffset =
+        _startTransform.offset +
+        Offset(delta.dx / _previewSize, delta.dy / _previewSize);
+    onChanged(_startTransform.copyWith(scale: nextScale, offset: nextOffset));
+  }
+
+  void _handlePointerUp(PointerEvent event) {
+    if (_activePointers.remove(event.pointer) != null &&
+        _activePointers.isNotEmpty) {
+      _beginPointerTransform();
+    }
+  }
+
+  Offset _currentFocalPoint() {
+    if (_activePointers.isEmpty) {
+      return Offset.zero;
+    }
+    var dx = 0.0;
+    var dy = 0.0;
+    for (final point in _activePointers.values) {
+      dx += point.dx;
+      dy += point.dy;
+    }
+    return Offset(dx / _activePointers.length, dy / _activePointers.length);
+  }
+
+  double _currentPointerDistance() {
+    if (_activePointers.length < 2) {
+      return 1;
+    }
+    final points = _activePointers.values.take(2).toList(growable: false);
+    return (points[0] - points[1]).distance.clamp(1.0, double.infinity);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _previewSize = math
+            .min(
+              284,
+              constraints.maxWidth.isFinite ? constraints.maxWidth : 284,
+            )
+            .toDouble();
+        return Container(
+          width: _previewSize,
+          height: _previewSize,
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                Colors.white.withValues(alpha: 0.18),
+                Colors.white.withValues(alpha: 0.03),
+              ],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.white.withValues(alpha: 0.08),
+                blurRadius: 36,
+                spreadRadius: 2,
               ),
             ],
           ),
-        ),
-        const SizedBox(height: 14),
-        FilledButton.icon(
-          onPressed: connected ? onDisconnect : null,
-          icon: const Icon(Icons.link_off),
-          label: const Text('断开连接'),
-        ),
-      ],
+          child: RawGestureDetector(
+            gestures: widget.onChanged == null
+                ? const <Type, GestureRecognizerFactory>{}
+                : <Type, GestureRecognizerFactory>{
+                    EagerGestureRecognizer:
+                        GestureRecognizerFactoryWithHandlers<
+                          EagerGestureRecognizer
+                        >(() => EagerGestureRecognizer(), (recognizer) {}),
+                  },
+            child: ClipOval(
+              child: Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: _handlePointerDown,
+                onPointerMove: _handlePointerMove,
+                onPointerUp: _handlePointerUp,
+                onPointerCancel: _handlePointerUp,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    DecoratedBox(
+                      decoration: const BoxDecoration(color: Colors.black),
+                    ),
+                    _TransformedPreviewMedia(
+                      active: widget.active,
+                      media: widget.media,
+                      asset: widget.asset,
+                      transform: widget.transform,
+                    ),
+                    if (widget.media == null &&
+                        widget.asset == null &&
+                        !widget.preparing)
+                      const Center(
+                        child: Icon(
+                          Icons.add_photo_alternate_outlined,
+                          size: 72,
+                          color: Colors.white,
+                        ),
+                      ),
+                    if (widget.preparing)
+                      ColoredBox(
+                        color: Colors.black54,
+                        child: Center(
+                          child: SizedBox(
+                            width: 88,
+                            height: 88,
+                            child: CircularProgressIndicator(
+                              value: widget.progress == 0
+                                  ? null
+                                  : _clamp01(widget.progress),
+                              strokeWidth: 6,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _TransformedPreviewMedia extends StatelessWidget {
+  const _TransformedPreviewMedia({
+    required this.active,
+    required this.media,
+    required this.asset,
+    required this.transform,
+  });
+
+  final bool active;
+  final SelectedMedia? media;
+  final PreparedAsset? asset;
+  final CropTransform transform;
+
+  @override
+  Widget build(BuildContext context) {
+    final child = _previewChild();
+    if (child == null) {
+      return const SizedBox.expand();
+    }
+    return _CropTransformView(transform: transform, child: child);
+  }
+
+  Widget? _previewChild() {
+    final selected = media;
+    if (selected != null && _isVideoMime(selected.mime)) {
+      return _VideoPreview(
+        key: ValueKey('maker-video-${selected.uri}'),
+        uri: selected.uri,
+        active: active,
+      );
+    }
+    if (_hasPreviewPath(selected?.animatedPreviewPath)) {
+      return Image.file(
+        File(selected!.animatedPreviewPath!),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      );
+    }
+    if (selected?.previewBytes != null) {
+      return Image.memory(
+        selected!.previewBytes!,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      );
+    }
+    if (_hasPreviewPath(asset?.animatedPreviewPath)) {
+      return Image.file(
+        File(asset!.animatedPreviewPath!),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      );
+    }
+    if (_hasPreviewPath(asset?.previewPath)) {
+      return Image.file(
+        File(asset!.previewPath!),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      );
+    }
+    return null;
+  }
+}
+
+class _CropTransformView extends StatelessWidget {
+  const _CropTransformView({required this.transform, required this.child});
+
+  final CropTransform transform;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = math.min(
+          constraints.maxWidth.isFinite ? constraints.maxWidth : 0,
+          constraints.maxHeight.isFinite ? constraints.maxHeight : 0,
+        );
+        return Transform.translate(
+          offset: Offset(
+            transform.offset.dx * size,
+            transform.offset.dy * size,
+          ),
+          child: Transform.scale(scale: transform.scale, child: child),
+        );
+      },
     );
   }
 }
 
 class _PreviewDial extends StatelessWidget {
   const _PreviewDial({
+    required this.active,
     required this.media,
     required this.asset,
     required this.preparing,
     required this.progress,
   });
 
+  final bool active;
   final SelectedMedia? media;
   final PreparedAsset? asset;
   final bool preparing;
@@ -876,6 +1339,8 @@ class _PreviewDial extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final transform = asset?.cropTransform ?? const CropTransform();
+
     return Container(
       width: 284,
       height: 284,
@@ -903,15 +1368,30 @@ class _PreviewDial extends StatelessWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: RadialGradient(
-                  colors: [Colors.white.withValues(alpha: 0.18), Colors.black],
-                ),
-              ),
-            ),
+            DecoratedBox(decoration: const BoxDecoration(color: Colors.black)),
             if (media != null && _isVideoMime(media!.mime))
-              _VideoPreview(uri: media!.uri)
+              _VideoPreview(
+                key: ValueKey('dial-media-video-${media!.uri}'),
+                uri: media!.uri,
+                active: active,
+              )
+            else if (asset != null &&
+                _isVideoMime(asset!.mime) &&
+                asset!.sourceUri != null)
+              _CropTransformView(
+                transform: transform,
+                child: _VideoPreview(
+                  key: ValueKey('dial-asset-video-${asset!.sourceUri}'),
+                  uri: asset!.sourceUri!,
+                  active: active,
+                ),
+              )
+            else if (media?.previewBytes != null)
+              Image.memory(
+                media!.previewBytes!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+              )
             else if (_hasPreviewPath(media?.animatedPreviewPath))
               Image.file(
                 File(media!.animatedPreviewPath!),
@@ -919,16 +1399,13 @@ class _PreviewDial extends StatelessWidget {
                 gaplessPlayback: true,
               )
             else if (_hasPreviewPath(asset?.animatedPreviewPath))
-              Image.file(
-                File(asset!.animatedPreviewPath!),
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-              )
-            else if (media?.previewBytes != null)
-              Image.memory(
-                media!.previewBytes!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
+              _CropTransformView(
+                transform: transform,
+                child: Image.file(
+                  File(asset!.animatedPreviewPath!),
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                ),
               )
             else if (_hasPreviewPath(asset?.previewPath))
               Image.file(
@@ -966,9 +1443,10 @@ class _PreviewDial extends StatelessWidget {
 }
 
 class _VideoPreview extends StatefulWidget {
-  const _VideoPreview({required this.uri});
+  const _VideoPreview({super.key, required this.uri, required this.active});
 
   final String uri;
+  final bool active;
 
   @override
   State<_VideoPreview> createState() => _VideoPreviewState();
@@ -992,6 +1470,8 @@ class _VideoPreviewState extends State<_VideoPreview> {
       _controller = null;
       _ready = false;
       _open();
+    } else if (oldWidget.active != widget.active) {
+      unawaited(_syncPlayback());
     }
   }
 
@@ -1005,7 +1485,7 @@ class _VideoPreviewState extends State<_VideoPreview> {
       await controller.initialize();
       await controller.setLooping(true);
       await controller.setVolume(0);
-      await controller.play();
+      await _syncPlayback(controller);
       if (mounted && identical(_controller, controller)) {
         setState(() => _ready = true);
       }
@@ -1018,6 +1498,37 @@ class _VideoPreviewState extends State<_VideoPreview> {
         });
       }
     }
+  }
+
+  Future<void> _syncPlayback([VideoPlayerController? pendingController]) async {
+    final controller = pendingController ?? _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    try {
+      if (widget.active) {
+        await controller.play();
+      } else {
+        await controller.pause();
+      }
+    } catch (_) {
+      // Preview playback is best-effort; native codecs may reject stale handles.
+    }
+  }
+
+  @override
+  void deactivate() {
+    final controller = _controller;
+    if (controller != null && controller.value.isInitialized) {
+      unawaited(controller.pause());
+    }
+    super.deactivate();
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    unawaited(_syncPlayback());
   }
 
   @override
@@ -1120,84 +1631,42 @@ class _PageHeader extends StatelessWidget {
   }
 }
 
-class _HistoryTile extends StatelessWidget {
-  const _HistoryTile({
+class _HistoryPreview extends StatelessWidget {
+  const _HistoryPreview({
     required this.entry,
-    required this.onTap,
-    required this.onLongPress,
+    required this.previewPath,
+    required this.transform,
   });
 
   final HistoryEntry entry;
-  final VoidCallback onTap;
-  final VoidCallback onLongPress;
-
-  @override
-  Widget build(BuildContext context) {
-    final previewPath = entry.animatedPreviewPath ?? entry.previewPath;
-
-    return _GlassPanel(
-      child: InkWell(
-        onTap: onTap,
-        onLongPress: onLongPress,
-        borderRadius: BorderRadius.circular(18),
-        child: Row(
-          children: [
-            ClipOval(
-              child: SizedBox.square(
-                dimension: 44,
-                child: _HistoryPreview(entry: entry, previewPath: previewPath),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    entry.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '${entry.frameCount} 帧  ${entry.fps} fps  ${_formatBytes(entry.packageSize)}',
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.58),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const Icon(Icons.chevron_right),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _HistoryPreview extends StatelessWidget {
-  const _HistoryPreview({required this.entry, required this.previewPath});
-
-  final HistoryEntry entry;
   final String? previewPath;
+  final CropTransform transform;
 
   @override
   Widget build(BuildContext context) {
-    if (_isVideoMime(entry.mime) && entry.sourceUri != null) {
-      return _VideoPreview(uri: entry.sourceUri!);
-    }
-    if (_hasPreviewPath(previewPath)) {
-      return Image.file(
+    Widget? child;
+    if (_hasPreviewPath(entry.animatedPreviewPath)) {
+      child = Image.file(
+        File(entry.animatedPreviewPath!),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      );
+    } else if (_hasPreviewPath(previewPath)) {
+      child = Image.file(
         File(previewPath!),
         fit: BoxFit.cover,
         gaplessPlayback: true,
       );
     }
-    return const ColoredBox(
-      color: Colors.white,
-      child: Icon(Icons.image, color: Colors.black),
-    );
+
+    if (child == null) {
+      return const ColoredBox(
+        color: Colors.black,
+        child: Icon(Icons.image, color: Colors.white),
+      );
+    }
+
+    return _CropTransformView(transform: transform, child: child);
   }
 }
 
@@ -1290,6 +1759,17 @@ class SelectedMedia {
   final String mime;
   final Uint8List? previewBytes;
   final String? animatedPreviewPath;
+
+  SelectedMedia copyWith({String? animatedPreviewPath}) {
+    return SelectedMedia(
+      uri: uri,
+      name: name,
+      size: size,
+      mime: mime,
+      previewBytes: previewBytes,
+      animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
+    );
+  }
 }
 
 class PreparedAsset {
@@ -1304,6 +1784,9 @@ class PreparedAsset {
     required this.frameCount,
     required this.fps,
     required this.crc32,
+    this.cropScale = 1,
+    this.cropOffsetX = 0,
+    this.cropOffsetY = 0,
   });
 
   factory PreparedAsset.fromMap(Map<String, dynamic> map) {
@@ -1318,6 +1801,9 @@ class PreparedAsset {
       frameCount: (map['frameCount'] as num?)?.toInt() ?? 1,
       fps: (map['fps'] as num?)?.toInt() ?? 1,
       crc32: (map['crc32'] as num?)?.toInt() ?? 0,
+      cropScale: (map['cropScale'] as num?)?.toDouble() ?? 1,
+      cropOffsetX: (map['cropOffsetX'] as num?)?.toDouble() ?? 0,
+      cropOffsetY: (map['cropOffsetY'] as num?)?.toDouble() ?? 0,
     );
   }
 
@@ -1331,6 +1817,48 @@ class PreparedAsset {
   final int frameCount;
   final int fps;
   final int crc32;
+  final double cropScale;
+  final double cropOffsetX;
+  final double cropOffsetY;
+
+  PreparedAsset copyWith({CropTransform? cropTransform}) {
+    return PreparedAsset(
+      assetPath: assetPath,
+      previewPath: previewPath,
+      animatedPreviewPath: animatedPreviewPath,
+      sourceUri: sourceUri,
+      mime: mime,
+      name: name,
+      packageSize: packageSize,
+      frameCount: frameCount,
+      fps: fps,
+      crc32: crc32,
+      cropScale: cropTransform?.scale ?? cropScale,
+      cropOffsetX: cropTransform?.offset.dx ?? cropOffsetX,
+      cropOffsetY: cropTransform?.offset.dy ?? cropOffsetY,
+    );
+  }
+
+  CropTransform get cropTransform {
+    return CropTransform(
+      scale: cropScale,
+      offset: Offset(cropOffsetX, cropOffsetY),
+    );
+  }
+}
+
+class CropTransform {
+  const CropTransform({this.scale = 1, this.offset = Offset.zero});
+
+  final double scale;
+  final Offset offset;
+
+  CropTransform copyWith({double? scale, Offset? offset}) {
+    return CropTransform(
+      scale: (scale ?? this.scale).clamp(1.0, 4.0).toDouble(),
+      offset: _clampCropOffset(offset ?? this.offset),
+    );
+  }
 }
 
 class HistoryEntry {
@@ -1346,9 +1874,15 @@ class HistoryEntry {
     required this.fps,
     required this.crc32,
     required this.createdAt,
+    required this.cropScale,
+    required this.cropOffsetX,
+    required this.cropOffsetY,
   });
 
-  factory HistoryEntry.fromAsset(PreparedAsset asset) {
+  factory HistoryEntry.fromAsset(
+    PreparedAsset asset, {
+    CropTransform cropTransform = const CropTransform(),
+  }) {
     return HistoryEntry(
       assetPath: asset.assetPath,
       previewPath: asset.previewPath,
@@ -1361,6 +1895,9 @@ class HistoryEntry {
       fps: asset.fps,
       crc32: asset.crc32,
       createdAt: DateTime.now().millisecondsSinceEpoch,
+      cropScale: cropTransform.scale,
+      cropOffsetX: cropTransform.offset.dx,
+      cropOffsetY: cropTransform.offset.dy,
     );
   }
 
@@ -1377,6 +1914,9 @@ class HistoryEntry {
       fps: (map['fps'] as num?)?.toInt() ?? 1,
       crc32: (map['crc32'] as num?)?.toInt() ?? 0,
       createdAt: (map['createdAt'] as num?)?.toInt() ?? 0,
+      cropScale: (map['cropScale'] as num?)?.toDouble() ?? 1,
+      cropOffsetX: (map['cropOffsetX'] as num?)?.toDouble() ?? 0,
+      cropOffsetY: (map['cropOffsetY'] as num?)?.toDouble() ?? 0,
     );
   }
 
@@ -1393,6 +1933,9 @@ class HistoryEntry {
       'fps': fps,
       'crc32': crc32,
       'createdAt': createdAt,
+      'cropScale': cropScale,
+      'cropOffsetX': cropOffsetX,
+      'cropOffsetY': cropOffsetY,
     };
   }
 
@@ -1407,6 +1950,16 @@ class HistoryEntry {
   final int fps;
   final int crc32;
   final int createdAt;
+  final double cropScale;
+  final double cropOffsetX;
+  final double cropOffsetY;
+
+  CropTransform get cropTransform {
+    return CropTransform(
+      scale: cropScale,
+      offset: Offset(cropOffsetX, cropOffsetY),
+    );
+  }
 }
 
 Map<String, dynamic> _asStringMap(Object? value) {
@@ -1424,6 +1977,13 @@ double _readDouble(Object? value) {
 }
 
 double _clamp01(double value) => value.clamp(0.0, 1.0).toDouble();
+
+Offset _clampCropOffset(Offset value) {
+  return Offset(
+    value.dx.clamp(-1.5, 1.5).toDouble(),
+    value.dy.clamp(-1.5, 1.5).toDouble(),
+  );
+}
 
 int resolveBadgePackageBudget({required bool sdAvailable}) {
   const legacyFlashBudget = 10 * 1024 * 1024;
@@ -1445,13 +2005,3 @@ String? _readNullableString(Object? value) {
 bool _hasPreviewPath(String? path) => path != null && path.isNotEmpty;
 
 bool _isVideoMime(String mime) => mime.toLowerCase().startsWith('video/');
-
-String _formatBytes(int bytes) {
-  if (bytes >= 1024 * 1024) {
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
-  }
-  if (bytes >= 1024) {
-    return '${(bytes / 1024).toStringAsFixed(1)} KB';
-  }
-  return '$bytes B';
-}

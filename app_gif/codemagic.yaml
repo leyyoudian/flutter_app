@@ -3,6 +3,7 @@ workflows:
     name: iOS Debug Build
     instance_type: mac_mini_m2
     max_build_duration: 120
+    working_directory: app_gif
     environment:
       flutter: stable
       xcode: latest
