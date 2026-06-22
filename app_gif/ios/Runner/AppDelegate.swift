@@ -509,7 +509,7 @@ import UIKit
       bitsPerComponent: 8,
       bytesPerRow: width * 4,
       space: colorSpace,
-      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
     )!
     context.setFillColor(UIColor.black.cgColor)
     context.fill(CGRect(x: 0, y: 0, width: width, height: height))
@@ -517,7 +517,7 @@ import UIKit
     let drawWidth = Double(source.width) * scale
     let drawHeight = Double(source.height) * scale
     let dx = (Double(width) - drawWidth) / 2.0 + crop.offsetX * Double(width)
-    let dy = (Double(height) - drawHeight) / 2.0 - crop.offsetY * Double(height)
+    let dy = (Double(height) - drawHeight) / 2.0 + crop.offsetY * Double(height)
     context.interpolationQuality = .high
     context.draw(source, in: CGRect(x: dx, y: dy, width: drawWidth, height: drawHeight))
     return context.makeImage()!
@@ -543,7 +543,7 @@ import UIKit
         bitsPerComponent: 8,
         bytesPerRow: width * 4,
         space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
       )!
       context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
     }
@@ -583,7 +583,7 @@ import UIKit
     CGImageDestinationSetProperties(destination, [
       kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0],
     ] as CFDictionary)
-    let palette = rgb332GifPalette()
+    let palette = rgb332Palette()
     for frame in frames {
       let image = indexedImage(indexes: [UInt8](frame), width: width, height: height, palette: palette)
       CGImageDestinationAddImage(
@@ -616,7 +616,9 @@ import UIKit
       bitsPerPixel: 32,
       bytesPerRow: width * 4,
       space: CGColorSpaceCreateDeviceRGB(),
-      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+      bitmapInfo: CGBitmapInfo.byteOrder32Big.union(
+        CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+      ),
       provider: provider,
       decode: nil,
       shouldInterpolate: false,
@@ -1081,7 +1083,7 @@ private func renderStaticImage(_ image: CGImage, streamSize: Int, crop: CropTran
     bitsPerComponent: 8,
     bytesPerRow: streamSize * 4,
     space: colorSpace,
-    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
   )!
   context.setFillColor(UIColor.black.cgColor)
   context.fill(CGRect(x: 0, y: 0, width: streamSize, height: streamSize))
@@ -1089,7 +1091,7 @@ private func renderStaticImage(_ image: CGImage, streamSize: Int, crop: CropTran
   let drawWidth = Double(image.width) * scale
   let drawHeight = Double(image.height) * scale
   let dx = (Double(streamSize) - drawWidth) / 2.0 + crop.offsetX * Double(streamSize)
-  let dy = (Double(streamSize) - drawHeight) / 2.0 - crop.offsetY * Double(streamSize)
+  let dy = (Double(streamSize) - drawHeight) / 2.0 + crop.offsetY * Double(streamSize)
   context.interpolationQuality = .high
   context.draw(image, in: CGRect(x: dx, y: dy, width: drawWidth, height: drawHeight))
   return context.makeImage()!
@@ -1107,7 +1109,7 @@ private func quantizeRenderedImage(_ image: CGImage) -> [UInt8] {
       bitsPerComponent: 8,
       bytesPerRow: width * 4,
       space: CGColorSpaceCreateDeviceRGB(),
-      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
     )!
     context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
   }
