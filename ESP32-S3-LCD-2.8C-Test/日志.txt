@@ -1,0 +1,249 @@
+原来的板子+代码+换一块2.5寸的lcd屏幕接口引脚都是一样的但是这个屏幕不显示ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x1 (POWERON),boot:0xb (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2810,len:0x1564
+load:0x403c8700,len:0x4
+load:0x403c8704,len:0xd24
+load:0x403cb700,len:0x2ed4
+entry 0x403c8928
+I (27) boot: ESP-IDF v5.4.2-dirty 2nd stage bootloader
+I (27) boot: compile time Jun 18 2026 12:25:11
+I (27) boot: Multicore bootloader
+I (28) boot: chip revision: v0.2
+I (30) boot: efuse block revision: v1.4
+I (34) boot.esp32s3: Boot SPI Speed : 80MHz
+I (38) boot.esp32s3: SPI Mode       : DIO
+I (42) boot.esp32s3: SPI Flash Size : 16MB
+I (45) boot: Enabling RNG early entropy source...
+I (50) boot: Partition Table:
+I (52) boot: ## Label            Usage          Type ST Offset   Length
+I (59) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (65) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (72) boot:  2 factory          factory app      00 00 00010000 00300000
+I (78) boot:  3 asset            Unknown data     01 40 00310000 00a00000
+I (85) boot:  4 reserved         Unknown data     01 42 00d10000 00080000
+I (91) boot: End of partition table
+I (95) esp_image: segment 0: paddr=00010020 vaddr=3c0b0020 size=22dc0h (142784) map
+I (127) esp_image: segment 1: paddr=00032de8 vaddr=3fc9d700 size=05440h ( 21568) load
+I (132) esp_image: segment 2: paddr=00038230 vaddr=40374000 size=07de8h ( 32232) load
+I (139) esp_image: segment 3: paddr=00040020 vaddr=42000020 size=a6ab0h (682672) map
+I (260) esp_image: segment 4: paddr=000e6ad8 vaddr=4037bde8 size=11858h ( 71768) load
+I (276) esp_image: segment 5: paddr=000f8338 vaddr=600fe000 size=0001ch (    28) load
+I (286) boot: Loaded app from partition at offset 0x10000
+I (286) boot: Disabling RNG early entropy source...
+I (296) octal_psram: vendor id    : 0x0d (AP)
+I (296) octal_psram: dev id       : 0x02 (generation 3)
+I (296) octal_psram: density      : 0x03 (64 Mbit)
+I (298) octal_psram: good-die     : 0x01 (Pass)
+I (303) octal_psram: Latency      : 0x01 (Fixed)
+I (307) octal_psram: VCC          : 0x01 (3V)
+I (311) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (316) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (321) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (325) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (331) octal_psram: DriveStrength: 0x00 (1/1)
+I (335) MSPI Timing: PSRAM timing tuning index: 5
+I (339) esp_psram: Found 8MB PSRAM device
+I (343) esp_psram: Speed: 80MHz
+I (362) mmu_psram: Read only data copied and mapped to SPIRAM
+I (428) mmu_psram: Instructions copied and mapped to SPIRAM
+I (428) cpu_start: Multicore app
+I (682) esp_psram: SPI SRAM memory test OK
+I (691) cpu_start: Pro cpu start user code
+I (691) cpu_start: cpu freq: 240000000 Hz
+I (691) app_init: Application information:
+I (691) app_init: Project name:     ESP32-S3-LCD-2.8C-Test
+I (696) app_init: App version:      2b3e03eb
+I (700) app_init: Compile time:     Jun 18 2026 14:47:33
+I (705) app_init: ELF file SHA256:  44cf7790e...
+I (709) app_init: ESP-IDF:          v5.4.2-dirty
+I (714) efuse_init: Min chip rev:     v0.0
+I (717) efuse_init: Max chip rev:     v0.99 
+I (721) efuse_init: Chip rev:         v0.2
+I (725) heap_init: Initializing. RAM available for dynamic allocation:
+I (732) heap_init: At 3FCA6A08 len 00042D08 (267 KiB): RAM
+I (737) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (742) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (747) heap_init: At 600FE01C len 00001FCC (7 KiB): RTCRAM
+I (752) esp_psram: Adding pool of 7296K of PSRAM memory to heap allocator
+I (759) esp_psram: Adding pool of 52K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (770) spi_flash: detected chip: generic
+I (774) spi_flash: flash io: dio
+W (777) spi_flash: Flash suspend feature is enabled
+W (781) i2c: This driver is an old driver, please migrate your application code to adapt `driver/i2c_master.h`
+I (791) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (797) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (804) main_task: Started on CPU0
+I (807) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (815) main_task: Calling app_main()
+I (818) main: Badge firmware build: ebaj4-fastupload-20fps-20260618-2
+I (824) gpio: GPIO[0]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (833) main: Flash size: 16 MB
+I (836) I2C: I2C initialized successfully
+I (845) BadgeStorage: storage mode=sd-only
+I (1103) LCD: Install RGB LCD panel driver
+I (1132) LCD: Register event callbacks
+I (1132) LCD: Initialize RGB LCD panel
+I (1144) pp: pp rom version: e7ae62f
+I (1145) net80211: net80211 rom version: e7ae62f
+I (1146) wifi:wifi driver task: 3fcbd6f4, prio:23, stack:6656, core=0
+I (1151) wifi:wifi firmware version: bea31f3
+I (1152) wifi:wifi certification version: v7.0
+I (1155) wifi:config NVS flash: enabled
+I (1159) wifi:config nano formatting: disabled
+I (1163) wifi:Init data frame dynamic rx buffer num: 32
+I (1168) wifi:Init static rx mgmt buffer num: 5
+I (1172) wifi:Init management short buffer num: 32
+I (1177) wifi:Init dynamic tx buffer num: 32
+I (1181) wifi:Init static tx FG buffer num: 2
+I (1185) wifi:Init static rx buffer size: 1600
+I (1189) wifi:Init static rx buffer num: 10
+I (1193) wifi:Init dynamic rx buffer num: 32
+I (1197) wifi_init: rx ba win: 6
+I (1200) wifi_init: accept mbox: 6
+W (1200) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+I (1203) wifi_init: tcpip mbox: 32
+I (1211) wifi_init: udp mbox: 6
+I (1214) wifi_init: tcp mbox: 6
+I (1217) wifi_init: tcp tx win: 5760
+E (1218) gpio: gpio_pullup_en(78): GPIO number error (input-only pad has no internal PU)
+I (1220) wifi_init: tcp rx win: 5760
+E (1228) gpio: gpio_pullup_en(78): GPIO number error (input-only pad has no internal PU)
+I (1231) wifi_init: tcp mss: 1440
+E (1239) gpio: gpio_pullup_en(78): GPIO number error (input-only pad has no internal PU)
+I (1242) wifi_init: WiFi IRAM OP enabled
+E (1250) sdmmc_periph: sdmmc_host_init_slot: Invalid GPIO number -1, returned 0x102
+I (1254) wifi_init: WiFi RX IRAM OP enabled
+E (1261) vfs_fat_sdmmc: slot init failed (0x102).
+I (1267) wifi:I (1269) gpio: GPIO[2]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+Set ps type: 0, coexist: 0
+I (1279) gpio: GPIO[1]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+
+I (1290) gpio: GPIO[42]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1290) phy_init: phy_version 701,f4f1da3a,Mar  3 2025,15:50:10
+W (1298) BadgeStorage: SD 4-bit mount failed: ESP_ERR_INVALID_ARG, fallback to 1-bit
+I (1312) gpio: GPIO[2]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1320) gpio: GPIO[1]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1328) gpio: GPIO[42]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1333) wifi:mode : softAP (28:84:85:55:5a:c1)
+I (1341) wifi:Total power save buffer number: 16
+I (1345) wifi:Init max length of beacon: 752/752
+I (1349) wifi:Init max length of beacon: 752/752
+I (1354) WifiUpload: AP ready: ssid=ESP-BAJI http=http://192.168.4.1/upload tcp=192.168.4.1:3333
+I (1354) esp_netif_lwip: DHCP server started on interface WIFI_AP_DEF with IP: 192.168.4.1
+I (1372) WifiUpload: TCP upload server listening on port 3333
+I (1376) Wireless: Wi-Fi AP control/upload ready
+I (1386) BadgeStorage: SD mounted, width=1 asset path=/sdcard/badge.eb4
+I (1389) BadgeDisplay: asset format magic=344a4142 version=4 frames=116 fps=20 stream=480x480 key=1 tile=106 repeat=9 other=0
+I (1398) BadgeDisplay: playing storage=sd format=ebaj4 frames=116 fps=20 stream=480x480
+W (1524) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+W (1710) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+W (2059) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+W (2408) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+I (2455) BadgeDisplay: play perf storage=sd format=ebaj4 frames=21 source=17 stream=480x480 read=824ms decode=224ms render=357ms display=5ms vsync=220ms underrun=4 repeat=0
+原来的板子+代码+原lcd屏幕接口:I (303) octal_psram: Latency      : 0x01 (Fixed)
+I (307) octal_psram: VCC          : 0x01 (3V)
+I (311) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (316) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (321) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (325) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (331) octal_psram: DriveStrength: 0x00 (1/1)
+I (335) MSPI Timing: PSRAM timing tuning index: 5
+I (339) esp_psram: Found 8MB PSRAM device
+I (343) esp_psram: Speed: 80MHz
+I (362) mmu_psram: Read only data copied and mapped to SPIRAM
+I (428) mmu_psram: Instructions copied and mapped to SPIRAM
+I (428) cpu_start: Multicore app
+I (682) esp_psram: SPI SRAM memory test OK
+I (691) cpu_start: Pro cpu start user code
+I (691) cpu_start: cpu freq: 240000000 Hz
+I (691) app_init: Application information:
+I (691) app_init: Project name:     ESP32-S3-LCD-2.8C-Test
+I (696) app_init: App version:      2b3e03eb
+I (700) app_init: Compile time:     Jun 18 2026 14:47:33
+I (705) app_init: ELF file SHA256:  44cf7790e...
+I (709) app_init: ESP-IDF:          v5.4.2-dirty
+I (714) efuse_init: Min chip rev:     v0.0
+I (717) efuse_init: Max chip rev:     v0.99 
+I (721) efuse_init: Chip rev:         v0.2
+I (725) heap_init: Initializing. RAM available for dynamic allocation:
+I (732) heap_init: At 3FCA6A08 len 00042D08 (267 KiB): RAM
+I (737) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (742) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (747) heap_init: At 600FE01C len 00001FCC (7 KiB): RTCRAM
+I (752) esp_psram: Adding pool of 7296K of PSRAM memory to heap allocator
+I (759) esp_psram: Adding pool of 52K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (770) spi_flash: detected chip: generic
+I (774) spi_flash: flash io: dio
+W (777) spi_flash: Flash suspend feature is enabled
+W (781) i2c: This driver is an old driver, please migrate your application code to adapt `driver/i2c_master.h`
+I (791) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (797) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (804) main_task: Started on CPU0
+I (807) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (815) main_task: Calling app_main()
+I (818) main: Badge firmware build: ebaj4-fastupload-20fps-20260618-2
+I (824) gpio: GPIO[0]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (833) main: Flash size: 16 MB
+I (836) I2C: I2C initialized successfully
+I (845) BadgeStorage: storage mode=sd-only
+I (1103) LCD: Install RGB LCD panel driver
+I (1132) LCD: Register event callbacks
+I (1132) LCD: Initialize RGB LCD panel
+I (1144) pp: pp rom version: e7ae62f
+I (1145) net80211: net80211 rom version: e7ae62f
+I (1146) wifi:wifi driver task: 3fcbd6f4, prio:23, stack:6656, core=0
+I (1151) wifi:wifi firmware version: bea31f3
+I (1152) wifi:wifi certification version: v7.0
+I (1155) wifi:config NVS flash: enabled
+I (1159) wifi:config nano formatting: disabled
+I (1163) wifi:Init data frame dynamic rx buffer num: 32
+I (1168) wifi:Init static rx mgmt buffer num: 5
+I (1172) wifi:Init management short buffer num: 32
+I (1177) wifi:Init dynamic tx buffer num: 32
+I (1181) wifi:Init static tx FG buffer num: 2
+I (1185) wifi:Init static rx buffer size: 1600
+I (1189) wifi:Init static rx buffer num: 10
+I (1193) wifi:Init dynamic rx buffer num: 32
+I (1197) wifi_init: rx ba win: 6
+I (1200) wifi_init: accept mbox: 6
+W (1200) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+I (1203) wifi_init: tcpip mbox: 32
+I (1211) wifi_init: udp mbox: 6
+I (1214) wifi_init: tcp mbox: 6
+I (1217) wifi_init: tcp tx win: 5760
+E (1218) gpio: gpio_pullup_en(78): GPIO number error (input-only pad has no internal PU)
+I (1220) wifi_init: tcp rx win: 5760
+E (1228) gpio: gpio_pullup_en(78): GPIO number error (input-only pad has no internal PU)
+I (1231) wifi_init: tcp mss: 1440
+E (1239) gpio: gpio_pullup_en(78): GPIO number error (input-only pad has no internal PU)
+I (1242) wifi_init: WiFi IRAM OP enabled
+E (1250) sdmmc_periph: sdmmc_host_init_slot: Invalid GPIO number -1, returned 0x102
+I (1254) wifi_init: WiFi RX IRAM OP enabled
+E (1261) vfs_fat_sdmmc: slot init failed (0x102).
+I (1267) wifi:I (1269) gpio: GPIO[2]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+Set ps type: 0, coexist: 0
+I (1279) gpio: GPIO[1]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+
+I (1290) gpio: GPIO[42]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1290) phy_init: phy_version 701,f4f1da3a,Mar  3 2025,15:50:10
+W (1298) BadgeStorage: SD 4-bit mount failed: ESP_ERR_INVALID_ARG, fallback to 1-bit
+I (1312) gpio: GPIO[2]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1320) gpio: GPIO[1]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1328) gpio: GPIO[42]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (1333) wifi:mode : softAP (28:84:85:55:5a:c1)
+I (1341) wifi:Total power save buffer number: 16
+I (1345) wifi:Init max length of beacon: 752/752
+I (1349) wifi:Init max length of beacon: 752/752
+I (1354) WifiUpload: AP ready: ssid=ESP-BAJI http=http://192.168.4.1/upload tcp=192.168.4.1:3333
+I (1354) esp_netif_lwip: DHCP server started on interface WIFI_AP_DEF with IP: 192.168.4.1
+I (1372) WifiUpload: TCP upload server listening on port 3333
+I (1376) Wireless: Wi-Fi AP control/upload ready
+I (1386) BadgeStorage: SD mounted, width=1 asset path=/sdcard/badge.eb4
+I (1389) BadgeDisplay: asset format magic=344a4142 version=4 frames=116 fps=20 stream=480x480 key=1 tile=106 repeat=9 other=0
+I (1398) BadgeDisplay: playing storage=sd format=ebaj4 frames=116 fps=20 stream=480x480
+W (1524) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+W (1710) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT
+W (2059) BadgeDisplay: vsync wait failed: ESP_ERR_TIMEOUT

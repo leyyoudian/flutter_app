@@ -1,0 +1,2 @@
+source D:/Documents/esp-baji/ESP32-S3-LCD-2.8C-Test/build/bootloader/gdbinit/symbols
+source D:/Documents/esp-baji/ESP32-S3-LCD-2.8C-Test/build/bootloader/gdbinit/connect

@@ -1,0 +1,6 @@
+source "D:/espidf/v5.4.2/esp-idf/components/bootloader/Kconfig.projbuild"
+source "D:/espidf/v5.4.2/esp-idf/components/esp_app_format/Kconfig.projbuild"
+source "D:/espidf/v5.4.2/esp-idf/components/esp_rom/Kconfig.projbuild"
+source "D:/espidf/v5.4.2/esp-idf/components/esptool_py/Kconfig.projbuild"
+source "D:/espidf/v5.4.2/esp-idf/components/partition_table/Kconfig.projbuild"
+source "D:/Documents/esp-baji/ESP32-S3-LCD-2.8C-Test/main/Kconfig.projbuild"
