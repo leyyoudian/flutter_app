@@ -133,7 +133,7 @@ class MainActivity : FlutterActivity() {
                 if (bytes != null && bytes.size > MAX_INPUT_BYTES) {
                     throw IllegalArgumentException("素材文件过大")
                 }
-                val previewBytes = buildPreviewBytes(uri, mime, bytes)
+                val previewBytes = buildPreviewBytes(uri, mime, bytes, CropTransform.DEFAULT)
                 val animatedPreviewPath = bytes?.let {
                     copyAnimatedPreview(
                         it,
@@ -208,6 +208,15 @@ class MainActivity : FlutterActivity() {
                 writeBrightness(value, result)
             }
             "pickMedia" -> pickMedia(result)
+            "warmVideoAnimatedPreview" -> {
+                val uri = call.argument<String>("uri")
+                if (uri.isNullOrBlank()) {
+                    result.error("bad_uri", "素材地址为空", null)
+                    return
+                }
+                val name = call.argument<String>("name") ?: "asset"
+                warmVideoAnimatedPreview(uri, name, result)
+            }
             "prepareAsset" -> {
                 val uri = call.argument<String>("uri")
                 if (uri.isNullOrBlank()) {
@@ -219,7 +228,13 @@ class MainActivity : FlutterActivity() {
                 val maxPackageBytes = (call.argument<Int>("maxPackageBytes")
                     ?: resolveBadgePackageBudget(badgeSdAvailable))
                     .coerceAtLeast(HEADER_SIZE + FRAME_ENTRY_SIZE + PALETTE_BYTES + STREAM_240_PIXELS)
-                prepareAsset(uri, name, fps, maxPackageBytes, result)
+                val crop = CropTransform(
+                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(1.0, 4.0),
+                    offsetX = (call.argument<Double>("cropOffsetX") ?: 0.0).coerceIn(-1.5, 1.5),
+                    offsetY = (call.argument<Double>("cropOffsetY") ?: 0.0).coerceIn(-1.5, 1.5),
+                )
+                val warmPreviewPath = call.argument<String>("warmPreviewPath")
+                prepareAsset(uri, name, fps, maxPackageBytes, crop, warmPreviewPath, result)
             }
             "uploadAsset" -> {
                 val assetPath = call.argument<String>("assetPath")
@@ -580,6 +595,8 @@ class MainActivity : FlutterActivity() {
         displayName: String,
         fps: Int,
         maxPackageBytes: Int,
+        crop: CropTransform,
+        warmPreviewPath: String?,
         result: MethodChannel.Result,
     ) {
         Thread {
@@ -593,16 +610,18 @@ class MainActivity : FlutterActivity() {
                 val encoder = EbajEncoder { progress ->
                     sendEvent(mapOf("type" to "prepareProgress", "progress" to progress))
                 }
-                val encoded = encoder.encode(this, uri, mime, fps, maxPackageBytes)
+                val encoded = encoder.encode(this, uri, mime, fps, maxPackageBytes, crop)
                 val directory = File(cacheDir, "ebaj").apply { mkdirs() }
                 val stem = "${System.currentTimeMillis()}_${safeFileName(displayName)}"
                 val file = File(directory, "$stem.ebaj")
                 file.writeBytes(encoded.packageBytes)
-                val previewPath = buildPreviewBytes(uri, mime, null)?.let { preview ->
+                val previewPath = buildPreviewBytes(uri, mime, null, crop)?.let { preview ->
                     File(directory, "$stem.png").also { it.writeBytes(preview) }.absolutePath
                 }
                 val animatedPreviewPath = if (isVideoMime(mime)) {
-                    null
+                    buildVideoAnimatedPreview(uri, crop, warmPreviewPath)?.let { preview ->
+                        File(directory, "$stem.gif").also { it.writeBytes(preview) }.absolutePath
+                    }
                 } else {
                     val bytes = readUriBytes(uri)
                     copyAnimatedPreview(bytes, directory, stem)
@@ -624,6 +643,31 @@ class MainActivity : FlutterActivity() {
                 mainHandler.post {
                     result.error("prepare_failed", error.message ?: "素材处理失败", null)
                 }
+            }
+        }.start()
+    }
+
+    private fun warmVideoAnimatedPreview(uriText: String, displayName: String, result: MethodChannel.Result) {
+        result.success(null)
+        Thread {
+            runCatching {
+                val uri = Uri.parse(uriText)
+                val mime = normalizeMime(contentResolver.getType(uri), displayName)
+                if (!isVideoMime(mime)) {
+                    return@Thread
+                }
+                val directory = File(cacheDir, "media_preview").apply { mkdirs() }
+                val stem = "${System.currentTimeMillis()}_${safeFileName(displayName)}"
+                val preview = buildVideoAnimatedPreview(uri, CropTransform.DEFAULT)
+                    ?: return@Thread
+                val path = File(directory, "$stem.gif").also { it.writeBytes(preview) }.absolutePath
+                sendEvent(
+                    mapOf(
+                        "type" to "videoPreviewReady",
+                        "uri" to uriText,
+                        "animatedPreviewPath" to path,
+                    ),
+                )
             }
         }.start()
     }
@@ -1086,20 +1130,25 @@ class MainActivity : FlutterActivity() {
             ?: throw IllegalArgumentException("无法读取素材")
     }
 
-    private fun buildPreviewBytes(uri: Uri, mime: String, source: ByteArray?): ByteArray? {
+    private fun buildPreviewBytes(
+        uri: Uri,
+        mime: String,
+        source: ByteArray?,
+        crop: CropTransform,
+    ): ByteArray? {
         val bitmap = runCatching {
                 if (isVideoMime(mime)) {
-                    renderVideoFrame(this, uri, PREVIEW_SIZE, PREVIEW_SIZE)
+                    renderVideoFrame(this, uri, PREVIEW_SIZE, PREVIEW_SIZE, crop)
                 } else {
                     val bytes = source ?: readUriBytes(uri)
                     val movie = Movie.decodeByteArray(bytes, 0, bytes.size)
                 if (movie != null && movie.width() > 0 && movie.height() > 0) {
                     movie.setTime(0)
-                    renderMovieFrame(movie, PREVIEW_SIZE, PREVIEW_SIZE)
+                    renderMovieFrame(movie, PREVIEW_SIZE, PREVIEW_SIZE, crop)
                 } else {
                     val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         ?: return null
-                    renderBitmapFrame(decoded, PREVIEW_SIZE, PREVIEW_SIZE)
+                    renderBitmapFrame(decoded, PREVIEW_SIZE, PREVIEW_SIZE, crop)
                 }
                 }
             }.getOrNull() ?: return null
@@ -1115,6 +1164,54 @@ class MainActivity : FlutterActivity() {
             return null
         }
         return File(directory, "$stem.gif").also { it.writeBytes(source) }.absolutePath
+    }
+
+    private fun buildVideoAnimatedPreview(uri: Uri, crop: CropTransform, warmPreviewPath: String? = null): ByteArray? {
+        return runCatching {
+            reusableWarmPreviewBytes(warmPreviewPath)?.let { return@runCatching it }
+            val retriever = createRetriever(this, uri)
+            try {
+                val durationMs = retriever
+                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull()
+                    ?.coerceAtLeast(1L)
+                    ?: 1000L
+                val delayMs = frameDelayMs(VIDEO_PREVIEW_GIF_FPS)
+                val totalFrames = max(1, ((durationMs + delayMs - 1) / delayMs).toInt())
+                val frames = mutableListOf<ByteArray>()
+                for (index in 0 until totalFrames) {
+                    val timeUs = min(
+                        (durationMs - 1L) * 1000L,
+                        index.toLong() * delayMs.toLong() * 1000L,
+                    )
+                    val source = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        ?: continue
+                    val bitmap = renderBitmapFrame(source, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, crop)
+                    val indexed = quantizeBitmapToGifIndexed(bitmap)
+                    bitmap.recycle()
+                    frames += indexed
+                }
+                if (frames.isEmpty()) {
+                    null
+                } else {
+                    encodeIndexedGif(frames, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, delayMs)
+                }
+            } finally {
+                retriever.release()
+            }
+        }.getOrNull()
+    }
+
+    private fun reusableWarmPreviewBytes(path: String?): ByteArray? {
+        if (path.isNullOrBlank()) {
+            return null
+        }
+        val file = File(path)
+        return if (file.exists() && file.isFile && file.length() > 0L) {
+            file.readBytes()
+        } else {
+            null
+        }
     }
 
     private fun isGif(source: ByteArray): Boolean {
@@ -1174,6 +1271,9 @@ class MainActivity : FlutterActivity() {
                 "fps" to item.optInt("fps"),
                 "crc32" to item.optLong("crc32"),
                 "createdAt" to item.optLong("createdAt"),
+                "cropScale" to item.optDouble("cropScale", 1.0),
+                "cropOffsetX" to item.optDouble("cropOffsetX", 0.0),
+                "cropOffsetY" to item.optDouble("cropOffsetY", 0.0),
             )
         }
         return result
@@ -1195,6 +1295,9 @@ class MainActivity : FlutterActivity() {
             item.put("fps", map["fps"])
             item.put("crc32", map["crc32"])
             item.put("createdAt", map["createdAt"])
+            item.put("cropScale", map["cropScale"])
+            item.put("cropOffsetX", map["cropOffsetX"])
+            item.put("cropOffsetY", map["cropOffsetY"])
             array.put(item)
         }
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1212,10 +1315,12 @@ class MainActivity : FlutterActivity() {
             mime: String,
             requestedFps: Int,
             maxPackageBytes: Int,
+            crop: CropTransform,
         ): EncodedPackage {
-            val fps = TARGET_FPS
-            val selectedStreamSize = sampleStreamResolution(context, uri, mime, fps)
-            val selected = encodeAtResolution(context, uri, mime, fps, selectedStreamSize)
+            val fps = requestedFps.coerceIn(1, 60)
+            val delayMs = frameDelayMs(fps)
+            val selectedStreamSize = sampleStreamResolution(context, uri, mime, fps, delayMs, crop)
+            val selected = encodeAtResolution(context, uri, mime, fps, delayMs, selectedStreamSize, crop)
             if (selected.packageBytes.size > maxPackageBytes) {
                 throw PackageTooLargeException(ASSET_TOO_LARGE_MESSAGE)
             }
@@ -1227,23 +1332,25 @@ class MainActivity : FlutterActivity() {
             uri: Uri,
             mime: String,
             fps: Int,
+            delayMs: Int,
             streamSize: Int,
+            crop: CropTransform,
         ): EncodedPackage {
             val frames = if (isVideoMime(mime)) {
-                encodeVideoFrames(context, uri, fps, streamSize)
+                encodeVideoFrames(context, uri, delayMs, streamSize, crop)
             } else {
                 val source = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     ?: throw IllegalArgumentException("无法读取素材")
                 val movie = Movie.decodeByteArray(source, 0, source.size)
                 if (movie != null && movie.width() > 0 && movie.height() > 0 && movie.duration() > 0) {
-                    encodeGifFrames(movie, fps, streamSize)
+                    encodeGifFrames(movie, delayMs, streamSize, crop)
                 } else {
                     val bitmap = BitmapFactory.decodeByteArray(source, 0, source.size)
                         ?: throw IllegalArgumentException("不支持的图片格式")
-                    val rendered = renderBitmapFrame(bitmap, streamSize, streamSize)
+                    val rendered = renderBitmapFrame(bitmap, streamSize, streamSize, crop)
                     val indexed = quantizeToIndexed(rendered)
                     rendered.recycle()
-                    listOf(encodeFrame(indexed, null, FRAME_DELAY_MS, streamSize, forceKeyframe = true))
+                    listOf(encodeFrame(indexed, null, delayMs, streamSize, forceKeyframe = true))
                 }
             }
 
@@ -1253,8 +1360,9 @@ class MainActivity : FlutterActivity() {
         private fun encodeVideoFrames(
             context: Context,
             uri: Uri,
-            fps: Int,
+            delayMs: Int,
             streamSize: Int,
+            crop: CropTransform,
         ): List<EncodedFrame> {
             val retriever = createRetriever(context, uri)
             try {
@@ -1263,7 +1371,6 @@ class MainActivity : FlutterActivity() {
                     ?.toLongOrNull()
                     ?.coerceAtLeast(1L)
                     ?: 1000L
-                val delayMs = FRAME_DELAY_MS
                 val totalFrames = max(1, ((durationMs + delayMs - 1) / delayMs).toInt())
                 val frames = mutableListOf<EncodedFrame>()
                 var previous: ByteArray? = null
@@ -1272,7 +1379,7 @@ class MainActivity : FlutterActivity() {
                     val timeUs = min((durationMs - 1L) * 1000L, index.toLong() * delayMs.toLong() * 1000L)
                     val source = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                         ?: throw IllegalArgumentException("视频帧读取失败")
-                    val bitmap = renderBitmapFrame(source, streamSize, streamSize)
+                    val bitmap = renderBitmapFrame(source, streamSize, streamSize, crop)
                     val indexed = quantizeToIndexed(bitmap)
                     bitmap.recycle()
                     val frame = encodeFrame(indexed, previous, delayMs, streamSize, forceKeyframe = index == 0)
@@ -1291,11 +1398,16 @@ class MainActivity : FlutterActivity() {
             uri: Uri,
             mime: String,
             fps: Int,
+            delayMs: Int,
+            crop: CropTransform,
         ): Int {
             if (isVideoMime(mime)) {
                 return selectStreamResolution(
                     STREAM_RESOLUTIONS.toList().map { streamSize ->
-                        StreamEstimate(streamSize, estimateVideoBytesPerSecond(context, uri, fps, streamSize))
+                        StreamEstimate(
+                            streamSize,
+                            estimateVideoBytesPerSecond(context, uri, fps, delayMs, streamSize, crop),
+                        )
                     },
                 )
             }
@@ -1306,7 +1418,7 @@ class MainActivity : FlutterActivity() {
             if (movie != null && movie.width() > 0 && movie.height() > 0 && movie.duration() > 0) {
                 return selectStreamResolution(
                     STREAM_RESOLUTIONS.toList().map { streamSize ->
-                        StreamEstimate(streamSize, estimateGifBytesPerSecond(movie, fps, streamSize))
+                        StreamEstimate(streamSize, estimateGifBytesPerSecond(movie, fps, delayMs, streamSize, crop))
                     },
                 )
             }
@@ -1318,7 +1430,9 @@ class MainActivity : FlutterActivity() {
             context: Context,
             uri: Uri,
             fps: Int,
+            delayMs: Int,
             streamSize: Int,
+            crop: CropTransform,
         ): Long {
             val retriever = createRetriever(context, uri)
             try {
@@ -1327,19 +1441,19 @@ class MainActivity : FlutterActivity() {
                     ?.toLongOrNull()
                     ?.coerceAtLeast(1L)
                     ?: 1000L
-                val totalFrames = max(1, ((durationMs + FRAME_DELAY_MS - 1) / FRAME_DELAY_MS).toInt())
+                val totalFrames = max(1, ((durationMs + delayMs - 1) / delayMs).toInt())
                 val indexes = sampleFrameIndexes(totalFrames)
                 var previous: ByteArray? = null
                 var payloadBytes = 0L
 
                 indexes.forEachIndexed { sampleIndex, frameIndex ->
-                    val timeUs = min((durationMs - 1L) * 1000L, frameIndex.toLong() * FRAME_DELAY_MS.toLong() * 1000L)
+                    val timeUs = min((durationMs - 1L) * 1000L, frameIndex.toLong() * delayMs.toLong() * 1000L)
                     val source = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                         ?: throw IllegalArgumentException("视频帧读取失败")
-                    val bitmap = renderBitmapFrame(source, streamSize, streamSize)
+                    val bitmap = renderBitmapFrame(source, streamSize, streamSize, crop)
                     val indexed = quantizeToIndexed(bitmap)
                     bitmap.recycle()
-                    val frame = encodeFrame(indexed, previous, FRAME_DELAY_MS, streamSize, forceKeyframe = sampleIndex == 0)
+                    val frame = encodeFrame(indexed, previous, delayMs, streamSize, forceKeyframe = sampleIndex == 0)
                     payloadBytes += frame.data.size.toLong()
                     previous = indexed
                 }
@@ -1350,20 +1464,26 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        private fun estimateGifBytesPerSecond(movie: Movie, fps: Int, streamSize: Int): Long {
+        private fun estimateGifBytesPerSecond(
+            movie: Movie,
+            fps: Int,
+            delayMs: Int,
+            streamSize: Int,
+            crop: CropTransform,
+        ): Long {
             val duration = movie.duration().takeIf { it > 0 } ?: 1000
-            val totalFrames = max(1, (duration + FRAME_DELAY_MS - 1) / FRAME_DELAY_MS)
+            val totalFrames = max(1, (duration + delayMs - 1) / delayMs)
             val indexes = sampleFrameIndexes(totalFrames)
             var previous: ByteArray? = null
             var payloadBytes = 0L
 
             indexes.forEachIndexed { sampleIndex, frameIndex ->
-                val timeMs = min(duration - 1, frameIndex * FRAME_DELAY_MS)
+                val timeMs = min(duration - 1, frameIndex * delayMs)
                 movie.setTime(timeMs)
-                val bitmap = renderMovieFrame(movie, streamSize, streamSize)
+                val bitmap = renderMovieFrame(movie, streamSize, streamSize, crop)
                 val indexed = quantizeToIndexed(bitmap)
                 bitmap.recycle()
-                val frame = encodeFrame(indexed, previous, FRAME_DELAY_MS, streamSize, forceKeyframe = sampleIndex == 0)
+                val frame = encodeFrame(indexed, previous, delayMs, streamSize, forceKeyframe = sampleIndex == 0)
                 payloadBytes += frame.data.size.toLong()
                 previous = indexed
             }
@@ -1381,9 +1501,13 @@ class MainActivity : FlutterActivity() {
                 .distinct()
         }
 
-        private fun encodeGifFrames(movie: Movie, fps: Int, streamSize: Int): List<EncodedFrame> {
+        private fun encodeGifFrames(
+            movie: Movie,
+            delayMs: Int,
+            streamSize: Int,
+            crop: CropTransform,
+        ): List<EncodedFrame> {
             val duration = movie.duration().takeIf { it > 0 } ?: 1000
-            val delayMs = FRAME_DELAY_MS
             val totalFrames = max(1, (duration + delayMs - 1) / delayMs)
             val frames = mutableListOf<EncodedFrame>()
             var previous: ByteArray? = null
@@ -1391,7 +1515,7 @@ class MainActivity : FlutterActivity() {
             for (index in 0 until totalFrames) {
                 val timeMs = min(duration - 1, index * delayMs)
                 movie.setTime(timeMs)
-                val bitmap = renderMovieFrame(movie, streamSize, streamSize)
+                val bitmap = renderMovieFrame(movie, streamSize, streamSize, crop)
                 val indexed = quantizeToIndexed(bitmap)
                 bitmap.recycle()
                 val frame = encodeFrame(indexed, previous, delayMs, streamSize, forceKeyframe = index == 0)
@@ -1667,6 +1791,15 @@ class MainActivity : FlutterActivity() {
         val streamSize: Int,
         val bytesPerSecond: Long,
     )
+    private data class CropTransform(
+        val scale: Double,
+        val offsetX: Double,
+        val offsetY: Double,
+    ) {
+        companion object {
+            val DEFAULT = CropTransform(1.0, 0.0, 0.0)
+        }
+    }
     private class PixelScratch(
         val width: Int,
         val height: Int,
@@ -1710,13 +1843,13 @@ class MainActivity : FlutterActivity() {
         private const val WIDTH = 480
         private const val HEIGHT = 480
         private const val PREVIEW_SIZE = 320
+        private const val VIDEO_PREVIEW_GIF_SIZE = 192
+        private const val VIDEO_PREVIEW_GIF_FPS = 30
         private const val STREAM_240_PIXELS = 240 * 240
         private const val MAGIC = 0x344a4142
         private const val VERSION = 4
         private const val HEADER_SIZE = 44
         private const val FRAME_ENTRY_SIZE = 16
-        private const val TARGET_FPS = 20
-        private const val FRAME_DELAY_MS = 50
         private const val CODEC_INDEXED_KEY = 0x10
         private const val CODEC_INDEXED_TILE = 0x11
         private const val CODEC_INDEXED_REPEAT = 0x12
@@ -1759,24 +1892,40 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        private fun renderVideoFrame(context: Context, uri: Uri, width: Int, height: Int): Bitmap {
+        private fun frameDelayMs(fps: Int): Int {
+            return max(1, ((1000f / fps.toFloat()) + 0.5f).toInt())
+        }
+
+        private fun renderVideoFrame(
+            context: Context,
+            uri: Uri,
+            width: Int,
+            height: Int,
+            crop: CropTransform,
+        ): Bitmap {
             val retriever = createRetriever(context, uri)
             try {
                 val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: throw IllegalArgumentException("无法读取视频预览")
-                return renderBitmapFrame(frame, width, height)
+                return renderBitmapFrame(frame, width, height, crop)
             } finally {
                 retriever.release()
             }
         }
 
-        private fun renderMovieFrame(movie: Movie, width: Int, height: Int): Bitmap {
+        private fun renderMovieFrame(
+            movie: Movie,
+            width: Int,
+            height: Int,
+            crop: CropTransform,
+        ): Bitmap {
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bitmap)
             canvas.drawColor(Color.BLACK)
-            val scale = max(width.toFloat() / movie.width().toFloat(), height.toFloat() / movie.height().toFloat())
-            val dx = (width - movie.width() * scale) / 2f
-            val dy = (height - movie.height() * scale) / 2f
+            val scale = max(width.toFloat() / movie.width().toFloat(), height.toFloat() / movie.height().toFloat()) *
+                crop.scale.toFloat()
+            val dx = (width - movie.width() * scale) / 2f + crop.offsetX.toFloat() * width
+            val dy = (height - movie.height() * scale) / 2f + crop.offsetY.toFloat() * height
             canvas.save()
             canvas.translate(dx, dy)
             canvas.scale(scale, scale)
@@ -1785,14 +1934,23 @@ class MainActivity : FlutterActivity() {
             return bitmap
         }
 
-        private fun renderBitmapFrame(source: Bitmap, width: Int, height: Int): Bitmap {
+        private fun renderBitmapFrame(
+            source: Bitmap,
+            width: Int,
+            height: Int,
+            crop: CropTransform,
+        ): Bitmap {
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bitmap)
             canvas.drawColor(Color.BLACK)
-            val scale = max(width.toFloat() / source.width.toFloat(), height.toFloat() / source.height.toFloat())
+            val scale = max(width.toFloat() / source.width.toFloat(), height.toFloat() / source.height.toFloat()) *
+                crop.scale.toFloat()
             val matrix = Matrix().apply {
                 postScale(scale, scale)
-                postTranslate((width - source.width * scale) / 2f, (height - source.height * scale) / 2f)
+                postTranslate(
+                    (width - source.width * scale) / 2f + crop.offsetX.toFloat() * width,
+                    (height - source.height * scale) / 2f + crop.offsetY.toFloat() * height,
+                )
             }
             val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
             canvas.drawBitmap(source, matrix, paint)
@@ -1800,6 +1958,149 @@ class MainActivity : FlutterActivity() {
                 source.recycle()
             }
             return bitmap
+        }
+
+        private fun sharpenForIndexed(value: Int): Int {
+            val centered = value - 128
+            return (128 + centered * SHARPEN_PERCENT / 100).coerceIn(0, 255)
+        }
+
+        private fun orderedDither(x: Int, y: Int, bits: Int): Int {
+            val levelStep = if (bits == 2) 64 else 32
+            val threshold = DITHER_4X4[((y and 3) shl 2) or (x and 3)] - 8
+            return threshold * levelStep / 16
+        }
+
+        private fun quantizeBitmapToGifIndexed(bitmap: Bitmap): ByteArray {
+            val output = ByteArray(bitmap.width * bitmap.height)
+            val pixels = IntArray(bitmap.width * bitmap.height)
+            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            var offset = 0
+            for (y in 0 until bitmap.height) {
+                val rowOffset = y * bitmap.width
+                for (x in 0 until bitmap.width) {
+                    val pixel = pixels[rowOffset + x]
+                    val alpha = pixel ushr 24
+                    var red = (pixel ushr 16) and 0xff
+                    var green = (pixel ushr 8) and 0xff
+                    var blue = pixel and 0xff
+                    if (alpha < 255) {
+                        red = red * alpha / 255
+                        green = green * alpha / 255
+                        blue = blue * alpha / 255
+                    }
+                    red = (sharpenForIndexed(red) + orderedDither(x, y, 3)).coerceIn(0, 255)
+                    green = (sharpenForIndexed(green) + orderedDither(x, y, 3)).coerceIn(0, 255)
+                    blue = (sharpenForIndexed(blue) + orderedDither(x, y, 2)).coerceIn(0, 255)
+                    output[offset++] = (((red ushr 5) shl 5) or ((green ushr 5) shl 2) or (blue ushr 6)).toByte()
+                }
+            }
+            return output
+        }
+
+        private fun rgb332GifPalette(): ByteArray {
+            val palette = ByteArray(PALETTE_ENTRIES * 3)
+            var offset = 0
+            for (index in 0 until PALETTE_ENTRIES) {
+                palette[offset++] = (((index ushr 5) and 0x07) * 255 / 7).toByte()
+                palette[offset++] = (((index ushr 2) and 0x07) * 255 / 7).toByte()
+                palette[offset++] = ((index and 0x03) * 255 / 3).toByte()
+            }
+            return palette
+        }
+
+        private fun encodeIndexedGif(
+            frames: List<ByteArray>,
+            width: Int,
+            height: Int,
+            delayMs: Int,
+        ): ByteArray {
+            val output = ByteSink(width * height * frames.size / 2)
+            "GIF89a".forEach { output.write(it.code) }
+            output.write(width and 0xff)
+            output.write((width ushr 8) and 0xff)
+            output.write(height and 0xff)
+            output.write((height ushr 8) and 0xff)
+            output.write(0xf7)
+            output.write(0)
+            output.write(0)
+            val palette = rgb332GifPalette()
+            output.write(palette, 0, palette.size)
+            output.write(0x21)
+            output.write(0xff)
+            output.write(11)
+            "NETSCAPE2.0".forEach { output.write(it.code) }
+            output.write(3)
+            output.write(1)
+            output.write(0)
+            output.write(0)
+            output.write(0)
+            val gifDelay = max(1, delayMs / 10)
+            for (frame in frames) {
+                output.write(0x21)
+                output.write(0xf9)
+                output.write(4)
+                output.write(0)
+                output.write(gifDelay and 0xff)
+                output.write((gifDelay ushr 8) and 0xff)
+                output.write(0)
+                output.write(0)
+                output.write(0x2c)
+                output.write(0)
+                output.write(0)
+                output.write(0)
+                output.write(0)
+                output.write(width and 0xff)
+                output.write((width ushr 8) and 0xff)
+                output.write(height and 0xff)
+                output.write((height ushr 8) and 0xff)
+                output.write(0)
+                output.write(8)
+                val compressed = gifLzwEncodeLiteral(frame)
+                var offset = 0
+                while (offset < compressed.size) {
+                    val chunk = min(255, compressed.size - offset)
+                    output.write(chunk)
+                    output.write(compressed, offset, chunk)
+                    offset += chunk
+                }
+                output.write(0)
+            }
+            output.write(0x3b)
+            return output.toByteArray()
+        }
+
+        private fun gifLzwEncodeLiteral(indexed: ByteArray): ByteArray {
+            val minCodeSize = 8
+            val clearCode = 1 shl minCodeSize
+            val endCode = clearCode + 1
+            val codeSize = minCodeSize + 1
+            val codes = ArrayList<Int>(indexed.size + indexed.size / 128 + 4)
+            codes += clearCode
+            indexed.forEachIndexed { index, value ->
+                if (index > 0 && index % 128 == 0) {
+                    codes += clearCode
+                }
+                codes += value.toInt() and 0xff
+            }
+            codes += endCode
+
+            val output = ByteSink(codes.size * 2)
+            var bitBuffer = 0
+            var bitCount = 0
+            for (code in codes) {
+                bitBuffer = bitBuffer or (code shl bitCount)
+                bitCount += codeSize
+                while (bitCount >= 8) {
+                    output.write(bitBuffer and 0xff)
+                    bitBuffer = bitBuffer ushr 8
+                    bitCount -= 8
+                }
+            }
+            if (bitCount > 0) {
+                output.write(bitBuffer and 0xff)
+            }
+            return output.toByteArray()
         }
 
         private fun writeLe16(target: ByteArray, offset: Int, value: Int) {
