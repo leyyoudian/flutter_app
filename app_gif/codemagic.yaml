@@ -15,15 +15,27 @@ workflows:
       - name: Install pods
         script: |
           find . -name "Podfile" -execdir pod install \;
-      - name: Build unsigned iOS release IPA for sideloading
+      - name: Build ad-hoc iOS release IPA for sideloading
         script: |
           flutter build ios --release --no-codesign
+          APP_PATH="build/ios/iphoneos/Runner.app"
+          test -d "$APP_PATH"
+          if [ -e "$APP_PATH/Runner.debug.dylib" ] || [ -e "$APP_PATH/__preview.dylib" ]; then
+            echo "Debug dylib found in release app; refusing to package invalid sideload IPA"
+            find "$APP_PATH" -maxdepth 1 -name "*.dylib" -print
+            exit 1
+          fi
+          /usr/bin/codesign --force --deep --sign - "$APP_PATH"
+          /usr/bin/otool -l "$APP_PATH/Runner" | grep -q LC_CODE_SIGNATURE
+          rm -rf build/ios/ipa/Payload
           mkdir -p build/ios/ipa/Payload
-          cp -R build/ios/iphoneos/Runner.app build/ios/ipa/Payload/Runner.app
+          cp -R "$APP_PATH" build/ios/ipa/Payload/Runner.app
           cd build/ios/ipa
-          /usr/bin/zip -qry Runner-release-unsigned.ipa Payload
+          /usr/bin/zip -qry Runner-release-adhoc.ipa Payload
+          /usr/bin/zipinfo -1 Runner-release-adhoc.ipa | grep -q '^Payload/Runner.app/Runner$'
+          ! /usr/bin/zipinfo -1 Runner-release-adhoc.ipa | grep -q 'Runner.debug.dylib'
     artifacts:
-      - build/ios/ipa/Runner-release-unsigned.ipa
+      - build/ios/ipa/Runner-release-adhoc.ipa
       - flutter_drive.log
     publishing:
       email:
