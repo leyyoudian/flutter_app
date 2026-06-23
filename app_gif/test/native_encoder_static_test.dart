@@ -39,6 +39,11 @@ void main() {
     expect(source, contains('VIDEO_PREVIEW_GIF_FPS = 30'));
     expect(source, contains('warmVideoAnimatedPreview'));
     expect(source, contains('warmPreviewPath'));
+    expect(source, contains('private fun persistentAssetDirectory'));
+    expect(source, contains('persistentAssetDirectory("ebaj")'));
+    expect(source, contains('persistentAssetDirectory("media_preview")'));
+    expect(source, isNot(contains('File(cacheDir, "ebaj")')));
+    expect(source, isNot(contains('File(cacheDir, "media_preview")')));
     expect(
       source,
       contains('buildVideoAnimatedPreview(uri, crop, warmPreviewPath)'),

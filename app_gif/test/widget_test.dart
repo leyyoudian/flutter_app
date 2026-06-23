@@ -26,6 +26,15 @@ void main() {
     expect(find.byType(AnimatedSwitcher), findsNothing);
   });
 
+  testWidgets('uses a compact custom floating bottom bar', (tester) async {
+    await tester.pumpWidget(const BadgeApp());
+    await tester.pumpAndSettle();
+
+    expect(find.byType(NavigationBar), findsNothing);
+    expect(find.byType(NavigationDestination), findsNothing);
+    expect(find.byKey(const ValueKey('floating-bottom-nav')), findsOneWidget);
+  });
+
   test('keeps animated preview paths in asset history', () {
     final selected = SelectedMedia.fromMap({
       'uri': 'content://asset.gif',
@@ -112,5 +121,13 @@ void main() {
     expect(source, isNot(contains('asset?.assetPath != entry.assetPath')));
     expect(source, isNot(contains('active: active && !uploading')));
     expect(source, isNot(contains('uri: entry.sourceUri!')));
+  });
+
+  test('history previews hide missing files instead of showing error icons', () {
+    final source = File('lib/main.dart').readAsStringSync();
+
+    expect(source, contains('errorBuilder: _blackPreviewFallback'));
+    expect(source, contains('bool _previewFileExists'));
+    expect(source, isNot(contains('bool _hasPreviewPath(String? path) => path != null && path.isNotEmpty;')));
   });
 }

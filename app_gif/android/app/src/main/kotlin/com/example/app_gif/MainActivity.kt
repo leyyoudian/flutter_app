@@ -137,7 +137,7 @@ class MainActivity : FlutterActivity() {
                 val animatedPreviewPath = bytes?.let {
                     copyAnimatedPreview(
                         it,
-                        File(cacheDir, "media_preview").apply { mkdirs() },
+                        persistentAssetDirectory("media_preview"),
                         "${System.currentTimeMillis()}_${safeFileName(name)}",
                     )
                 }
@@ -611,7 +611,7 @@ class MainActivity : FlutterActivity() {
                     sendEvent(mapOf("type" to "prepareProgress", "progress" to progress))
                 }
                 val encoded = encoder.encode(this, uri, mime, fps, maxPackageBytes, crop)
-                val directory = File(cacheDir, "ebaj").apply { mkdirs() }
+                val directory = persistentAssetDirectory("ebaj")
                 val stem = "${System.currentTimeMillis()}_${safeFileName(displayName)}"
                 val file = File(directory, "$stem.ebaj")
                 file.writeBytes(encoded.packageBytes)
@@ -656,7 +656,7 @@ class MainActivity : FlutterActivity() {
                 if (!isVideoMime(mime)) {
                     return@Thread
                 }
-                val directory = File(cacheDir, "media_preview").apply { mkdirs() }
+                val directory = persistentAssetDirectory("media_preview")
                 val stem = "${System.currentTimeMillis()}_${safeFileName(displayName)}"
                 val preview = buildVideoAnimatedPreview(uri, CropTransform.DEFAULT)
                     ?: return@Thread
@@ -1251,6 +1251,10 @@ class MainActivity : FlutterActivity() {
 
     private fun safeFileName(name: String): String {
         return name.replace(Regex("[^A-Za-z0-9._-]"), "_").take(48).ifBlank { "asset" }
+    }
+
+    private fun persistentAssetDirectory(name: String): File {
+        return File(filesDir, "badge_assets/$name").apply { mkdirs() }
     }
 
     private fun loadHistory(): List<Map<String, Any?>> {
