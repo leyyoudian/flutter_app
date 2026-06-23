@@ -1,8 +1,9 @@
 workflows:
-  ios-debug:
-    name: iOS Debug Build
+  ios-release:
+    name: iOS Release IPA
     instance_type: mac_mini_m2
     max_build_duration: 120
+    working_directory: app_gif
     environment:
       flutter: stable
       xcode: latest
@@ -14,12 +15,11 @@ workflows:
       - name: Install pods
         script: |
           find . -name "Podfile" -execdir pod install \;
-      - name: Build iOS debug
+      - name: Build iOS release IPA
         script: |
-          flutter build ios --debug --no-codesign
+          flutter build ipa --release --no-codesign
     artifacts:
-      - build/ios/iphoneos/*.app
-      - build/ios/iphoneos/**/*.dSYM
+      - build/ios/ipa/*.ipa
       - flutter_drive.log
     publishing:
       email:
