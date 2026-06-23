@@ -3,11 +3,12 @@ import CoreGraphics
 import Flutter
 import ImageIO
 import Network
+import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
 
 @main
-@objc class AppDelegate: FlutterAppDelegate, UIDocumentPickerDelegate {
+@objc class AppDelegate: FlutterAppDelegate, PHPickerViewControllerDelegate {
   private var badgeChannel: FlutterMethodChannel?
   private var pendingPickResult: FlutterResult?
   private var activeUpload: NWConnection?
@@ -192,30 +193,38 @@ import UIKit
       return
     }
     pendingPickResult = result
-    let types: [UTType] = [.gif, .png, .jpeg, .webP, .mpeg4Movie, .quickTimeMovie, .movie]
-    let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+    var configuration = PHPickerConfiguration(photoLibrary: .shared())
+    configuration.filter = .any(of: [.images, .videos])
+    configuration.selectionLimit = 1
+    configuration.preferredAssetRepresentationMode = .current
+    let picker = PHPickerViewController(configuration: configuration)
     picker.delegate = self
-    picker.allowsMultipleSelection = false
     window?.rootViewController?.present(picker, animated: true)
   }
 
-  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-    pendingPickResult?(nil)
-    pendingPickResult = nil
-  }
-
-  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
     guard let pending = pendingPickResult else { return }
     pendingPickResult = nil
-    guard let picked = urls.first else {
+    guard let itemProvider = results.first?.itemProvider else {
       pending(nil)
       return
     }
-    DispatchQueue.global(qos: .userInitiated).async {
-      do {
-        let media = try self.preparePickedMedia(url: picked)
-        DispatchQueue.main.async { pending(media) }
-      } catch {
+
+    loadPickedMediaFile(from: itemProvider) { result in
+      switch result {
+      case .success(let url):
+        DispatchQueue.global(qos: .userInitiated).async {
+          do {
+            let media = try self.preparePickedMedia(url: url)
+            DispatchQueue.main.async { pending(media) }
+          } catch {
+            DispatchQueue.main.async {
+              pending(FlutterError(code: "pick_failed", message: error.localizedDescription, details: nil))
+            }
+          }
+        }
+      case .failure(let error):
         DispatchQueue.main.async {
           pending(FlutterError(code: "pick_failed", message: error.localizedDescription, details: nil))
         }
@@ -243,6 +252,44 @@ import UIKit
       "previewBytes": FlutterStandardTypedData(bytes: previewBytes),
       "animatedPreviewPath": nullable(animatedPreviewPath),
     ]
+  }
+
+  private func loadPickedMediaFile(
+    from itemProvider: NSItemProvider,
+    completion: @escaping (Result<URL, Error>) -> Void
+  ) {
+    let typeIdentifiers = [
+      UTType.movie.identifier,
+      UTType.mpeg4Movie.identifier,
+      UTType.quickTimeMovie.identifier,
+      UTType.gif.identifier,
+      UTType.png.identifier,
+      UTType.jpeg.identifier,
+      UTType.webP.identifier,
+      UTType.image.identifier,
+    ].filter { itemProvider.hasItemConformingToTypeIdentifier($0) }
+
+    guard let typeIdentifier = typeIdentifiers.first else {
+      completion(.failure(BadgeError.message("相册素材格式不支持")))
+      return
+    }
+
+    itemProvider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
+      if let error {
+        completion(.failure(error))
+        return
+      }
+      guard let url else {
+        completion(.failure(BadgeError.message("相册素材读取失败")))
+        return
+      }
+      do {
+        let local = try self.copyPickedFileToCache(url)
+        completion(.success(local))
+      } catch {
+        completion(.failure(error))
+      }
+    }
   }
 
   private func warmVideoAnimatedPreview(uriText: String, displayName: String, result: @escaping FlutterResult) {
@@ -678,7 +725,8 @@ import UIKit
   }
 
   private func cacheDirectory(_ name: String) throws -> URL {
-    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent("badge_assets", isDirectory: true)
     let directory = base.appendingPathComponent(name, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     return directory

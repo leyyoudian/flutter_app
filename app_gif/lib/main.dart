@@ -532,43 +532,130 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
           ),
         ],
       ),
-      bottomNavigationBar: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(28),
-          child: BackdropFilter(
-            filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
-            child: NavigationBar(
-              selectedIndex: _pageIndex,
-              height: 64,
-              backgroundColor: Colors.white.withValues(alpha: 0.08),
-              indicatorColor: Colors.white,
-              labelBehavior: NavigationDestinationLabelBehavior.alwaysHide,
-              onDestinationSelected: (index) =>
-                  setState(() => _pageIndex = index),
-              destinations: const [
-                NavigationDestination(
-                  icon: Icon(Icons.wifi_find),
-                  selectedIcon: Icon(Icons.wifi, color: Colors.black),
-                  label: '设备',
-                ),
-                NavigationDestination(
-                  icon: Icon(Icons.grid_view_rounded),
-                  selectedIcon: Icon(
-                    Icons.grid_view_rounded,
-                    color: Colors.black,
-                  ),
-                  label: '主页',
-                ),
-                NavigationDestination(
-                  icon: Icon(Icons.add_photo_alternate_outlined),
-                  selectedIcon: Icon(
-                    Icons.add_photo_alternate,
-                    color: Colors.black,
-                  ),
-                  label: '制作',
+      bottomNavigationBar: _FloatingBottomNav(
+        selectedIndex: _pageIndex,
+        onSelected: (index) => setState(() => _pageIndex = index),
+      ),
+    );
+  }
+}
+
+class _FloatingBottomNav extends StatelessWidget {
+  const _FloatingBottomNav({
+    required this.selectedIndex,
+    required this.onSelected,
+  });
+
+  final int selectedIndex;
+  final ValueChanged<int> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    final bottomPadding = math.max(8.0, bottomInset + 6.0);
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomPadding),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(30),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: const Color(0xff181818).withValues(alpha: 0.82),
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.035),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.34),
+                  blurRadius: 24,
+                  offset: const Offset(0, 10),
                 ),
               ],
+            ),
+            child: SizedBox(
+              key: const ValueKey('floating-bottom-nav'),
+              height: 62,
+              child: Row(
+                children: [
+                  _BottomNavButton(
+                    index: 0,
+                    selectedIndex: selectedIndex,
+                    icon: Icons.wifi_find,
+                    selectedIcon: Icons.wifi,
+                    tooltip: '设备',
+                    onSelected: onSelected,
+                  ),
+                  _BottomNavButton(
+                    index: 1,
+                    selectedIndex: selectedIndex,
+                    icon: Icons.grid_view_rounded,
+                    selectedIcon: Icons.grid_view_rounded,
+                    tooltip: '主页',
+                    onSelected: onSelected,
+                  ),
+                  _BottomNavButton(
+                    index: 2,
+                    selectedIndex: selectedIndex,
+                    icon: Icons.add_photo_alternate_outlined,
+                    selectedIcon: Icons.add_photo_alternate,
+                    tooltip: '制作',
+                    onSelected: onSelected,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _BottomNavButton extends StatelessWidget {
+  const _BottomNavButton({
+    required this.index,
+    required this.selectedIndex,
+    required this.icon,
+    required this.selectedIcon,
+    required this.tooltip,
+    required this.onSelected,
+  });
+
+  final int index;
+  final int selectedIndex;
+  final IconData icon;
+  final IconData selectedIcon;
+  final String tooltip;
+  final ValueChanged<int> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final selected = index == selectedIndex;
+
+    return Expanded(
+      child: Center(
+        child: Tooltip(
+          message: tooltip,
+          child: InkResponse(
+            radius: 34,
+            onTap: () => onSelected(index),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              curve: Curves.easeOutCubic,
+              width: selected ? 76 : 54,
+              height: 44,
+              decoration: BoxDecoration(
+                color: selected ? Colors.white : Colors.transparent,
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Icon(
+                selected ? selectedIcon : icon,
+                color: selected ? Colors.black : Colors.white,
+                size: 29,
+              ),
             ),
           ),
         ),
@@ -1269,6 +1356,7 @@ class _TransformedPreviewMedia extends StatelessWidget {
         File(selected!.animatedPreviewPath!),
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        errorBuilder: _blackPreviewFallback,
       );
     }
     if (selected?.previewBytes != null) {
@@ -1283,6 +1371,7 @@ class _TransformedPreviewMedia extends StatelessWidget {
         File(asset!.animatedPreviewPath!),
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        errorBuilder: _blackPreviewFallback,
       );
     }
     if (_hasPreviewPath(asset?.previewPath)) {
@@ -1290,6 +1379,7 @@ class _TransformedPreviewMedia extends StatelessWidget {
         File(asset!.previewPath!),
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        errorBuilder: _blackPreviewFallback,
       );
     }
     return null;
@@ -1397,6 +1487,7 @@ class _PreviewDial extends StatelessWidget {
                 File(media!.animatedPreviewPath!),
                 fit: BoxFit.cover,
                 gaplessPlayback: true,
+                errorBuilder: _blackPreviewFallback,
               )
             else if (_hasPreviewPath(asset?.animatedPreviewPath))
               _CropTransformView(
@@ -1405,6 +1496,7 @@ class _PreviewDial extends StatelessWidget {
                   File(asset!.animatedPreviewPath!),
                   fit: BoxFit.cover,
                   gaplessPlayback: true,
+                  errorBuilder: _blackPreviewFallback,
                 ),
               )
             else if (_hasPreviewPath(asset?.previewPath))
@@ -1412,6 +1504,7 @@ class _PreviewDial extends StatelessWidget {
                 File(asset!.previewPath!),
                 fit: BoxFit.cover,
                 gaplessPlayback: true,
+                errorBuilder: _blackPreviewFallback,
               )
             else
               const Center(
@@ -1650,12 +1743,14 @@ class _HistoryPreview extends StatelessWidget {
         File(entry.animatedPreviewPath!),
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        errorBuilder: _blackPreviewFallback,
       );
     } else if (_hasPreviewPath(previewPath)) {
       child = Image.file(
         File(previewPath!),
         fit: BoxFit.cover,
         gaplessPlayback: true,
+        errorBuilder: _blackPreviewFallback,
       );
     }
 
@@ -2002,6 +2097,23 @@ String? _readNullableString(Object? value) {
   return null;
 }
 
-bool _hasPreviewPath(String? path) => path != null && path.isNotEmpty;
+bool _hasPreviewPath(String? path) =>
+    path != null && path.isNotEmpty && _previewFileExists(path);
+
+bool _previewFileExists(String path) {
+  try {
+    return File(path).existsSync();
+  } on FileSystemException {
+    return false;
+  }
+}
+
+Widget _blackPreviewFallback(
+  BuildContext context,
+  Object error,
+  StackTrace? stackTrace,
+) {
+  return const ColoredBox(color: Colors.black);
+}
 
 bool _isVideoMime(String mime) => mime.toLowerCase().startsWith('video/');
