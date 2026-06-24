@@ -62,6 +62,8 @@ class BadgeHomePage extends StatefulWidget {
 
 class _BadgeHomePageState extends State<BadgeHomePage> {
   static const _channel = MethodChannel('esp_baji/native');
+  static const _privacyPolicyUrl =
+      'https://leyyoudian.github.io/flutter_app/privacy.html';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -156,6 +158,31 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
           setState(() {
             _media = _media?.copyWith(animatedPreviewPath: warmPreviewPath);
           });
+        }
+        break;
+      case 'assetPreviewReady':
+        final assetPreviewPath = _readNullableString(
+          event['animatedPreviewPath'],
+        );
+        final uri = event['uri'] as String?;
+        final assetPath = event['assetPath'] as String?;
+        if (_hasPreviewPath(assetPreviewPath)) {
+          setState(() {
+            if (_asset?.assetPath == assetPath) {
+              _asset = _asset?.copyWith(animatedPreviewPath: assetPreviewPath);
+            }
+            for (var index = 0; index < _history.length; index++) {
+              final entry = _history[index];
+              if (entry.assetPath == assetPath ||
+                  (assetPath == null && entry.sourceUri == uri)) {
+                _history[index] = entry.copyWith(
+                  animatedPreviewPath: assetPreviewPath,
+                );
+                break;
+              }
+            }
+          });
+          unawaited(_saveHistory());
         }
         break;
     }
@@ -384,6 +411,48 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
     }
   }
 
+  Future<void> _openPrivacyPolicyUrl() async {
+    try {
+      await _invokeNative<void>('openUrl', {'url': _privacyPolicyUrl});
+    } on PlatformException catch (error) {
+      if (mounted) {
+        _showSnack(error.message ?? error.code);
+      }
+    }
+  }
+
+  void _showPrivacyPolicy() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xff171717),
+        title: const Text('隐私政策'),
+        content: SingleChildScrollView(
+          child: Text(
+            'ESP Baji 不收集、出售或分享个人信息。\n\n'
+            '导入的图片、GIF 和视频只在本机处理，并仅在用户操作时通过本地 Wi-Fi 发送到已连接的 ESP 设备。'
+            '应用不会上传素材到第三方服务器，也不使用广告或分析 SDK。\n\n'
+            '公开隐私政策链接：\n$_privacyPolicyUrl',
+            style: const TextStyle(height: 1.45),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('关闭'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              unawaited(_openPrivacyPolicyUrl());
+            },
+            child: const Text('打开网页'),
+          ),
+        ],
+      ),
+    );
+  }
+
   bool get _isDefaultCrop {
     return (_cropTransform.scale - 1).abs() < 0.0001 &&
         _cropTransform.offset.distance < 0.0001;
@@ -418,6 +487,7 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
   }
 
   Future<void> _deleteHistoryEntry(HistoryEntry entry) async {
+    await _deleteNativeAssetFiles(entry);
     setState(() {
       _history.removeWhere((item) => item.assetPath == entry.assetPath);
       if (_asset?.assetPath == entry.assetPath) {
@@ -426,6 +496,14 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
       _status = '已删除历史记录';
     });
     await _saveHistory();
+  }
+
+  Future<void> _deleteNativeAssetFiles(HistoryEntry entry) async {
+    await _invokeNative<void>('deleteAssetFiles', {
+      'assetPath': entry.assetPath,
+      'previewPath': entry.previewPath,
+      'animatedPreviewPath': entry.animatedPreviewPath,
+    });
   }
 
   Future<void> _confirmDeleteHistoryEntry(HistoryEntry entry) async {
@@ -494,6 +572,7 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
         onConnect: _connect,
         onDisconnect: _disconnect,
         onBrightness: _setBrightness,
+        onPrivacyPolicy: _showPrivacyPolicy,
       ),
       _DisplayLibraryPage(
         active: _pageIndex == 1,
@@ -528,72 +607,13 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
         children: [
           const _Backdrop(),
           SafeArea(
-            child: Column(
-              children: [
-                Expanded(
-                  child: IndexedStack(index: _pageIndex, children: pages),
-                ),
-                const _PrivacyLink(),
-              ],
-            ),
+            child: IndexedStack(index: _pageIndex, children: pages),
           ),
         ],
       ),
       bottomNavigationBar: _FloatingBottomNav(
         selectedIndex: _pageIndex,
         onSelected: (index) => setState(() => _pageIndex = index),
-      ),
-    );
-  }
-}
-
-class _PrivacyLink extends StatelessWidget {
-  const _PrivacyLink();
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          GestureDetector(
-            onTap: () => _openPrivacyPolicy(context),
-            child: Text(
-              '隐私政策',
-              style: TextStyle(
-                color: Colors.white.withValues(alpha: 0.4),
-                fontSize: 12,
-                decoration: TextDecoration.underline,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _openPrivacyPolicy(BuildContext context) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text('隐私政策', style: TextStyle(color: Colors.white)),
-        content: const SingleChildScrollView(
-          child: Text(
-            '本应用（ESP Baji）不会收集、存储或分享您的任何个人信息。\n\n'
-            '应用通过本地 WiFi 连接您的 ESP32 设备进行通信，所有数据传输仅在您的局域网内进行。\n\n'
-            '我们不会将任何数据发送到第三方服务器。\n\n'
-            '如果您有任何疑问，请联系我们：ley98752_ley@163.com',
-            style: TextStyle(color: Colors.white70, fontSize: 14),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('关闭', style: TextStyle(color: Colors.white)),
-          ),
-        ],
       ),
     );
   }
@@ -964,6 +984,7 @@ class _DevicePage extends StatelessWidget {
     required this.onConnect,
     required this.onDisconnect,
     required this.onBrightness,
+    required this.onPrivacyPolicy,
   });
 
   final List<BadgeDevice> devices;
@@ -978,6 +999,7 @@ class _DevicePage extends StatelessWidget {
   final ValueChanged<BadgeDevice> onConnect;
   final VoidCallback onDisconnect;
   final ValueChanged<int> onBrightness;
+  final VoidCallback onPrivacyPolicy;
 
   @override
   Widget build(BuildContext context) {
@@ -1126,6 +1148,21 @@ class _DevicePage extends StatelessWidget {
               ),
             ),
           ),
+        const SizedBox(height: 8),
+        Center(
+          child: TextButton(
+            key: const ValueKey('privacy-policy-link'),
+            onPressed: onPrivacyPolicy,
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white.withValues(alpha: 0.46),
+              minimumSize: Size.zero,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              textStyle: const TextStyle(fontSize: 12),
+            ),
+            child: const Text('隐私政策'),
+          ),
+        ),
       ],
     );
   }
@@ -1975,11 +2012,14 @@ class PreparedAsset {
   final double cropOffsetX;
   final double cropOffsetY;
 
-  PreparedAsset copyWith({CropTransform? cropTransform}) {
+  PreparedAsset copyWith({
+    CropTransform? cropTransform,
+    String? animatedPreviewPath,
+  }) {
     return PreparedAsset(
       assetPath: assetPath,
       previewPath: previewPath,
-      animatedPreviewPath: animatedPreviewPath,
+      animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
       sourceUri: sourceUri,
       mime: mime,
       name: name,
@@ -1999,6 +2039,7 @@ class PreparedAsset {
       offset: Offset(cropOffsetX, cropOffsetY),
     );
   }
+
 }
 
 class CropTransform {
@@ -2112,6 +2153,25 @@ class HistoryEntry {
     return CropTransform(
       scale: cropScale,
       offset: Offset(cropOffsetX, cropOffsetY),
+    );
+  }
+
+  HistoryEntry copyWith({String? animatedPreviewPath}) {
+    return HistoryEntry(
+      assetPath: assetPath,
+      previewPath: previewPath,
+      animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
+      sourceUri: sourceUri,
+      mime: mime,
+      name: name,
+      packageSize: packageSize,
+      frameCount: frameCount,
+      fps: fps,
+      crc32: crc32,
+      createdAt: createdAt,
+      cropScale: cropScale,
+      cropOffsetX: cropOffsetX,
+      cropOffsetY: cropOffsetY,
     );
   }
 }

@@ -1,4 +1,35 @@
 workflows:
+  ios_app_store:
+    name: iOS App Store IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    working_directory: app_gif
+    integrations:
+      app_store_connect: codemagic
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.leyyoudian.espbaji
+    scripts:
+      - name: Get Flutter packages
+        script: |
+          flutter packages pub get
+      - name: Install pods
+        script: |
+          find . -name "Podfile" -execdir pod install \;
+      - name: Set up App Store code signing
+        script: |
+          xcode-project use-profiles
+      - name: Build app-store-ipa
+        script: |
+          flutter build ipa --release --export-options-plist=$HOME/export_options.plist
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - flutter_drive.log
+
   ios-release:
     name: iOS Release IPA
     instance_type: mac_mini_m2
@@ -43,45 +74,4 @@ workflows:
           - leyyoudian@example.com
         notify:
           success: true
-          failure: false
-
-  ios-app-store:
-    name: iOS App Store
-    instance_type: mac_mini_m2
-    max_build_duration: 120
-    working_directory: app_gif
-    environment:
-      flutter: stable
-      xcode: latest
-      cocoapods: default
-      ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.example.appGif
-    scripts:
-      - name: Set up code signing
-        script: |
-          xcode-project use-profiles
-      - name: Get Flutter packages
-        script: |
-          flutter packages pub get
-      - name: Install pods
-        script: |
-          find . -name "Podfile" -execdir pod install \;
-      - name: Build iOS release for App Store
-        script: |
-          flutter build ipa --release
-    artifacts:
-      - build/ios/ipa/*.ipa
-      - /tmp/xcodebuild_logs/*.log
-      - flutter_drive.log
-    publishing:
-      email:
-        recipients:
-          - leyyoudian@example.com
-        notify:
-          success: true
-          failure: false
-      app_store_connect:
-        auth: integration
-        submit_to_testflight: true
-        submit_to_app_store: false
+          failure: true
