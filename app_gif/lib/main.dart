@@ -528,13 +528,72 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
         children: [
           const _Backdrop(),
           SafeArea(
-            child: IndexedStack(index: _pageIndex, children: pages),
+            child: Column(
+              children: [
+                Expanded(
+                  child: IndexedStack(index: _pageIndex, children: pages),
+                ),
+                const _PrivacyLink(),
+              ],
+            ),
           ),
         ],
       ),
       bottomNavigationBar: _FloatingBottomNav(
         selectedIndex: _pageIndex,
         onSelected: (index) => setState(() => _pageIndex = index),
+      ),
+    );
+  }
+}
+
+class _PrivacyLink extends StatelessWidget {
+  const _PrivacyLink();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          GestureDetector(
+            onTap: () => _openPrivacyPolicy(context),
+            child: Text(
+              '隐私政策',
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.4),
+                fontSize: 12,
+                decoration: TextDecoration.underline,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openPrivacyPolicy(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text('隐私政策', style: TextStyle(color: Colors.white)),
+        content: const SingleChildScrollView(
+          child: Text(
+            '本应用（ESP Baji）不会收集、存储或分享您的任何个人信息。\n\n'
+            '应用通过本地 WiFi 连接您的 ESP32 设备进行通信，所有数据传输仅在您的局域网内进行。\n\n'
+            '我们不会将任何数据发送到第三方服务器。\n\n'
+            '如果您有任何疑问，请联系我们：ley98752_ley@163.com',
+            style: TextStyle(color: Colors.white70, fontSize: 14),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭', style: TextStyle(color: Colors.white)),
+          ),
+        ],
       ),
     );
   }
