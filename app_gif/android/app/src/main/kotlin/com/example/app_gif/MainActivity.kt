@@ -27,6 +27,11 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Movie
 import android.graphics.Paint
+import android.media.Image
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.ConnectivityManager
 import android.net.Network
@@ -53,6 +58,7 @@ import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
+import java.nio.ByteBuffer
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -80,6 +86,7 @@ class MainActivity : FlutterActivity() {
     @Volatile private var isUploading = false
     @Volatile private var badgeWifiNetwork: Network? = null
     @Volatile private var badgeSdAvailable = false
+    private val preparingVideoUri = AtomicReference<String?>(null)
     private var badgeWifiCallback: ConnectivityManager.NetworkCallback? = null
     private var uploadWifiLock: WifiManager.WifiLock? = null
 
@@ -244,13 +251,41 @@ class MainActivity : FlutterActivity() {
                 }
                 uploadAsset(assetPath, result)
             }
-            "loadHistory" -> result.success(loadHistory())
+            "loadHistory" -> loadHistory(result)
             "saveHistory" -> {
                 val items = call.arguments as? List<*> ?: emptyList<Any>()
                 saveHistory(items)
                 result.success(null)
             }
+            "deleteAssetFiles" -> {
+                val map = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
+                deleteAssetFiles(
+                    map["assetPath"] as? String,
+                    map["previewPath"] as? String,
+                    map["animatedPreviewPath"] as? String,
+                )
+                result.success(null)
+            }
+            "openUrl" -> {
+                val url = call.argument<String>("url")
+                if (url.isNullOrBlank()) {
+                    result.error("bad_url", "链接为空", null)
+                    return
+                }
+                openExternalUrl(url, result)
+            }
             else -> result.notImplemented()
+        }
+    }
+
+    private fun openExternalUrl(url: String, result: MethodChannel.Result) {
+        runCatching {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            startActivity(intent)
+        }.onSuccess {
+            result.success(null)
+        }.onFailure { error ->
+            result.error("open_url_failed", error.message ?: "无法打开链接", null)
         }
     }
 
@@ -601,31 +636,38 @@ class MainActivity : FlutterActivity() {
     ) {
         Thread {
             try {
+                val totalStartMs = System.currentTimeMillis()
                 val uri = Uri.parse(uriText)
+                preparingVideoUri.set(if (isVideoMime(normalizeMime(contentResolver.getType(uri), displayName))) uriText else null)
                 val mime = normalizeMime(contentResolver.getType(uri), displayName)
                 val size = querySize(uri)
                 if (isVideoMime(mime) && size > MAX_VIDEO_INPUT_BYTES) {
                     throw IllegalArgumentException("视频文件过大")
                 }
-                val encoder = EbajEncoder { progress ->
-                    sendEvent(mapOf("type" to "prepareProgress", "progress" to progress))
-                }
+                val encoder = EbajEncoder(::sendEncodePrepareProgress)
+                val encodeStartMs = System.currentTimeMillis()
                 val encoded = encoder.encode(this, uri, mime, fps, maxPackageBytes, crop)
+                val encodeMs = System.currentTimeMillis() - encodeStartMs
+                sendPrepareProgress(PREPARE_PROGRESS_WRITING)
                 val directory = persistentAssetDirectory("ebaj")
                 val stem = "${System.currentTimeMillis()}_${safeFileName(displayName)}"
                 val file = File(directory, "$stem.ebaj")
+                val writeStartMs = System.currentTimeMillis()
                 file.writeBytes(encoded.packageBytes)
+                val writeMs = System.currentTimeMillis() - writeStartMs
+                val previewStartMs = System.currentTimeMillis()
                 val previewPath = buildPreviewBytes(uri, mime, null, crop)?.let { preview ->
                     File(directory, "$stem.png").also { it.writeBytes(preview) }.absolutePath
                 }
                 val animatedPreviewPath = if (isVideoMime(mime)) {
-                    buildVideoAnimatedPreview(uri, crop, warmPreviewPath)?.let { preview ->
+                    reusableWarmPreviewBytes(warmPreviewPath)?.let { preview ->
                         File(directory, "$stem.gif").also { it.writeBytes(preview) }.absolutePath
                     }
                 } else {
                     val bytes = readUriBytes(uri)
                     copyAnimatedPreview(bytes, directory, stem)
                 }
+                val previewMs = System.currentTimeMillis() - previewStartMs
                 val response = mapOf(
                     "assetPath" to file.absolutePath,
                     "previewPath" to previewPath,
@@ -638,13 +680,32 @@ class MainActivity : FlutterActivity() {
                     "fps" to encoded.fps,
                     "crc32" to encoded.crc32,
                 )
+                val totalMs = System.currentTimeMillis() - totalStartMs
+                sendPrepareProgress(PREPARE_PROGRESS_DONE)
+                android.util.Log.i(
+                    "BadgePrepare",
+                    "prepare perf mime=$mime frames=${encoded.frameCount} fps=${encoded.fps} size=${encoded.packageBytes.size} encode=${encodeMs}ms write=${writeMs}ms preview=${previewMs}ms total=${totalMs}ms",
+                )
                 mainHandler.post { result.success(response) }
+                if (isVideoMime(mime) && animatedPreviewPath.isNullOrBlank()) {
+                    scheduleVideoAnimatedPreview(uri, uriText, directory, stem, crop, "assetPreviewReady", file.absolutePath)
+                }
             } catch (error: Exception) {
                 mainHandler.post {
                     result.error("prepare_failed", error.message ?: "素材处理失败", null)
                 }
+            } finally {
+                preparingVideoUri.compareAndSet(uriText, null)
             }
         }.start()
+    }
+
+    private fun sendPrepareProgress(progress: Double) {
+        sendEvent(mapOf("type" to "prepareProgress", "progress" to progress.coerceIn(0.0, 1.0)))
+    }
+
+    private fun sendEncodePrepareProgress(progress: Double) {
+        sendPrepareProgress(progress * PREPARE_PROGRESS_PACKING)
     }
 
     private fun warmVideoAnimatedPreview(uriText: String, displayName: String, result: MethodChannel.Result) {
@@ -656,15 +717,40 @@ class MainActivity : FlutterActivity() {
                 if (!isVideoMime(mime)) {
                     return@Thread
                 }
+                if (preparingVideoUri.get() == uriText) {
+                    return@Thread
+                }
                 val directory = persistentAssetDirectory("media_preview")
                 val stem = "${System.currentTimeMillis()}_${safeFileName(displayName)}"
-                val preview = buildVideoAnimatedPreview(uri, CropTransform.DEFAULT)
-                    ?: return@Thread
+                scheduleVideoAnimatedPreview(uri, uriText, directory, stem, CropTransform.DEFAULT, "videoPreviewReady")
+            }
+        }.start()
+    }
+
+    private fun scheduleVideoAnimatedPreview(
+        uri: Uri,
+        uriText: String,
+        directory: File,
+        stem: String,
+        crop: CropTransform,
+        eventType: String,
+        assetPath: String? = null,
+    ) {
+        Thread {
+            runCatching {
+                val previewStartMs = System.currentTimeMillis()
+                val preview = buildVideoAnimatedPreview(uri, crop) ?: return@Thread
                 val path = File(directory, "$stem.gif").also { it.writeBytes(preview) }.absolutePath
+                val previewMs = System.currentTimeMillis() - previewStartMs
+                android.util.Log.i(
+                    "BadgePrepare",
+                    "animated preview ready event=$eventType bytes=${preview.size} time=${previewMs}ms",
+                )
                 sendEvent(
-                    mapOf(
-                        "type" to "videoPreviewReady",
+                    mutableMapOf<String, Any?>(
+                        "type" to eventType,
                         "uri" to uriText,
+                        "assetPath" to assetPath,
                         "animatedPreviewPath" to path,
                     ),
                 )
@@ -1169,36 +1255,7 @@ class MainActivity : FlutterActivity() {
     private fun buildVideoAnimatedPreview(uri: Uri, crop: CropTransform, warmPreviewPath: String? = null): ByteArray? {
         return runCatching {
             reusableWarmPreviewBytes(warmPreviewPath)?.let { return@runCatching it }
-            val retriever = createRetriever(this, uri)
-            try {
-                val durationMs = retriever
-                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    ?.toLongOrNull()
-                    ?.coerceAtLeast(1L)
-                    ?: 1000L
-                val delayMs = frameDelayMs(VIDEO_PREVIEW_GIF_FPS)
-                val totalFrames = max(1, ((durationMs + delayMs - 1) / delayMs).toInt())
-                val frames = mutableListOf<ByteArray>()
-                for (index in 0 until totalFrames) {
-                    val timeUs = min(
-                        (durationMs - 1L) * 1000L,
-                        index.toLong() * delayMs.toLong() * 1000L,
-                    )
-                    val source = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        ?: continue
-                    val bitmap = renderBitmapFrame(source, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, crop)
-                    val indexed = quantizeBitmapToGifIndexed(bitmap)
-                    bitmap.recycle()
-                    frames += indexed
-                }
-                if (frames.isEmpty()) {
-                    null
-                } else {
-                    encodeIndexedGif(frames, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, delayMs)
-                }
-            } finally {
-                retriever.release()
-            }
+            EbajEncoder {}.buildVideoAnimatedPreview(this, uri, crop)
         }.getOrNull()
     }
 
@@ -1257,19 +1314,42 @@ class MainActivity : FlutterActivity() {
         return File(filesDir, "badge_assets/$name").apply { mkdirs() }
     }
 
-    private fun loadHistory(): List<Map<String, Any?>> {
+    private fun loadHistory(result: MethodChannel.Result) {
+        Thread {
+            val history = runCatching { loadAndRepairHistory() }.getOrDefault(emptyList())
+            mainHandler.post { result.success(history) }
+        }.start()
+    }
+
+    private fun loadAndRepairHistory(): List<Map<String, Any?>> {
         val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(HISTORY_KEY, "[]")
         val array = JSONArray(raw)
-        val result = mutableListOf<Map<String, Any?>>()
+        val output = mutableListOf<Map<String, Any?>>()
+        var changed = false
         for (index in 0 until array.length()) {
             val item = array.optJSONObject(index) ?: continue
-            result += mapOf(
+            val repaired = repairHistoryItem(item)
+            changed = changed || repaired.toString() != item.toString()
+            output += historyMap(repaired)
+            array.put(index, repaired)
+        }
+        if (changed) {
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(HISTORY_KEY, array.toString())
+                .apply()
+        }
+        return output
+    }
+
+    private fun historyMap(item: JSONObject): Map<String, Any?> {
+        return mapOf(
                 "assetPath" to item.optString("assetPath"),
                 "previewPath" to item.optString("previewPath"),
-                    "animatedPreviewPath" to item.optString("animatedPreviewPath"),
-                    "sourceUri" to item.optString("sourceUri"),
-                    "mime" to item.optString("mime"),
-                    "name" to item.optString("name"),
+                "animatedPreviewPath" to item.optString("animatedPreviewPath"),
+                "sourceUri" to item.optString("sourceUri"),
+                "mime" to item.optString("mime"),
+                "name" to item.optString("name"),
                 "packageSize" to item.optInt("packageSize"),
                 "frameCount" to item.optInt("frameCount"),
                 "fps" to item.optInt("fps"),
@@ -1279,8 +1359,101 @@ class MainActivity : FlutterActivity() {
                 "cropOffsetX" to item.optDouble("cropOffsetX", 0.0),
                 "cropOffsetY" to item.optDouble("cropOffsetY", 0.0),
             )
+    }
+
+    private fun repairHistoryItem(item: JSONObject): JSONObject {
+        val repaired = JSONObject(item.toString())
+        val sourceUriText = repaired.optString("sourceUri")
+        if (sourceUriText.isBlank() || sourceUriText == "null") {
+            return repaired
         }
-        return result
+
+        val uri = runCatching { Uri.parse(sourceUriText) }.getOrNull() ?: return repaired
+        val name = repaired.optString("name").ifBlank { "asset" }
+        val mime = normalizeMime(repaired.optString("mime"), name)
+        val crop = CropTransform(
+            scale = repaired.optDouble("cropScale", 1.0).coerceIn(1.0, 4.0),
+            offsetX = repaired.optDouble("cropOffsetX", 0.0).coerceIn(-1.5, 1.5),
+            offsetY = repaired.optDouble("cropOffsetY", 0.0).coerceIn(-1.5, 1.5),
+        )
+        val directory = persistentAssetDirectory("ebaj")
+        val stem = "restored_${repaired.optLong("createdAt", System.currentTimeMillis())}_${safeFileName(name)}"
+        var changed = false
+
+        if (!existingFilePath(repaired.optString("animatedPreviewPath"))) {
+            val restoredAnimated = runCatching {
+                if (isVideoMime(mime)) {
+                    buildVideoAnimatedPreview(uri, crop, null)?.let { preview ->
+                        File(directory, "$stem.gif").also { it.writeBytes(preview) }.absolutePath
+                    }
+                } else {
+                    copyAnimatedPreview(readUriBytes(uri), directory, stem)
+                }
+            }.getOrNull()
+            if (!restoredAnimated.isNullOrBlank()) {
+                repaired.put("animatedPreviewPath", restoredAnimated)
+                changed = true
+            }
+        }
+
+        if (!existingFilePath(repaired.optString("previewPath"))) {
+            val restoredPreview = runCatching {
+                buildPreviewBytes(uri, mime, null, crop)?.let { preview ->
+                    File(directory, "$stem.png").also { it.writeBytes(preview) }.absolutePath
+                }
+            }.getOrNull()
+            if (!restoredPreview.isNullOrBlank()) {
+                repaired.put("previewPath", restoredPreview)
+                changed = true
+            }
+        }
+
+        if (!existingFilePath(repaired.optString("assetPath"))) {
+            val restoredAsset = runCatching {
+                val fps = repaired.optInt("fps", 25).coerceIn(1, 60)
+                val encoded = EbajEncoder {}.encode(
+                    this,
+                    uri,
+                    mime,
+                    fps,
+                    resolveBadgePackageBudget(true),
+                    crop,
+                )
+                File(directory, "$stem.ebaj").also { it.writeBytes(encoded.packageBytes) }
+                    .absolutePath
+            }.getOrNull()
+            if (!restoredAsset.isNullOrBlank()) {
+                repaired.put("assetPath", restoredAsset)
+                changed = true
+            }
+        }
+
+        return if (changed) repaired else item
+    }
+
+    private fun existingFilePath(path: String?): Boolean {
+        if (path.isNullOrBlank() || path == "null") {
+            return false
+        }
+        val file = File(path)
+        return file.exists() && file.isFile && file.length() > 0L
+    }
+
+    private fun deleteAssetFiles(assetPath: String?, previewPath: String?, animatedPreviewPath: String?) {
+        listOf(assetPath, previewPath, animatedPreviewPath)
+            .filterNotNull()
+            .distinct()
+            .forEach { path ->
+                runCatching {
+                    val file = File(path)
+                    val root = File(filesDir, "badge_assets").canonicalFile
+                    val target = file.canonicalFile
+                    val inAssetRoot = target == root || target.path.startsWith(root.path + File.separator)
+                    if (inAssetRoot && target.isFile) {
+                        target.delete()
+                    }
+                }
+            }
     }
 
     private fun saveHistory(items: List<*>) {
@@ -1362,6 +1535,40 @@ class MainActivity : FlutterActivity() {
         }
 
         private fun encodeVideoFrames(
+            context: Context,
+            uri: Uri,
+            delayMs: Int,
+            streamSize: Int,
+            crop: CropTransform,
+        ): List<EncodedFrame> {
+            return runCatching {
+                val durationMs = videoDurationMs(context, uri)
+                val totalFrames = max(1, ((durationMs + delayMs - 1) / delayMs).toInt())
+                val targetFrameTimesUs = LongArray(totalFrames) { index ->
+                    min((durationMs - 1L) * 1000L, index.toLong() * delayMs.toLong() * 1000L)
+                }
+                val frames = mutableListOf<EncodedFrame>()
+                var previous: ByteArray? = null
+
+                decodeVideoFramesSequentially(context, uri, targetFrameTimesUs, streamSize, streamSize, crop) { index, bitmap ->
+                    val indexed = quantizeToIndexed(bitmap)
+                    bitmap.recycle()
+                    val frame = encodeFrame(indexed, previous, delayMs, streamSize, forceKeyframe = index == 0)
+                    frames += frame
+                    previous = indexed
+                    onProgress((index + 1).toDouble() / totalFrames.toDouble())
+                }
+                if (frames.isEmpty()) {
+                    throw IllegalArgumentException("视频帧读取失败")
+                }
+                frames
+            }.getOrElse { error ->
+                android.util.Log.w("BadgePrepare", "sequential video decode failed, falling back: ${error.message}")
+                encodeVideoFramesWithRetriever(context, uri, delayMs, streamSize, crop)
+            }
+        }
+
+        private fun encodeVideoFramesWithRetriever(
             context: Context,
             uri: Uri,
             delayMs: Int,
@@ -1466,6 +1673,389 @@ class MainActivity : FlutterActivity() {
             } finally {
                 retriever.release()
             }
+        }
+
+        fun buildVideoAnimatedPreview(
+            context: Context,
+            uri: Uri,
+            crop: CropTransform,
+        ): ByteArray? {
+            val durationMs = videoDurationMs(context, uri)
+            val delayMs = frameDelayMs(VIDEO_PREVIEW_GIF_FPS)
+            val totalFrames = max(1, ((durationMs + delayMs - 1) / delayMs).toInt())
+            val targetFrameTimesUs = LongArray(totalFrames) { index ->
+                min((durationMs - 1L) * 1000L, index.toLong() * delayMs.toLong() * 1000L)
+            }
+            val frames = mutableListOf<ByteArray>()
+            decodeVideoPreviewFramesSequentially(context, uri, targetFrameTimesUs, crop) { _, indexed ->
+                frames += indexed
+            }
+            if (frames.isEmpty()) {
+                return null
+            }
+            return encodeIndexedGif(frames, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, delayMs)
+        }
+
+        private fun decodeVideoPreviewFramesSequentially(
+            context: Context,
+            uri: Uri,
+            targetFrameTimesUs: LongArray,
+            crop: CropTransform,
+            onFrame: (Int, ByteArray) -> Unit,
+        ) {
+            if (targetFrameTimesUs.isEmpty()) {
+                return
+            }
+
+            val extractor = MediaExtractor()
+            var decoder: MediaCodec? = null
+            try {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                    extractor.setDataSource(descriptor.fileDescriptor)
+                } ?: throw IllegalArgumentException("无法读取视频")
+
+                val trackIndex = selectVideoTrack(extractor)
+                if (trackIndex < 0) {
+                    throw IllegalArgumentException("视频轨道不存在")
+                }
+                extractor.selectTrack(trackIndex)
+                val inputFormat = extractor.getTrackFormat(trackIndex)
+                val mime = inputFormat.getString(MediaFormat.KEY_MIME)
+                    ?: throw IllegalArgumentException("视频格式错误")
+                inputFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                decoder = MediaCodec.createDecoderByType(mime)
+                decoder.configure(inputFormat, null, null, 0)
+                decoder.start()
+
+                val bufferInfo = MediaCodec.BufferInfo()
+                var sawInputEnd = false
+                var sawOutputEnd = false
+                var nextTargetIndex = 0
+
+                while (!sawOutputEnd && nextTargetIndex < targetFrameTimesUs.size) {
+                    if (!sawInputEnd) {
+                        val inputIndex = decoder.dequeueInputBuffer(VIDEO_DECODE_TIMEOUT_US)
+                        if (inputIndex >= 0) {
+                            val inputBuffer = decoder.getInputBuffer(inputIndex)
+                                ?: throw IllegalArgumentException("视频输入缓冲区不可用")
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                decoder.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    0,
+                                    0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                                )
+                                sawInputEnd = true
+                            } else {
+                                decoder.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    sampleSize,
+                                    extractor.sampleTime.coerceAtLeast(0L),
+                                    0,
+                                )
+                                extractor.advance()
+                            }
+                        }
+                    }
+
+                    val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, VIDEO_DECODE_TIMEOUT_US)
+                    when {
+                        outputIndex >= 0 -> {
+                            val presentationTimeUs = bufferInfo.presentationTimeUs
+                            val shouldKeep = bufferInfo.size > 0 &&
+                                presentationTimeUs >= targetFrameTimesUs[nextTargetIndex]
+                            if (shouldKeep) {
+                                val image = decoder.getOutputImage(outputIndex)
+                                if (image != null) {
+                                    try {
+                                        val indexed = quantizeYuvImageToGifIndexed(image, crop)
+                                        while (
+                                            nextTargetIndex < targetFrameTimesUs.size &&
+                                            targetFrameTimesUs[nextTargetIndex] <= presentationTimeUs
+                                        ) {
+                                            onFrame(nextTargetIndex, indexed)
+                                            nextTargetIndex++
+                                        }
+                                    } finally {
+                                        image.close()
+                                    }
+                                }
+                            }
+                            sawOutputEnd = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                            decoder.releaseOutputBuffer(outputIndex, false)
+                        }
+                        outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            // Decoder output format changes are normal for adaptive videos.
+                        }
+                        outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            if (sawInputEnd) {
+                                sawOutputEnd = true
+                            }
+                        }
+                    }
+                }
+            } finally {
+                decoder?.runCatchingStopAndRelease()
+                extractor.release()
+            }
+        }
+
+        private fun decodeVideoFramesSequentially(
+            context: Context,
+            uri: Uri,
+            targetFrameTimesUs: LongArray,
+            width: Int,
+            height: Int,
+            crop: CropTransform,
+            onFrame: (Int, Bitmap) -> Unit,
+        ) {
+            if (targetFrameTimesUs.isEmpty()) {
+                return
+            }
+
+            val extractor = MediaExtractor()
+            var decoder: MediaCodec? = null
+            try {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                    extractor.setDataSource(descriptor.fileDescriptor)
+                } ?: throw IllegalArgumentException("无法读取视频")
+
+                val trackIndex = selectVideoTrack(extractor)
+                if (trackIndex < 0) {
+                    throw IllegalArgumentException("视频轨道不存在")
+                }
+                extractor.selectTrack(trackIndex)
+                val inputFormat = extractor.getTrackFormat(trackIndex)
+                val mime = inputFormat.getString(MediaFormat.KEY_MIME)
+                    ?: throw IllegalArgumentException("视频格式错误")
+                inputFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                decoder = MediaCodec.createDecoderByType(mime)
+                decoder.configure(inputFormat, null, null, 0)
+                decoder.start()
+
+                val bufferInfo = MediaCodec.BufferInfo()
+                var sawInputEnd = false
+                var sawOutputEnd = false
+                var nextTargetIndex = 0
+
+                while (!sawOutputEnd && nextTargetIndex < targetFrameTimesUs.size) {
+                    if (!sawInputEnd) {
+                        val inputIndex = decoder.dequeueInputBuffer(VIDEO_DECODE_TIMEOUT_US)
+                        if (inputIndex >= 0) {
+                            val inputBuffer = decoder.getInputBuffer(inputIndex)
+                                ?: throw IllegalArgumentException("视频输入缓冲区不可用")
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                decoder.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    0,
+                                    0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                                )
+                                sawInputEnd = true
+                            } else {
+                                decoder.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    sampleSize,
+                                    extractor.sampleTime.coerceAtLeast(0L),
+                                    0,
+                                )
+                                extractor.advance()
+                            }
+                        }
+                    }
+
+                    val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, VIDEO_DECODE_TIMEOUT_US)
+                    when {
+                        outputIndex >= 0 -> {
+                            val presentationTimeUs = bufferInfo.presentationTimeUs
+                            val shouldKeep = bufferInfo.size > 0 &&
+                                presentationTimeUs >= targetFrameTimesUs[nextTargetIndex]
+                            if (shouldKeep) {
+                                val image = decoder.getOutputImage(outputIndex)
+                                if (image != null) {
+                                    try {
+                                        val source = imageToBitmap(image)
+                                        val rendered = renderBitmapFrame(source, width, height, crop)
+                                        var emitted = false
+                                        while (
+                                            nextTargetIndex < targetFrameTimesUs.size &&
+                                            targetFrameTimesUs[nextTargetIndex] <= presentationTimeUs
+                                        ) {
+                                            val frameBitmap = if (
+                                                nextTargetIndex + 1 < targetFrameTimesUs.size &&
+                                                targetFrameTimesUs[nextTargetIndex + 1] <= presentationTimeUs
+                                            ) {
+                                                rendered.copy(Bitmap.Config.ARGB_8888, false)
+                                            } else {
+                                                rendered
+                                            }
+                                            emitted = true
+                                            onFrame(nextTargetIndex, frameBitmap)
+                                            nextTargetIndex++
+                                        }
+                                        if (!emitted) {
+                                            rendered.recycle()
+                                        }
+                                    } finally {
+                                        image.close()
+                                    }
+                                }
+                            }
+                            sawOutputEnd = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                            decoder.releaseOutputBuffer(outputIndex, false)
+                        }
+                        outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            // Decoder output format changes are normal for adaptive videos.
+                        }
+                        outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            if (sawInputEnd) {
+                                sawOutputEnd = true
+                            }
+                        }
+                    }
+                }
+            } finally {
+                decoder?.runCatchingStopAndRelease()
+                extractor.release()
+            }
+        }
+
+        private fun MediaCodec.runCatchingStopAndRelease() {
+            runCatching { stop() }
+            runCatching { release() }
+        }
+
+        private fun selectVideoTrack(extractor: MediaExtractor): Int {
+            for (index in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(index)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/")) {
+                    return index
+                }
+            }
+            return -1
+        }
+
+        private fun videoDurationMs(context: Context, uri: Uri): Long {
+            val retriever = createRetriever(context, uri)
+            return try {
+                retriever
+                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull()
+                    ?.coerceAtLeast(1L)
+                    ?: 1000L
+            } finally {
+                retriever.release()
+            }
+        }
+
+        private fun imageToBitmap(image: Image): Bitmap {
+            if (image.format != android.graphics.ImageFormat.YUV_420_888) {
+                throw IllegalArgumentException("视频输出格式不支持: ${image.format}")
+            }
+            val width = image.width
+            val height = image.height
+            val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val pixels = IntArray(width * height)
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+            var offset = 0
+
+            for (y in 0 until height) {
+                val yRow = y * yPlane.rowStride
+                val uvRow = (y / 2) * uPlane.rowStride
+                for (x in 0 until width) {
+                    val yValue = yBuffer.getUnsigned(yRow + x * yPlane.pixelStride)
+                    val uValue = uBuffer.getUnsigned(uvRow + (x / 2) * uPlane.pixelStride)
+                    val vValue = vBuffer.getUnsigned((y / 2) * vPlane.rowStride + (x / 2) * vPlane.pixelStride)
+                    pixels[offset++] = yuvToArgb(yValue, uValue, vValue)
+                }
+            }
+            output.setPixels(pixels, 0, width, 0, 0, width, height)
+            return output
+        }
+
+        private fun quantizeYuvImageToGifIndexed(image: Image, crop: CropTransform): ByteArray {
+            if (image.format != android.graphics.ImageFormat.YUV_420_888) {
+                throw IllegalArgumentException("视频输出格式不支持: ${image.format}")
+            }
+            val output = ByteArray(VIDEO_PREVIEW_GIF_SIZE * VIDEO_PREVIEW_GIF_SIZE)
+            val sourceWidth = image.width
+            val sourceHeight = image.height
+            val scale = max(
+                VIDEO_PREVIEW_GIF_SIZE.toFloat() / sourceWidth.toFloat(),
+                VIDEO_PREVIEW_GIF_SIZE.toFloat() / sourceHeight.toFloat(),
+            ) * crop.scale.toFloat()
+            val dx = (VIDEO_PREVIEW_GIF_SIZE - sourceWidth * scale) / 2f +
+                crop.offsetX.toFloat() * VIDEO_PREVIEW_GIF_SIZE
+            val dy = (VIDEO_PREVIEW_GIF_SIZE - sourceHeight * scale) / 2f +
+                crop.offsetY.toFloat() * VIDEO_PREVIEW_GIF_SIZE
+
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+            var offset = 0
+
+            for (y in 0 until VIDEO_PREVIEW_GIF_SIZE) {
+                val sourceY = ((y + 0.5f - dy) / scale).toInt()
+                if (sourceY !in 0 until sourceHeight) {
+                    offset += VIDEO_PREVIEW_GIF_SIZE
+                    continue
+                }
+                val yRow = sourceY * yPlane.rowStride
+                val uvY = sourceY / 2
+                val uRow = uvY * uPlane.rowStride
+                val vRow = uvY * vPlane.rowStride
+                for (x in 0 until VIDEO_PREVIEW_GIF_SIZE) {
+                    val sourceX = ((x + 0.5f - dx) / scale).toInt()
+                    if (sourceX !in 0 until sourceWidth) {
+                        offset++
+                        continue
+                    }
+                    val uvX = sourceX / 2
+                    val yValue = yBuffer.getUnsigned(yRow + sourceX * yPlane.pixelStride)
+                    val uValue = uBuffer.getUnsigned(uRow + uvX * uPlane.pixelStride)
+                    val vValue = vBuffer.getUnsigned(vRow + uvX * vPlane.pixelStride)
+                    val c = (yValue - 16).coerceAtLeast(0)
+                    val d = uValue - 128
+                    val e = vValue - 128
+                    var red = ((298 * c + 409 * e + 128) shr 8).coerceIn(0, 255)
+                    var green = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
+                    var blue = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
+                    red = (sharpenForIndexed(red) + orderedDither(x, y, 3)).coerceIn(0, 255)
+                    green = (sharpenForIndexed(green) + orderedDither(x, y, 3)).coerceIn(0, 255)
+                    blue = (sharpenForIndexed(blue) + orderedDither(x, y, 2)).coerceIn(0, 255)
+                    output[offset++] = (((red ushr 5) shl 5) or ((green ushr 5) shl 2) or (blue ushr 6)).toByte()
+                }
+            }
+            return output
+        }
+
+        private fun ByteBuffer.getUnsigned(index: Int): Int {
+            return get(index).toInt() and 0xff
+        }
+
+        private fun yuvToArgb(yValue: Int, uValue: Int, vValue: Int): Int {
+            val c = (yValue - 16).coerceAtLeast(0)
+            val d = uValue - 128
+            val e = vValue - 128
+            val red = ((298 * c + 409 * e + 128) shr 8).coerceIn(0, 255)
+            val green = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
+            val blue = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
+            return (0xff shl 24) or (red shl 16) or (green shl 8) or blue
         }
 
         private fun estimateGifBytesPerSecond(
@@ -1848,7 +2438,11 @@ class MainActivity : FlutterActivity() {
         private const val HEIGHT = 480
         private const val PREVIEW_SIZE = 320
         private const val VIDEO_PREVIEW_GIF_SIZE = 192
-        private const val VIDEO_PREVIEW_GIF_FPS = 30
+        private const val VIDEO_PREVIEW_GIF_FPS = 25
+        private const val VIDEO_DECODE_TIMEOUT_US = 10_000L
+        private const val PREPARE_PROGRESS_PACKING = 0.90
+        private const val PREPARE_PROGRESS_WRITING = 0.96
+        private const val PREPARE_PROGRESS_DONE = 1.0
         private const val STREAM_240_PIXELS = 240 * 240
         private const val MAGIC = 0x344a4142
         private const val VERSION = 4

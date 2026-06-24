@@ -35,6 +35,21 @@ void main() {
     expect(find.byKey(const ValueKey('floating-bottom-nav')), findsOneWidget);
   });
 
+  testWidgets('privacy policy link is on device page but not home page', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const BadgeApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('隐私政策'), findsNothing);
+
+    await tester.tap(find.byIcon(Icons.wifi_find));
+    await tester.pumpAndSettle();
+
+    expect(find.text('隐私政策'), findsOneWidget);
+    expect(find.byKey(const ValueKey('privacy-policy-link')), findsOneWidget);
+  });
+
   test('keeps animated preview paths in asset history', () {
     final selected = SelectedMedia.fromMap({
       'uri': 'content://asset.gif',
@@ -128,6 +143,27 @@ void main() {
 
     expect(source, contains('errorBuilder: _blackPreviewFallback'));
     expect(source, contains('bool _previewFileExists'));
+    expect(source, contains("'deleteAssetFiles'"));
+    expect(source, contains('_deleteNativeAssetFiles'));
     expect(source, isNot(contains('bool _hasPreviewPath(String? path) => path != null && path.isNotEmpty;')));
+  });
+
+  test('privacy policy is public and opened through native url launcher', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    final privacy = File('../docs/privacy.html').readAsStringSync();
+
+    expect(source, contains('https://leyyoudian.github.io/flutter_app/privacy.html'));
+    expect(source, contains("'openUrl'"));
+    expect(source, contains('privacy-policy-link'));
+    expect(privacy, contains('ESP Baji Privacy Policy'));
+    expect(privacy, contains('本应用不会收集、出售或分享个人信息'));
+  });
+
+  test('support page is public for App Store Connect metadata', () {
+    final support = File('../docs/support.html').readAsStringSync();
+
+    expect(support, contains('ESP Baji Support'));
+    expect(support, contains('ley98752_ley@163.com'));
+    expect(support, contains('隐私政策'));
   });
 }

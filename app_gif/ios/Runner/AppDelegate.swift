@@ -1,5 +1,7 @@
 import AVFoundation
 import CoreGraphics
+import CoreMedia
+import CoreVideo
 import Flutter
 import ImageIO
 import Network
@@ -98,6 +100,25 @@ import UIKit
     case "saveHistory":
       saveHistory(call.arguments as? [[String: Any]] ?? [])
       result(nil)
+    case "deleteAssetFiles":
+      deleteAssetFiles(
+        assetPath: args["assetPath"] as? String,
+        previewPath: args["previewPath"] as? String,
+        animatedPreviewPath: args["animatedPreviewPath"] as? String
+      )
+      result(nil)
+    case "openUrl":
+      guard let urlText = args["url"] as? String, let url = URL(string: urlText) else {
+        result(FlutterError(code: "bad_url", message: "链接为空", details: nil))
+        return
+      }
+      UIApplication.shared.open(url, options: [:]) { success in
+        if success {
+          result(nil)
+        } else {
+          result(FlutterError(code: "open_url_failed", message: "无法打开链接", details: nil))
+        }
+      }
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -298,13 +319,14 @@ import UIKit
       do {
         let url = try self.url(from: uriText)
         guard self.isVideoMime(self.mimeType(for: url)) else { return }
-        let data = try self.buildVideoAnimatedPreview(url: url, crop: .default, warmPreviewPath: nil)
-        let path = try self.writeCacheFile(data: data, directoryName: "media_preview", stem: self.safeFileName(displayName), ext: "gif")
-        self.sendEvent([
-          "type": "videoPreviewReady",
-          "uri": uriText,
-          "animatedPreviewPath": path,
-        ])
+        self.scheduleVideoAnimatedPreview(
+          url: url,
+          uriText: uriText,
+          directoryName: "media_preview",
+          stem: self.safeFileName(displayName),
+          crop: .default,
+          eventType: "videoPreviewReady"
+        )
       } catch {
       }
     }
@@ -337,8 +359,13 @@ import UIKit
         )
         let animatedPreviewPath: String?
         if self.isVideoMime(mime) {
-          let gifData = try self.buildVideoAnimatedPreview(url: url, crop: crop, warmPreviewPath: warmPreviewPath)
-          animatedPreviewPath = try self.writeCacheFile(data: gifData, directoryName: "ebaj", stem: stem, ext: "gif")
+          if let warmPreviewPath,
+             FileManager.default.fileExists(atPath: URL(fileURLWithPath: warmPreviewPath).path) {
+            let gifData = try Data(contentsOf: URL(fileURLWithPath: warmPreviewPath))
+            animatedPreviewPath = try self.writeCacheFile(data: gifData, directoryName: "ebaj", stem: stem, ext: "gif")
+          } else {
+            animatedPreviewPath = nil
+          }
         } else if self.isGif(url) {
           animatedPreviewPath = try self.copyAnimatedPreview(source: url, directoryName: "ebaj", stem: stem)
         } else {
@@ -358,10 +385,52 @@ import UIKit
             "crc32": Int(encoded.crc32),
           ])
         }
+        if self.isVideoMime(mime), animatedPreviewPath == nil {
+          self.scheduleVideoAnimatedPreview(
+            url: url,
+            uriText: url.absoluteString,
+            directoryName: "ebaj",
+            stem: stem,
+            crop: crop,
+            eventType: "assetPreviewReady",
+            assetPath: assetPath
+          )
+        }
       } catch {
         DispatchQueue.main.async {
           result(FlutterError(code: "prepare_failed", message: error.localizedDescription, details: nil))
         }
+      }
+    }
+  }
+
+  private func scheduleVideoAnimatedPreview(
+    url: URL,
+    uriText: String,
+    directoryName: String,
+    stem: String,
+    crop: CropTransform,
+    eventType: String,
+    assetPath: String? = nil
+  ) {
+    DispatchQueue.global(qos: .utility).async {
+      do {
+        let started = Date()
+        let data = try self.buildVideoAnimatedPreview(url: url, crop: crop, warmPreviewPath: nil)
+        let path = try self.writeCacheFile(data: data, directoryName: directoryName, stem: stem, ext: "gif")
+        NSLog(
+          "BadgePrepare animated preview ready event=%@ bytes=%ld time=%ldms",
+          eventType as NSString,
+          data.count,
+          Int(Date().timeIntervalSince(started) * 1000)
+        )
+        self.sendEvent([
+          "type": eventType,
+          "uri": uriText,
+          "assetPath": nullable(assetPath),
+          "animatedPreviewPath": path,
+        ])
+      } catch {
       }
     }
   }
@@ -513,22 +582,82 @@ import UIKit
         return try Data(contentsOf: warm)
       }
     }
+    let delayMs = frameDelayMs(BadgeConstants.videoPreviewGifFps)
+    let frames = try buildVideoPreviewFrames(url: url, crop: crop)
+    return try encodeIndexedGif(frames: frames, width: BadgeConstants.videoPreviewGifSize, height: BadgeConstants.videoPreviewGifSize, delayMs: delayMs)
+  }
+
+  private func buildVideoPreviewFrames(url: URL, crop: CropTransform) throws -> [Data] {
     let asset = AVAsset(url: url)
     let durationMs = max(1, Int(CMTimeGetSeconds(asset.duration) * 1000.0))
     let delayMs = frameDelayMs(BadgeConstants.videoPreviewGifFps)
     let totalFrames = max(1, (durationMs + delayMs - 1) / delayMs)
-    let generator = AVAssetImageGenerator(asset: asset)
-    generator.appliesPreferredTrackTransform = true
-    generator.requestedTimeToleranceBefore = .zero
-    generator.requestedTimeToleranceAfter = .zero
-    var frames: [Data] = []
-    for index in 0..<totalFrames {
-      let timeMs = min(durationMs - 1, index * delayMs)
-      let image = try generator.copyCGImage(at: CMTime(value: CMTimeValue(timeMs), timescale: 1000), actualTime: nil)
-      let rendered = renderImage(image, width: BadgeConstants.videoPreviewGifSize, height: BadgeConstants.videoPreviewGifSize, crop: crop)
-      frames.append(Data(quantizeBitmapToGifIndexed(rendered)))
+    guard let track = asset.tracks(withMediaType: .video).first else {
+      throw BadgeError.message("视频轨道不存在")
     }
-    return try encodeIndexedGif(frames: frames, width: BadgeConstants.videoPreviewGifSize, height: BadgeConstants.videoPreviewGifSize, delayMs: delayMs)
+    let reader = try AVAssetReader(asset: asset)
+    let output = AVAssetReaderVideoCompositionOutput(
+      videoTracks: [track],
+      videoSettings: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: BadgeConstants.videoPreviewGifSize,
+        kCVPixelBufferHeightKey as String: BadgeConstants.videoPreviewGifSize,
+      ]
+    )
+    output.alwaysCopiesSampleData = false
+    output.videoComposition = videoPreviewComposition(asset: asset, track: track, crop: crop)
+    guard reader.canAdd(output) else {
+      throw BadgeError.message("视频预览读取失败")
+    }
+    reader.add(output)
+    guard reader.startReading() else {
+      throw reader.error ?? BadgeError.message("视频预览解码失败")
+    }
+
+    var frames: [Data] = []
+    while frames.count < totalFrames, let sample = output.copyNextSampleBuffer() {
+      guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+      frames.append(Data(quantizePixelBufferToGifIndexed(pixelBuffer)))
+    }
+    if let last = frames.last {
+      while frames.count < totalFrames {
+        frames.append(last)
+      }
+    }
+    if reader.status == .failed {
+      throw reader.error ?? BadgeError.message("视频预览解码失败")
+    }
+    guard !frames.isEmpty else {
+      throw BadgeError.message("视频预览没有可用帧")
+    }
+    return frames
+  }
+
+  private func videoPreviewComposition(asset: AVAsset, track: AVAssetTrack, crop: CropTransform) -> AVMutableVideoComposition {
+    let target = CGFloat(BadgeConstants.videoPreviewGifSize)
+    let transformedBounds = CGRect(origin: .zero, size: track.naturalSize).applying(track.preferredTransform)
+    let uprightSize = CGSize(width: abs(transformedBounds.width), height: abs(transformedBounds.height))
+    let moveToOrigin = CGAffineTransform(translationX: -transformedBounds.origin.x, y: -transformedBounds.origin.y)
+    let uprightTransform = track.preferredTransform.concatenating(moveToOrigin)
+    let scale = max(target / max(1, uprightSize.width), target / max(1, uprightSize.height)) * CGFloat(crop.scale)
+    let dx = (target - uprightSize.width * scale) / 2.0 + CGFloat(crop.offsetX) * target
+    let dy = (target - uprightSize.height * scale) / 2.0 + CGFloat(crop.offsetY) * target
+    let previewTransform = uprightTransform
+      .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+      .concatenating(CGAffineTransform(translationX: dx, y: dy))
+
+    let instruction = AVMutableVideoCompositionInstruction()
+    instruction.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+    let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+    layerInstruction.setTransform(previewTransform, at: .zero)
+    instruction.layerInstructions = [layerInstruction]
+
+    let composition = AVMutableVideoComposition()
+    composition.renderSize = CGSize(width: target, height: target)
+    composition.frameDuration = CMTime(value: CMTimeValue(frameDelayMs(BadgeConstants.videoPreviewGifFps)), timescale: 1000)
+    composition.instructions = [instruction]
+    composition.backgroundColor = UIColor.black.cgColor
+    return composition
   }
 
   private func renderFirstFrame(url: URL, mime: String, size: Int, crop: CropTransform) throws -> CGImage {
@@ -576,6 +705,41 @@ import UIKit
 
   private func quantizeBitmapToGifIndexed(_ image: CGImage) -> [UInt8] {
     quantizeImage(image, sharpen: true)
+  }
+
+  private func quantizePixelBufferToGifIndexed(_ pixelBuffer: CVPixelBuffer) -> [UInt8] {
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+      return [UInt8](repeating: 0, count: width * height)
+    }
+    let source = baseAddress.assumingMemoryBound(to: UInt8.self)
+    var output = [UInt8](repeating: 0, count: width * height)
+    var out = 0
+    for y in 0..<height {
+      let row = y * bytesPerRow
+      for x in 0..<width {
+        let offset = row + x * 4
+        var blue = Int(source[offset])
+        var green = Int(source[offset + 1])
+        var red = Int(source[offset + 2])
+        let alpha = Int(source[offset + 3])
+        if alpha < 255 {
+          red = red * alpha / 255
+          green = green * alpha / 255
+          blue = blue * alpha / 255
+        }
+        red = clamp(sharpenForIndexed(red) + orderedDither(x: x, y: y, bits: 3))
+        green = clamp(sharpenForIndexed(green) + orderedDither(x: x, y: y, bits: 3))
+        blue = clamp(sharpenForIndexed(blue) + orderedDither(x: x, y: y, bits: 2))
+        output[out] = UInt8(((red >> 5) << 5) | ((green >> 5) << 2) | (blue >> 6))
+        out += 1
+      }
+    }
+    return output
   }
 
   private func quantizeImage(_ image: CGImage, sharpen: Bool) -> [UInt8] {
@@ -725,11 +889,33 @@ import UIKit
   }
 
   private func cacheDirectory(_ name: String) throws -> URL {
-    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent("badge_assets", isDirectory: true)
+    let base = try assetRootDirectory()
     let directory = base.appendingPathComponent(name, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     return directory
+  }
+
+  private func assetRootDirectory() throws -> URL {
+    let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent("badge_assets", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+  }
+
+  private func deleteAssetFiles(assetPath: String?, previewPath: String?, animatedPreviewPath: String?) {
+    guard let root = try? assetRootDirectory().resolvingSymlinksInPath() else {
+      return
+    }
+    let paths = Set([assetPath, previewPath, animatedPreviewPath].compactMap { $0 })
+    for path in paths where !path.isEmpty && path != "null" {
+      let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+      guard url.path.hasPrefix(root.path + "/") || url.path == root.path else {
+        continue
+      }
+      if FileManager.default.fileExists(atPath: url.path) {
+        try? FileManager.default.removeItem(at: url)
+      }
+    }
   }
 
   private func url(from text: String) throws -> URL {
