@@ -119,6 +119,18 @@ import UIKit
           result(FlutterError(code: "open_url_failed", message: "无法打开链接", details: nil))
         }
       }
+    case "getFactoryAnimations":
+      result([
+        ["id": "F001", "name": "F001", "previewAsset": "assets/factory_previews/F001.png"],
+        ["id": "F002", "name": "F002", "previewAsset": "assets/factory_previews/F002.png"],
+        ["id": "F003", "name": "F003", "previewAsset": "assets/factory_previews/F003.png"],
+      ])
+    case "switchToAsset":
+      guard let id = args["id"] as? String, !id.isEmpty else {
+        result(FlutterError(code: "bad_id", message: "素材ID为空", details: nil))
+        return
+      }
+      switchToAsset(id: id, result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -414,6 +426,9 @@ import UIKit
     assetPath: String? = nil
   ) {
     DispatchQueue.global(qos: .utility).async {
+      if self.isUploading { return }
+      Thread.sleep(forTimeInterval: 1.2)
+      if self.isUploading { return }
       do {
         let started = Date()
         let data = try self.buildVideoAnimatedPreview(url: url, crop: crop, warmPreviewPath: nil)
@@ -440,31 +455,101 @@ import UIKit
       self.isUploading = true
       defer { self.isUploading = false }
       do {
-        let data = try Data(contentsOf: URL(fileURLWithPath: assetPath))
-        guard self.isSupportedPackage(data) else {
-          throw BadgeError.message("历史素材是旧格式，请重新导入生成 EBAJ4")
-        }
-        try self.uploadAssetOverTcp(packageBytes: data, crc: crc32(data))
-        self.sendEvent(["type": "uploadProgress", "progress": 1.0, "message": "已切换显示"])
-        DispatchQueue.main.async { result(nil) }
-      } catch {
+        let package = try self.preparePackageForUpload(fileURL: URL(fileURLWithPath: assetPath))
+        var assignedId: String?
         do {
-          let data = try Data(contentsOf: URL(fileURLWithPath: assetPath))
-          try self.uploadAssetOverHttp(packageBytes: data, crc: crc32(data))
-          self.sendEvent(["type": "uploadProgress", "progress": 1.0, "message": "已切换显示"])
-          DispatchQueue.main.async { result(nil) }
+          assignedId = try self.uploadAssetOverTcp(package: package)
         } catch {
-          DispatchQueue.main.async {
-            result(FlutterError(code: "upload_failed", message: error.localizedDescription, details: nil))
-          }
+          try self.uploadAssetOverHttp(package: package)
+        }
+        self.sendEvent(["type": "uploadProgress", "progress": 1.0, "message": "已切换显示"])
+        var resultMap: [String: Any] = [:]
+        if let id = assignedId { resultMap["assignedId"] = id }
+        DispatchQueue.main.async { result(resultMap.isEmpty ? nil : resultMap) }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "upload_failed", message: error.localizedDescription, details: nil))
         }
       }
     }
   }
 
-  private func uploadAssetOverTcp(packageBytes: Data, crc: UInt32) throws {
+  private func switchToAsset(id: String, result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let response = try self.sendSwitchCommand(id: id)
+        if response.hasPrefix("OK") {
+          self.sendEvent(["type": "switchResult", "id": id, "success": true])
+          DispatchQueue.main.async { result(true) }
+        } else if response.hasPrefix("NEED_UPLOAD") {
+          DispatchQueue.main.async {
+            result(["needsUpload": true, "id": id])
+          }
+        } else {
+          throw NSError(
+            domain: "BadgeSwitch",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: response.isEmpty ? "切换失败" : response]
+          )
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "switch_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
+  private func sendSwitchCommand(id: String) throws -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    var responseData = Data()
+    var failure: Error?
+    let connection = NWConnection(
+      host: NWEndpoint.Host(BadgeConstants.badgeHost),
+      port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
+      using: .tcp
+    )
+    connection.stateUpdateHandler = { state in
+      switch state {
+      case .ready:
+        let cmd = "SWITCH \(id)\n"
+        connection.send(
+          content: cmd.data(using: .utf8),
+          completion: .contentProcessed { error in
+            if let error = error {
+              failure = error
+              semaphore.signal()
+              return
+            }
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, receiveError in
+              if let data = data { responseData = data }
+              if let receiveError = receiveError { failure = receiveError }
+              connection.cancel()
+              semaphore.signal()
+            }
+          }
+        )
+      case .failed(let error), .waiting(let error):
+        failure = error
+        connection.cancel()
+        semaphore.signal()
+      case .cancelled:
+        semaphore.signal()
+      default:
+        break
+      }
+    }
+    connection.start(queue: .global())
+    _ = semaphore.wait(timeout: .now() + .seconds(5))
+    connection.cancel()
+    if let failure = failure { throw failure }
+    return String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  }
+
+  private func uploadAssetOverTcp(package: UploadPackageInfo) throws -> String? {
     let semaphore = DispatchSemaphore(value: 0)
     var failure: Error?
+    var assignedId: String?
     let connection = NWConnection(
       host: NWEndpoint.Host(BadgeConstants.badgeHost),
       port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
@@ -476,24 +561,49 @@ import UIKit
       case .ready:
         var header = Data()
         appendLe32(&header, BadgeConstants.badgeTcpUploadMagic)
-        appendLe32(&header, UInt32(packageBytes.count))
-        appendLe32(&header, crc)
-        var payload = Data()
-        payload.append(header)
-        payload.append(packageBytes)
-        connection.send(content: payload, completion: .contentProcessed { error in
+        appendLe32(&header, UInt32(package.size))
+        appendLe32(&header, package.crc)
+        connection.send(content: header, completion: .contentProcessed { error in
           if let error = error {
             failure = error
             semaphore.signal()
             return
           }
-          connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, error in
-            if let error = error {
-              failure = error
-            } else if let data = data, let text = String(data: data, encoding: .utf8), !text.hasPrefix("OK") {
-              failure = BadgeError.message(text.trimmingCharacters(in: .whitespacesAndNewlines))
+          connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { readyData, _, _, readyError in
+            if let readyError {
+              failure = readyError
+              semaphore.signal()
+              return
             }
-            semaphore.signal()
+            let readyText = readyData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            guard readyText.hasPrefix("READY") else {
+              let trimmedReady = readyText.trimmingCharacters(in: .whitespacesAndNewlines)
+              failure = BadgeError.message(trimmedReady.isEmpty ? "设备未准备好上传" : trimmedReady)
+              semaphore.signal()
+              return
+            }
+            self.sendTcpFileChunks(connection: connection, package: package) { chunkError in
+              if let chunkError {
+                failure = chunkError
+                semaphore.signal()
+                return
+              }
+              connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, error in
+                if let error = error {
+                  failure = error
+                } else if let data = data, let text = String(data: data, encoding: .utf8) {
+                  if text.hasPrefix("OK") {
+                    let idPart = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                      .replacingOccurrences(of: "OK", with: "")
+                      .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !idPart.isEmpty { assignedId = idPart }
+                  } else {
+                    failure = BadgeError.message(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                  }
+                }
+                semaphore.signal()
+              }
+            }
           }
         })
       case .failed(let error):
@@ -504,23 +614,24 @@ import UIKit
       }
     }
     connection.start(queue: .global(qos: .userInitiated))
-    if semaphore.wait(timeout: .now() + .seconds(60)) == .timedOut {
+    if semaphore.wait(timeout: .now() + .seconds(BadgeConstants.uploadTimeoutSeconds)) == .timedOut {
       failure = BadgeError.message("TCP上传超时")
     }
     connection.cancel()
     activeUpload = nil
     if let failure = failure { throw failure }
+    return assignedId
   }
 
-  private func uploadAssetOverHttp(packageBytes: Data, crc: UInt32) throws {
+  private func uploadAssetOverHttp(package: UploadPackageInfo) throws {
     var request = URLRequest(url: URL(string: BadgeConstants.badgeUploadUrl)!)
     request.httpMethod = "POST"
     request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-    request.setValue(String(format: "%08x", crc), forHTTPHeaderField: "X-EBAJ-CRC32")
-    request.timeoutInterval = 60
+    request.setValue(String(format: "%08x", package.crc), forHTTPHeaderField: "X-EBAJ-CRC32")
+    request.timeoutInterval = TimeInterval(BadgeConstants.uploadTimeoutSeconds)
     let semaphore = DispatchSemaphore(value: 0)
     var failure: Error?
-    let task = URLSession.shared.uploadTask(with: request, from: packageBytes) { _, response, error in
+    let task = URLSession.shared.uploadTask(with: request, fromFile: package.fileURL) { _, response, error in
       if let error = error {
         failure = error
       } else if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
@@ -529,11 +640,71 @@ import UIKit
       semaphore.signal()
     }
     task.resume()
-    if semaphore.wait(timeout: .now() + .seconds(60)) == .timedOut {
+    if semaphore.wait(timeout: .now() + .seconds(BadgeConstants.uploadTimeoutSeconds)) == .timedOut {
       task.cancel()
       failure = BadgeError.message("HTTP上传超时")
     }
     if let failure = failure { throw failure }
+  }
+
+  private func sendTcpFileChunks(
+    connection: NWConnection,
+    package: UploadPackageInfo,
+    completion: @escaping (Error?) -> Void
+  ) {
+    guard let stream = InputStream(url: package.fileURL) else {
+      completion(BadgeError.message("素材包读取失败"))
+      return
+    }
+
+    stream.open()
+    var sent = 0
+    var nextProgressAt = BadgeConstants.uploadProgressStepBytes
+
+    func sendNextChunk() {
+      var buffer = [UInt8](repeating: 0, count: BadgeConstants.uploadChunkBytes)
+      let read = stream.read(&buffer, maxLength: buffer.count)
+      if read < 0 {
+        let error = stream.streamError ?? BadgeError.message("素材包读取失败")
+        stream.close()
+        completion(error)
+        return
+      }
+      if read == 0 {
+        stream.close()
+        guard sent == package.size else {
+          completion(BadgeError.message("素材读取中断"))
+          return
+        }
+        connection.send(content: nil, contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { error in
+          completion(error)
+        })
+        return
+      }
+
+      let data = Data(buffer.prefix(read))
+      connection.send(content: data, completion: .contentProcessed { error in
+        if let error {
+          stream.close()
+          completion(error)
+          return
+        }
+        sent += read
+        if sent >= nextProgressAt || sent == package.size {
+          self.sendEvent([
+            "type": "uploadProgress",
+            "progress": Double(sent) / Double(package.size),
+            "message": "TCP上传 \(sent * 100 / package.size)%",
+          ])
+          while nextProgressAt <= sent {
+            nextProgressAt += BadgeConstants.uploadProgressStepBytes
+          }
+        }
+        sendNextChunk()
+      })
+    }
+
+    sendNextChunk()
   }
 
   private func requestText(_ urlText: String, timeout: TimeInterval) throws -> String {
@@ -957,8 +1128,77 @@ import UIKit
     mime.lowercased().hasPrefix("video/")
   }
 
-  private func isSupportedPackage(_ data: Data) -> Bool {
-    data.count >= BadgeConstants.headerSize && readLe32(data, 0) == BadgeConstants.magic
+  private func preparePackageForUpload(fileURL: URL) throws -> UploadPackageInfo {
+    let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+    let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+    if size < BadgeConstants.headerSize {
+      throw BadgeError.message("素材包头不完整，请重新导入生成 EBAJ4")
+    }
+    if size > Int(UInt32.max) {
+      throw BadgeError.message("素材包过大，请换短一点的素材")
+    }
+
+    let handle = try FileHandle(forReadingFrom: fileURL)
+    let header = handle.readData(ofLength: BadgeConstants.headerSize)
+    handle.closeFile()
+    if let message = validatePackageForUpload(header, packageSize: size) {
+      throw BadgeError.message(message)
+    }
+
+    return UploadPackageInfo(fileURL: fileURL, size: size, crc: try crc32(fileURL: fileURL))
+  }
+
+  private func validatePackageForUpload(_ data: Data, packageSize packageLength: Int) -> String? {
+    guard data.count >= BadgeConstants.headerSize else {
+      return "素材包头不完整，请重新导入生成 EBAJ4"
+    }
+
+    let magic = readLe32(data, 0)
+    let version = Int(readLe16(data, 4))
+    let headerSize = Int(readLe16(data, 6))
+    let width = Int(readLe16(data, 8))
+    let height = Int(readLe16(data, 10))
+    let frameCount = Int(readLe16(data, 12))
+    let fps = Int(readLe16(data, 14))
+    let frameTableOffset = Int(readLe32(data, 16))
+    let frameDataOffset = Int(readLe32(data, 20))
+    let packageSize = Int(readLe32(data, 24))
+    let streamWidth = Int(readLe16(data, 36))
+    let streamHeight = Int(readLe16(data, 38))
+    let paletteEntries = Int(readLe16(data, 40))
+
+    if magic != BadgeConstants.magic || version != BadgeConstants.version {
+      return "历史素材是旧格式，请重新导入生成 EBAJ4"
+    }
+    if headerSize != BadgeConstants.headerSize || width != BadgeConstants.width || height != BadgeConstants.height {
+      return "素材尺寸和当前设备不匹配，请重新导入生成"
+    }
+    if frameCount == 0 {
+      return "素材没有可用帧，请重新导入生成"
+    }
+    if fps < BadgeConstants.minDeviceFps || fps > BadgeConstants.maxDeviceFps {
+      return "历史素材帧率不是25-30fps，请重新导入生成"
+    }
+    if paletteEntries != BadgeConstants.paletteEntries || !isValidStreamSize(streamWidth, streamHeight) {
+      return "素材编码和当前固件不匹配，请重新导入生成"
+    }
+    if packageSize != packageLength {
+      return "素材包大小不匹配，请重新导入生成"
+    }
+    let tableBytes = frameCount * BadgeConstants.frameEntrySize
+    let tableEnd = frameTableOffset + tableBytes
+    if frameTableOffset < BadgeConstants.headerSize ||
+      tableEnd > frameDataOffset ||
+      frameDataOffset > packageSize {
+      return "素材帧表损坏，请重新导入生成"
+    }
+    return nil
+  }
+
+  private func isValidStreamSize(_ streamWidth: Int, _ streamHeight: Int) -> Bool {
+    (streamWidth == 480 && streamHeight == 480) ||
+      (streamWidth == 320 && streamHeight == 320) ||
+      (streamWidth == 240 && streamHeight == 240)
   }
 
   private func parseSdAvailable(_ status: String) -> Bool {
@@ -998,20 +1238,38 @@ private final class EbajEncoder {
   }
 
   func encode(url: URL, mime: String, requestedFps: Int, maxPackageBytes: Int, crop: CropTransform) throws -> EncodedPackage {
-    let fps = min(60, max(1, requestedFps))
+    let fps = BadgeConstants.deviceFps
     let delayMs = frameDelayMs(fps)
     let selectedStreamSize = try sampleStreamResolution(url: url, mime: mime, fps: fps, delayMs: delayMs, crop: crop)
-    let selected = try encodeAtResolution(url: url, mime: mime, fps: fps, delayMs: delayMs, streamSize: selectedStreamSize, crop: crop)
-    if selected.packageBytes.count > maxPackageBytes {
-      throw BadgeError.message(BadgeConstants.assetTooLargeMessage)
+    let candidates = candidateStreamResolutions(selectedStreamSize)
+    for (index, streamSize) in candidates.enumerated() {
+      let selected = try encodeAtResolution(url: url, mime: mime, fps: fps, delayMs: delayMs, streamSize: streamSize, crop: crop)
+      if selected.packageBytes.count > maxPackageBytes {
+        continue
+      }
+      if actualQualityBytesPerSecond(selected) <= BadgeConstants.qualityStreamBytesPerSecond ||
+        index == candidates.count - 1 {
+        return selected
+      }
+      NSLog(
+        "BadgePrepare stream %d actual=%dBps exceeds target=%d, retry lower",
+        streamSize,
+        actualQualityBytesPerSecond(selected),
+        BadgeConstants.qualityStreamBytesPerSecond
+      )
     }
-    return selected
+    throw BadgeError.message(BadgeConstants.assetTooLargeMessage)
   }
 
   private func encodeAtResolution(url: URL, mime: String, fps: Int, delayMs: Int, streamSize: Int, crop: CropTransform) throws -> EncodedPackage {
     let frames: [EncodedFrame]
     if mime.lowercased().hasPrefix("video/") {
-      frames = try encodeVideoFrames(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)
+      let gifData = try convertVideoToAnimatedGif(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)
+      guard let source = CGImageSourceCreateWithData(gifData as CFData, nil),
+            CGImageSourceGetCount(source) > 1 else {
+        throw BadgeError.message("视频转GIF失败")
+      }
+      frames = try encodeImageSequence(source: source, delayMs: delayMs, streamSize: streamSize, crop: crop)
     } else {
       guard
         let source = CGImageSourceCreateWithURL(url as CFURL, nil),
@@ -1031,6 +1289,51 @@ private final class EbajEncoder {
       }
     }
     return try packFrames(frames: frames, fps: fps, streamSize: streamSize)
+  }
+
+  private func convertVideoToAnimatedGif(url: URL, delayMs: Int, streamSize: Int, crop: CropTransform) throws -> Data {
+    let asset = AVAsset(url: url)
+    let durationMs = max(1, Int(CMTimeGetSeconds(asset.duration) * 1000.0))
+    let totalFrames = max(1, (durationMs + delayMs - 1) / delayMs)
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.requestedTimeToleranceBefore = .zero
+    generator.requestedTimeToleranceAfter = .zero
+
+    guard let destination = CGImageDestinationCreateWithData(
+      NSMutableData() as CFMutableData, kUTTypeGIF, totalFrames, nil
+    ) else {
+      throw BadgeError.message("无法创建GIF编码器")
+    }
+
+    let gifProperties = [
+      kCGImagePropertyGIFDictionary: [
+        kCGImagePropertyGIFLoopCount: 0
+      ]
+    ] as CFDictionary
+    CGImageDestinationSetProperties(destination, gifProperties)
+
+    let frameProperties = [
+      kCGImagePropertyGIFDictionary: [
+        kCGImagePropertyGIFDelayTime: Double(delayMs) / 1000.0
+      ]
+    ] as CFDictionary
+
+    for index in 0..<totalFrames {
+      let timeMs = min(durationMs - 1, index * delayMs)
+      let image = try generator.copyCGImage(
+        at: CMTime(value: CMTimeValue(timeMs), timescale: 1000), actualTime: nil
+      )
+      let rendered = renderStaticImage(image, streamSize: streamSize, crop: crop)
+      CGImageDestinationAddImage(destination, rendered, frameProperties)
+      onProgress(Double(index + 1) / Double(totalFrames))
+    }
+
+    guard CGImageDestinationFinalize(destination) else {
+      throw BadgeError.message("GIF编码失败")
+    }
+
+    return (destination as? NSMutableData).map { $0 as Data } ?? Data()
   }
 
   private func encodeVideoFrames(url: URL, delayMs: Int, streamSize: Int, crop: CropTransform) throws -> [EncodedFrame] {
@@ -1224,10 +1527,35 @@ private final class EbajEncoder {
   }
 
   private func selectStreamResolution(_ estimates: [StreamEstimate]) -> Int {
-    for estimate in estimates where estimate.bytesPerSecond <= BadgeConstants.qualityStreamBytesPerSecond {
+    for estimate in estimates where isPlaybackSafeStream(estimate) {
       return estimate.streamSize
     }
     return estimates.last?.streamSize ?? BadgeConstants.streamResolutions.last!
+  }
+
+  private func isPlaybackSafeStream(_ estimate: StreamEstimate) -> Bool {
+    let budget = min(
+      BadgeConstants.qualityStreamBytesPerSecond,
+      playbackBudgetBytesPerSecond(estimate.streamSize)
+    )
+    return estimate.bytesPerSecond <= budget
+  }
+
+  private func playbackBudgetBytesPerSecond(_ streamSize: Int) -> Int {
+    return streamSize == BadgeConstants.width ? BadgeConstants.playbackStreamBytesPerSecond : BadgeConstants.qualityStreamBytesPerSecond
+  }
+
+  private func candidateStreamResolutions(_ selectedStreamSize: Int) -> [Int] {
+    guard let start = BadgeConstants.streamResolutions.firstIndex(of: selectedStreamSize) else {
+      return BadgeConstants.streamResolutions
+    }
+    return Array(BadgeConstants.streamResolutions[start...])
+  }
+
+  private func actualQualityBytesPerSecond(_ selected: EncodedPackage) -> Int {
+    let tableBytes = selected.frameCount * BadgeConstants.frameEntrySize
+    let payloadBytes = max(0, selected.packageBytes.count - BadgeConstants.headerSize - tableBytes)
+    return payloadBytes * selected.fps / max(1, selected.frameCount)
   }
 }
 
@@ -1241,12 +1569,18 @@ private enum BadgeConstants {
   static let badgeStatusUrl = "http://192.168.4.1/status"
   static let badgeBrightnessUrl = "http://192.168.4.1/brightness"
   static let statusTimeout: TimeInterval = 2.5
+  static let uploadTimeoutSeconds = 180
+  static let uploadChunkBytes = 64 * 1024
+  static let uploadProgressStepBytes = 512 * 1024
   static let sdStreamBudgetBytes = 512 * 1024 * 1024
   static let assetTooLargeMessage = "转换后的设备包超过当前素材存储空间，请换短一点的素材。"
   static let maxHistoryItems = 20
   static let historyKey = "history"
   static let width = 480
   static let height = 480
+  static let minDeviceFps = 25
+  static let deviceFps = 25
+  static let maxDeviceFps = 30
   static let previewSize = 320
   static let videoPreviewGifSize = 192
   static let videoPreviewGifFps = 30
@@ -1261,7 +1595,8 @@ private enum BadgeConstants {
   static let paletteEntries = 256
   static let paletteBytes = paletteEntries * 2
   static let sampleFrameCount = 4
-  static let qualityStreamBytesPerSecond = 4 * 1024 * 1024
+  static let qualityStreamBytesPerSecond = 10 * 512 * 1024
+  static let playbackStreamBytesPerSecond = 10 * 512 * 1024
   static let sharpenPercent = 106
   static let dither4x4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
   static let tileSize = 16
@@ -1288,6 +1623,12 @@ private struct EncodedPackage {
   let frameCount: Int
   let fps: Int
   let crc32: UInt32
+}
+
+private struct UploadPackageInfo {
+  let fileURL: URL
+  let size: Int
+  let crc: UInt32
 }
 
 private struct StreamEstimate {
@@ -1430,6 +1771,27 @@ private func crc32(_ data: Data) -> UInt32 {
   return crc ^ 0xffff_ffff
 }
 
+private func crc32(fileURL: URL) throws -> UInt32 {
+  let handle = try FileHandle(forReadingFrom: fileURL)
+  defer { handle.closeFile() }
+
+  var crc: UInt32 = 0xffff_ffff
+  while true {
+    let data = handle.readData(ofLength: BadgeConstants.uploadChunkBytes)
+    if data.isEmpty { break }
+    for byte in data {
+      var current = UInt32(byte)
+      for _ in 0..<8 {
+        let mix = (crc ^ current) & 1
+        crc >>= 1
+        if mix != 0 { crc ^= 0xedb8_8320 }
+        current >>= 1
+      }
+    }
+  }
+  return crc ^ 0xffff_ffff
+}
+
 private func appendLe32(_ data: inout Data, _ value: UInt32) {
   data.append(UInt8(value & 0xff))
   data.append(UInt8((value >> 8) & 0xff))
@@ -1447,6 +1809,11 @@ private func writeLe32(_ data: inout Data, _ offset: Int, _ value: UInt32) {
   data[offset + 1] = UInt8((value >> 8) & 0xff)
   data[offset + 2] = UInt8((value >> 16) & 0xff)
   data[offset + 3] = UInt8((value >> 24) & 0xff)
+}
+
+private func readLe16(_ data: Data, _ offset: Int) -> UInt16 {
+  UInt16(data[offset]) |
+    (UInt16(data[offset + 1]) << 8)
 }
 
 private func readLe32(_ data: Data, _ offset: Int) -> UInt32 {

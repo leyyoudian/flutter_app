@@ -67,7 +67,7 @@ void main() {
       'name': selected.name,
       'packageSize': 2048,
       'frameCount': 24,
-      'fps': 30,
+      'fps': 25,
       'crc32': 1234,
     });
     final history = HistoryEntry.fromAsset(prepared);
@@ -118,6 +118,15 @@ void main() {
     expect(source, contains('required this.active'));
     expect(source, contains('final bool active;'));
     expect(source, contains('oldWidget.active != widget.active'));
+    expect(source, contains('WidgetsBindingObserver'));
+    expect(source, contains('AppLifecycleState.resumed'));
+    expect(source, contains('_appActive'));
+    expect(source, contains('_previewActive'));
+    expect(source, contains('bool get _previewActive => _appActive && !_preparing;'));
+    expect(source, isNot(contains('bool get _previewActive => _appActive && !_preparing && !_uploading;')));
+    expect(source, contains('previewActive && _pageIndex == 1'));
+    expect(source, contains('previewActive && _pageIndex == 2'));
+    expect(source, isNot(contains('DevicePreview(')));
     expect(source, contains('await controller.pause()'));
     expect(source, contains('void activate()'));
     expect(source, contains(r"key: ValueKey('maker-video-${selected.uri}')"));
@@ -129,13 +138,25 @@ void main() {
       source,
       isNot(contains(r"key: ValueKey('history-video-${entry.assetPath}')")),
     );
-    expect(source, contains('if (_hasPreviewPath(entry.animatedPreviewPath))'));
+    expect(source, contains('if (active && _hasPreviewPath(entry.animatedPreviewPath))'));
     expect(source, contains('_PreviewDial('));
     expect(source, contains('active: active'));
     expect(source, contains('active: active && !preparing'));
-    expect(source, isNot(contains('asset?.assetPath != entry.assetPath')));
+    expect(source, contains('active: active'));
     expect(source, isNot(contains('active: active && !uploading')));
+    expect(source, isNot(contains('asset?.assetPath != entry.assetPath')));
     expect(source, isNot(contains('uri: entry.sourceUri!')));
+  });
+
+  test('animated image previews stay visible while upload disables taps', () {
+    final source = File('lib/main.dart').readAsStringSync();
+
+    expect(source, contains('onTap: uploading ? null : () => onHistoryTap(entry)'));
+    expect(source, contains('active: active'));
+    expect(source, isNot(contains('active: active && !uploading')));
+    expect(source, contains('if (active && _hasPreviewPath(entry.animatedPreviewPath))'));
+    expect(source, contains('if (active && _hasPreviewPath(selected?.animatedPreviewPath))'));
+    expect(source, contains('else if (active && _hasPreviewPath(asset?.animatedPreviewPath))'));
   });
 
   test('history previews hide missing files instead of showing error icons', () {

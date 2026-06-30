@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
@@ -60,7 +61,8 @@ class BadgeHomePage extends StatefulWidget {
   State<BadgeHomePage> createState() => _BadgeHomePageState();
 }
 
-class _BadgeHomePageState extends State<BadgeHomePage> {
+class _BadgeHomePageState extends State<BadgeHomePage>
+    with WidgetsBindingObserver {
   static const _channel = MethodChannel('esp_baji/native');
   static const _privacyPolicyUrl =
       'https://leyyoudian.github.io/flutter_app/privacy.html';
@@ -77,6 +79,7 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
   bool _sdAvailable = false;
   bool _preparing = false;
   bool _uploading = false;
+  bool _appActive = true;
   double _prepareProgress = 0;
   double _uploadProgress = 0;
   String _status = '未连接';
@@ -84,25 +87,60 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
   SelectedMedia? _media;
   PreparedAsset? _asset;
   CropTransform _cropTransform = const CropTransform();
+  List<FactoryAnimation> _factoryAnims = [];
+  String? _selectedFactoryId;
+  String? _activeFactoryId;       // currently playing on dial
+  List<String> _videoQueue = [];  // pending video sequence
+  int _videoIndex = 0;
+
+  bool get _previewActive => _appActive && !_preparing;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _channel.setMethodCallHandler(_handleNativeCall);
     unawaited(_loadHistory());
     unawaited(_refreshConnectionState());
-    _connectionTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if ((_connected || _connecting) && !_preparing && !_uploading) {
-        unawaited(_refreshConnectionState());
-      }
-    });
+    unawaited(_loadFactoryAnimations());
+    _restartConnectionTimer();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _brightnessTimer?.cancel();
     _connectionTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final appActive = state == AppLifecycleState.resumed;
+    if (_appActive == appActive) {
+      return;
+    }
+    setState(() => _appActive = appActive);
+    _restartConnectionTimer();
+    if (appActive) {
+      unawaited(_refreshConnectionState());
+    }
+  }
+
+  void _restartConnectionTimer() {
+    _connectionTimer?.cancel();
+    _connectionTimer = null;
+    if (!_appActive) {
+      return;
+    }
+    _connectionTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!_appActive || _preparing || _uploading) {
+        return;
+      }
+      if (_connected || _connecting) {
+        unawaited(_refreshConnectionState());
+      }
+    });
   }
 
   Future<void> _handleNativeCall(MethodCall call) async {
@@ -200,6 +238,62 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
           result.map((item) => HistoryEntry.fromMap(_asStringMap(item))),
         );
     });
+  }
+
+  Future<void> _loadFactoryAnimations() async {
+    try {
+      final jsonStr = await DefaultAssetBundle.of(context)
+          .loadString('assets/factory_previews/manifest.json');
+      final list = json.decode(jsonStr) as List<dynamic>;
+      if (!mounted) return;
+      setState(() {
+        _factoryAnims = list
+            .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
+            .toList();
+      });
+    } catch (_) {
+      // Fallback: manifest not found, leave empty
+    }
+  }
+
+  Future<void> _switchToFactory(FactoryAnimation anim) async {
+    setState(() {
+      _selectedFactoryId = anim.id;
+      _asset = null;
+    });
+    // Build video sequence: exit video + entrance video (unless third_half)
+    final queue = <String>[];
+    bool isThirdHalf = false;
+    if (_activeFactoryId != null && _activeFactoryId != anim.id) {
+      final current = _factoryAnims.cast<FactoryAnimation?>().firstWhere(
+            (a) => a?.id == _activeFactoryId, orElse: () => null);
+      isThirdHalf = current?.transitions.containsKey(anim.id) ?? false;
+      final exitVid = current?.exitVideo(anim.id);
+      if (exitVid != null) queue.add(exitVid);
+    }
+    // Third_half replaces both exit and entrance — skip target first_half
+    if (!isThirdHalf && anim.firstVideo != null) queue.add(anim.firstVideo!);
+    setState(() {
+      _videoQueue = queue;
+      _videoIndex = 0;
+      _activeFactoryId = anim.id;
+    });
+    // Send switch command to device
+    if (!_connected) return;
+    setState(() => _status = '切换中...');
+    try {
+      final result = await _invokeNative<dynamic>('switchToAsset', {'id': anim.id});
+      if (!mounted) return;
+      if (result == true) {
+        setState(() => _status = '已切换');
+      } else if (result is Map && result['needsUpload'] == true) {
+        _showSnack('设备缺少该素材，需先上传');
+        setState(() => _status = '素材缺失');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      _showSnack('切换失败: $e');
+    }
   }
 
   Future<void> _saveHistory() async {
@@ -363,18 +457,28 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
     setState(() {
       _uploading = true;
       _uploadProgress = 0;
-      _status = '连接 ESP-BAJI';
+      _status = '准备上传';
     });
     try {
-      await _invokeNative<void>('uploadAsset', {'assetPath': asset.assetPath});
-      if (!mounted) {
-        return;
-      }
+      final result = await _invokeNative<Map<dynamic, dynamic>>(
+        'uploadAsset',
+        {'assetPath': asset.assetPath},
+      );
+      if (!mounted) return;
+      final assignedId = _readNullableString(result?['assignedId']);
       setState(() {
         _uploading = false;
         _uploadProgress = 1;
-        _status = '已切换显示';
+        _status = '已切换';
+        // Store assigned device ID on the history entry
+        for (var i = 0; i < _history.length; i++) {
+          if (_history[i].assetPath == asset.assetPath) {
+            _history[i] = _history[i].copyWith(deviceId: assignedId);
+            break;
+          }
+        }
       });
+      if (assignedId != null) unawaited(_saveHistory());
     } on PlatformException catch (error) {
       setState(() {
         _uploading = false;
@@ -453,6 +557,12 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
     );
   }
 
+  void _advanceVideo() {
+    if (_videoIndex + 1 < _videoQueue.length) {
+      setState(() => _videoIndex++);
+    }
+  }
+
   bool get _isDefaultCrop {
     return (_cropTransform.scale - 1).abs() < 0.0001 &&
         _cropTransform.offset.distance < 0.0001;
@@ -460,6 +570,40 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
 
   Future<void> _uploadHistoryEntry(HistoryEntry entry) async {
     if (_preparing || _uploading) {
+      return;
+    }
+    // If already uploaded, just switch to it
+    if (entry.deviceId != null && _connected) {
+      setState(() {
+        _status = '切换中...';
+        _selectedFactoryId = null;
+      });
+      try {
+        await _invokeNative<dynamic>(
+          'switchToAsset',
+          {'id': entry.deviceId},
+        );
+        if (!mounted) return;
+        setState(() {
+          _status = '已切换';
+          _asset = PreparedAsset(
+            assetPath: entry.assetPath,
+            previewPath: entry.previewPath,
+            animatedPreviewPath: entry.animatedPreviewPath,
+            sourceUri: entry.sourceUri,
+            mime: entry.mime,
+            name: entry.name,
+            packageSize: entry.packageSize,
+            frameCount: entry.frameCount,
+            fps: entry.fps,
+            crc32: entry.crc32,
+          );
+        });
+      } catch (e) {
+        if (!mounted) return;
+        _showSnack('切换失败: $e');
+        setState(() => _status = '切换失败');
+      }
       return;
     }
     final asset = PreparedAsset(
@@ -482,6 +626,7 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
       _asset = asset;
       _pageIndex = 1;
       _status = '上传历史素材';
+      _selectedFactoryId = null; // clear factory selection when uploading user content
     });
     await _uploadAsset(asset);
   }
@@ -558,6 +703,7 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final previewActive = _previewActive;
     final pages = [
       _DevicePage(
         devices: _devices,
@@ -575,19 +721,25 @@ class _BadgeHomePageState extends State<BadgeHomePage> {
         onPrivacyPolicy: _showPrivacyPolicy,
       ),
       _DisplayLibraryPage(
-        active: _pageIndex == 1,
+        active: previewActive && _pageIndex == 1,
         connected: _connected,
         status: _status,
         asset: _asset,
         history: _history,
         uploading: _uploading,
         uploadProgress: _uploadProgress,
+        factoryAnims: _factoryAnims,
+        selectedFactoryId: _selectedFactoryId,
+        videoQueue: _videoQueue,
+        videoIndex: _videoIndex,
+        onVideoDone: _advanceVideo,
         onHistoryTap: (entry) => unawaited(_uploadHistoryEntry(entry)),
         onHistoryDelete: (entry) =>
             unawaited(_confirmDeleteHistoryEntry(entry)),
+        onFactoryTap: (anim) => unawaited(_switchToFactory(anim)),
       ),
       _MakerPage(
-        active: _pageIndex == 2,
+        active: previewActive && _pageIndex == 2,
         media: _media,
         asset: _asset,
         cropTransform: _cropTransform,
@@ -733,7 +885,7 @@ class _BottomNavButton extends StatelessWidget {
               child: Icon(
                 selected ? selectedIcon : icon,
                 color: selected ? Colors.black : Colors.white,
-                size: 29,
+                size: 22,
               ),
             ),
           ),
@@ -752,8 +904,14 @@ class _DisplayLibraryPage extends StatelessWidget {
     required this.history,
     required this.uploading,
     required this.uploadProgress,
+    required this.factoryAnims,
+    required this.selectedFactoryId,
+    required this.videoQueue,
+    required this.videoIndex,
+    required this.onVideoDone,
     required this.onHistoryTap,
     required this.onHistoryDelete,
+    required this.onFactoryTap,
   });
 
   final bool active;
@@ -763,11 +921,23 @@ class _DisplayLibraryPage extends StatelessWidget {
   final List<HistoryEntry> history;
   final bool uploading;
   final double uploadProgress;
+  final List<FactoryAnimation> factoryAnims;
+  final String? selectedFactoryId;
+  final List<String> videoQueue;
+  final int videoIndex;
+  final VoidCallback onVideoDone;
   final ValueChanged<HistoryEntry> onHistoryTap;
   final ValueChanged<HistoryEntry> onHistoryDelete;
+  final ValueChanged<FactoryAnimation> onFactoryTap;
 
   @override
   Widget build(BuildContext context) {
+    final selectedFactory = selectedFactoryId != null
+        ? factoryAnims.cast<FactoryAnimation?>().firstWhere(
+              (a) => a?.id == selectedFactoryId,
+              orElse: () => null,
+            )
+        : null;
     return Column(
       children: [
         Padding(
@@ -776,9 +946,13 @@ class _DisplayLibraryPage extends StatelessWidget {
             children: [
               Row(
                 children: [
-                  _ConnectionStatusText(
-                    connected: connected,
-                    text: connected ? status : '未连接',
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: connected ? const Color(0xff32d583) : const Color(0xffff5b5b),
+                    ),
                   ),
                 ],
               ),
@@ -788,6 +962,13 @@ class _DisplayLibraryPage extends StatelessWidget {
                   active: active,
                   media: null,
                   asset: asset,
+                  factoryVideo: videoQueue.isNotEmpty && videoIndex < videoQueue.length
+                      ? videoQueue[videoIndex]
+                      : null,
+                  nextVideo: videoQueue.isNotEmpty && videoIndex + 1 < videoQueue.length
+                      ? videoQueue[videoIndex + 1]
+                      : null,
+                  onFactoryVideoDone: videoQueue.isNotEmpty ? onVideoDone : null,
                   preparing: uploading,
                   progress: uploadProgress,
                 ),
@@ -818,31 +999,37 @@ class _DisplayLibraryPage extends StatelessWidget {
                 stops: const [0, 0.12, 1],
               ),
             ),
-            child: history.isEmpty
-                ? const Padding(
-                    padding: EdgeInsets.fromLTRB(18, 28, 18, 104),
-                    child: _EmptyHistory(),
-                  )
-                : GridView.builder(
-                    padding: const EdgeInsets.fromLTRB(18, 28, 18, 104),
-                    itemCount: history.length,
-                    gridDelegate:
-                        const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 3,
-                          mainAxisSpacing: 12,
-                          crossAxisSpacing: 12,
-                          childAspectRatio: 1,
-                        ),
-                    itemBuilder: (context, index) {
-                      final entry = history[index];
-                      return _HistoryGridTile(
-                        entry: entry,
-                        selected: asset?.assetPath == entry.assetPath,
-                        onTap: uploading ? null : () => onHistoryTap(entry),
-                        onLongPress: () => onHistoryDelete(entry),
-                      );
-                    },
+            child: GridView.builder(
+              padding: const EdgeInsets.fromLTRB(18, 8, 18, 104),
+              itemCount: factoryAnims.length + history.length,
+              gridDelegate:
+                  const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    mainAxisSpacing: 12,
+                    crossAxisSpacing: 12,
+                    childAspectRatio: 1,
                   ),
+              itemBuilder: (context, index) {
+                if (index < history.length) {
+                  final entry = history[index];
+                  return _HistoryGridTile(
+                    active: active,
+                    entry: entry,
+                    selected: asset?.assetPath == entry.assetPath,
+                    onTap: uploading ? null : () => onHistoryTap(entry),
+                    onLongPress: () => onHistoryDelete(entry),
+                  );
+                }
+                final anim = factoryAnims[index - history.length];
+                final isSelected = selectedFactoryId == anim.id;
+                return _FactoryGridTile(
+                  key: ValueKey('fac_${anim.id}'),
+                  anim: anim,
+                  selected: isSelected,
+                  onTap: uploading ? null : () => onFactoryTap(anim),
+                );
+              },
+            ),
           ),
         ),
       ],
@@ -1170,12 +1357,14 @@ class _DevicePage extends StatelessWidget {
 
 class _HistoryGridTile extends StatelessWidget {
   const _HistoryGridTile({
+    required this.active,
     required this.entry,
     required this.selected,
     required this.onTap,
     required this.onLongPress,
   });
 
+  final bool active;
   final HistoryEntry entry;
   final bool selected;
   final VoidCallback? onTap;
@@ -1206,6 +1395,7 @@ class _HistoryGridTile extends StatelessWidget {
                 child: ClipOval(
                   child: SizedBox.expand(
                     child: _HistoryPreview(
+                      active: active,
                       entry: entry,
                       previewPath: previewPath,
                       transform: entry.cropTransform,
@@ -1447,7 +1637,7 @@ class _TransformedPreviewMedia extends StatelessWidget {
         active: active,
       );
     }
-    if (_hasPreviewPath(selected?.animatedPreviewPath)) {
+    if (active && _hasPreviewPath(selected?.animatedPreviewPath)) {
       return Image.file(
         File(selected!.animatedPreviewPath!),
         fit: BoxFit.cover,
@@ -1462,7 +1652,7 @@ class _TransformedPreviewMedia extends StatelessWidget {
         gaplessPlayback: true,
       );
     }
-    if (_hasPreviewPath(asset?.animatedPreviewPath)) {
+    if (active && _hasPreviewPath(asset?.animatedPreviewPath)) {
       return Image.file(
         File(asset!.animatedPreviewPath!),
         fit: BoxFit.cover,
@@ -1513,6 +1703,9 @@ class _PreviewDial extends StatelessWidget {
     required this.active,
     required this.media,
     required this.asset,
+    this.factoryVideo,
+    this.nextVideo,
+    this.onFactoryVideoDone,
     required this.preparing,
     required this.progress,
   });
@@ -1520,6 +1713,9 @@ class _PreviewDial extends StatelessWidget {
   final bool active;
   final SelectedMedia? media;
   final PreparedAsset? asset;
+  final String? factoryVideo;
+  final String? nextVideo;
+  final VoidCallback? onFactoryVideoDone;
   final bool preparing;
   final double progress;
 
@@ -1578,14 +1774,14 @@ class _PreviewDial extends StatelessWidget {
                 fit: BoxFit.cover,
                 gaplessPlayback: true,
               )
-            else if (_hasPreviewPath(media?.animatedPreviewPath))
+            else if (active && _hasPreviewPath(media?.animatedPreviewPath))
               Image.file(
                 File(media!.animatedPreviewPath!),
                 fit: BoxFit.cover,
                 gaplessPlayback: true,
                 errorBuilder: _blackPreviewFallback,
               )
-            else if (_hasPreviewPath(asset?.animatedPreviewPath))
+            else if (active && _hasPreviewPath(asset?.animatedPreviewPath))
               _CropTransformView(
                 transform: transform,
                 child: Image.file(
@@ -1601,6 +1797,13 @@ class _PreviewDial extends StatelessWidget {
                 fit: BoxFit.cover,
                 gaplessPlayback: true,
                 errorBuilder: _blackPreviewFallback,
+              )
+            else if (factoryVideo != null)
+              _DualVideoPlayer(
+                currentVideo: factoryVideo!,
+                nextVideo: nextVideo,
+                active: active,
+                onDone: onFactoryVideoDone,
               )
             else
               const Center(
@@ -1743,6 +1946,139 @@ class _VideoPreviewState extends State<_VideoPreview> {
   }
 }
 
+class _DualVideoPlayer extends StatefulWidget {
+  const _DualVideoPlayer({
+    super.key,
+    required this.currentVideo,
+    this.nextVideo,
+    required this.active,
+    this.onDone,
+  });
+
+  final String currentVideo;
+  final String? nextVideo;
+  final bool active;
+  final VoidCallback? onDone;
+
+  @override
+  State<_DualVideoPlayer> createState() => _DualVideoPlayerState();
+}
+
+class _DualVideoPlayerState extends State<_DualVideoPlayer> {
+  VideoPlayerController? _active;   // currently displayed (always initialized)
+  VideoPlayerController? _preloaded; // next video ready to go
+  String? _activePath;
+  String? _preloadedPath;
+  bool _done = false;
+
+  @override
+  void initState() { super.initState(); _loadCurrent(); _maybePreload(); }
+
+  @override
+  void didUpdateWidget(covariant _DualVideoPlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.currentVideo != widget.currentVideo) { _done = false; _switchTo(widget.currentVideo); }
+    if (oldWidget.nextVideo != widget.nextVideo) { _maybePreload(); }
+    if (oldWidget.active != widget.active) { unawaited(_syncActive()); }
+  }
+
+  void _maybePreload() {
+    final nv = widget.nextVideo;
+    if (nv == null || nv == _activePath || nv == _preloadedPath) return;
+    _preloaded?.removeListener(_onUpdate);
+    _preloaded?.dispose();
+    _preloaded = null; _preloadedPath = null;
+    final c = VideoPlayerController.asset(nv);
+    _preloaded = c; _preloadedPath = nv;
+    c.initialize().then((_) {
+      if (!mounted || _preloaded != c) return;
+      c.setLooping(false); c.setVolume(0);
+    }).catchError((_) { c.dispose(); if (mounted && _preloaded == c) { _preloaded = null; _preloadedPath = null; } });
+  }
+
+  Future<void> _loadCurrent() async { _done = false; await _activate(widget.currentVideo); _maybePreload(); }
+
+  Future<void> _switchTo(String path) async {
+    if (_activePath == path && _active != null) return;
+
+    // If preloaded has this, instant swap
+    if (_preloadedPath == path && _preloaded?.value.isInitialized == true) {
+      final old = _active;
+      _active = _preloaded; _activePath = _preloadedPath;
+      _preloaded = old; _preloadedPath = null;
+      _active?.removeListener(_onUpdate);
+      _active?.addListener(_onUpdate);
+      await _active!.seekTo(Duration.zero);
+      await _active!.play();
+      if (mounted) setState(() {});
+      _disposeAfter(old, 500);
+      _maybePreload();
+      return;
+    }
+
+    // Load new without touching _active — no flicker
+    await _activate(path);
+    _maybePreload();
+  }
+
+  Future<void> _activate(String path) async {
+    // Load new controller while keeping _active displayed
+    final c = VideoPlayerController.asset(path);
+    try {
+      await c.initialize(); await c.setLooping(false); await c.setVolume(0);
+      if (!mounted) { c.dispose(); return; }
+      c.addListener(_onUpdate);
+      // Swap: new becomes active, old goes to disposal
+      final old = _active;
+      _active = c; _activePath = path;
+      if (mounted) setState(() {});
+      await c.seekTo(Duration.zero);
+      await c.play();
+      _disposeAfter(old, 500);
+    } catch (_) {
+      await c.dispose();
+    }
+  }
+
+  void _disposeAfter(VideoPlayerController? c, int ms) {
+    if (c == null) return;
+    c.removeListener(_onUpdate);
+    Future.delayed(Duration(milliseconds: ms), () {
+      if (_active != c && _preloaded != c) c.dispose();
+    });
+  }
+
+  void _onUpdate() {
+    if (_done || _active == null || !_active!.value.isInitialized) return;
+    if (_active!.value.position >= _active!.value.duration - const Duration(milliseconds: 100)) {
+      _done = true; widget.onDone?.call();
+    }
+  }
+
+  Future<void> _syncActive() async {
+    final c = _active; if (c == null || !c.value.isInitialized) return;
+    try { if (widget.active) { await c.play(); } else { await c.pause(); } } catch (_) {}
+  }
+
+  @override
+  void deactivate() { final c = _active; if (c != null && c.value.isInitialized) unawaited(c.pause()); super.deactivate(); }
+  @override
+  void activate() { super.activate(); unawaited(_syncActive()); }
+  @override
+  void dispose() {
+    _active?.removeListener(_onUpdate); _active?.dispose();
+    _preloaded?.removeListener(_onUpdate); _preloaded?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = _active;
+    if (c == null || !c.value.isInitialized) return const SizedBox.expand();
+    return FittedBox(fit: BoxFit.cover, child: SizedBox(width: c.value.size.width, height: c.value.size.height, child: VideoPlayer(c)));
+  }
+}
+
 class _GlassPanel extends StatelessWidget {
   const _GlassPanel({required this.child});
 
@@ -1822,11 +2158,13 @@ class _PageHeader extends StatelessWidget {
 
 class _HistoryPreview extends StatelessWidget {
   const _HistoryPreview({
+    required this.active,
     required this.entry,
     required this.previewPath,
     required this.transform,
   });
 
+  final bool active;
   final HistoryEntry entry;
   final String? previewPath;
   final CropTransform transform;
@@ -1834,7 +2172,7 @@ class _HistoryPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     Widget? child;
-    if (_hasPreviewPath(entry.animatedPreviewPath)) {
+    if (active && _hasPreviewPath(entry.animatedPreviewPath)) {
       child = Image.file(
         File(entry.animatedPreviewPath!),
         fit: BoxFit.cover,
@@ -2072,6 +2410,7 @@ class HistoryEntry {
     required this.cropScale,
     required this.cropOffsetX,
     required this.cropOffsetY,
+    this.deviceId,
   });
 
   factory HistoryEntry.fromAsset(
@@ -2112,6 +2451,7 @@ class HistoryEntry {
       cropScale: (map['cropScale'] as num?)?.toDouble() ?? 1,
       cropOffsetX: (map['cropOffsetX'] as num?)?.toDouble() ?? 0,
       cropOffsetY: (map['cropOffsetY'] as num?)?.toDouble() ?? 0,
+      deviceId: _readNullableString(map['deviceId']),
     );
   }
 
@@ -2131,6 +2471,7 @@ class HistoryEntry {
       'cropScale': cropScale,
       'cropOffsetX': cropOffsetX,
       'cropOffsetY': cropOffsetY,
+      if (deviceId != null) 'deviceId': deviceId,
     };
   }
 
@@ -2148,6 +2489,7 @@ class HistoryEntry {
   final double cropScale;
   final double cropOffsetX;
   final double cropOffsetY;
+  final String? deviceId;
 
   CropTransform get cropTransform {
     return CropTransform(
@@ -2156,7 +2498,7 @@ class HistoryEntry {
     );
   }
 
-  HistoryEntry copyWith({String? animatedPreviewPath}) {
+  HistoryEntry copyWith({String? animatedPreviewPath, String? deviceId}) {
     return HistoryEntry(
       assetPath: assetPath,
       previewPath: previewPath,
@@ -2172,6 +2514,7 @@ class HistoryEntry {
       cropScale: cropScale,
       cropOffsetX: cropOffsetX,
       cropOffsetY: cropOffsetY,
+      deviceId: deviceId ?? this.deviceId,
     );
   }
 }
@@ -2236,3 +2579,114 @@ Widget _blackPreviewFallback(
 }
 
 bool _isVideoMime(String mime) => mime.toLowerCase().startsWith('video/');
+
+class FactoryAnimation {
+  const FactoryAnimation({
+    required this.id,
+    required this.name,
+    required this.previewAsset,
+    this.firstVideo,
+    this.secondVideo,
+    this.transitions = const {},
+  });
+
+  final String id;
+  final String name;
+  final String previewAsset;
+  final String? firstVideo;
+  final String? secondVideo;
+  final Map<String, String> transitions;
+
+  factory FactoryAnimation.fromMap(Map<String, dynamic> map) {
+    return FactoryAnimation(
+      id: (map['id'] as String?) ?? '',
+      name: (map['name'] as String?) ?? '',
+      previewAsset: (map['previewAsset'] as String?) ?? '',
+      firstVideo: _readNullableString(map['firstVideo']),
+      secondVideo: _readNullableString(map['secondVideo']),
+      transitions: _asStringMap(map['transitions'])
+          .map((k, v) => MapEntry(k, v.toString())),
+    );
+  }
+
+  /// Get the exit animation video for switching to [targetId].
+  /// Returns third_half if a special transition exists, else secondVideo.
+  String? exitVideo(String? targetId) {
+    if (targetId != null && transitions.containsKey(targetId)) {
+      return transitions[targetId];
+    }
+    return secondVideo;
+  }
+}
+
+class _FactoryGridTile extends StatelessWidget {
+  const _FactoryGridTile({
+    super.key,
+    required this.anim,
+    required this.selected,
+    this.onTap,
+  });
+
+  final FactoryAnimation anim;
+  final bool selected;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: Material(
+        color: selected ? Colors.white.withValues(alpha: 0.05) : Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: selected
+                    ? Colors.white
+                    : Colors.white.withValues(alpha: 0.12),
+                width: selected ? 2 : 1,
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(6),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(5),
+                child: SizedBox.expand(
+                  child: Image.asset(
+                    anim.previewAsset,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) =>
+                        const ColoredBox(color: Color(0xff1a1a1a)),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SectionLabel extends StatelessWidget {
+  const _SectionLabel(this.text);
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 14,
+          fontWeight: FontWeight.w600,
+          color: Colors.white.withValues(alpha: 0.6),
+        ),
+      ),
+    );
+  }
+}

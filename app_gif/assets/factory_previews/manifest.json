@@ -1,0 +1,146 @@
+[
+  {
+    "id": "F001",
+    "name": "F001",
+    "previewAsset": "assets/factory_previews/F001.png",
+    "firstVideo": "assets/factory_previews/F001_first.mp4",
+    "secondVideo": "assets/factory_previews/F001_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F002",
+    "name": "F002",
+    "previewAsset": "assets/factory_previews/F002.png",
+    "firstVideo": "assets/factory_previews/F002_first.mp4",
+    "secondVideo": "assets/factory_previews/F002_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F003",
+    "name": "F003",
+    "previewAsset": "assets/factory_previews/F003.png",
+    "firstVideo": "assets/factory_previews/F003_first.mp4",
+    "secondVideo": "assets/factory_previews/F003_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F004",
+    "name": "F004",
+    "previewAsset": "assets/factory_previews/F004.png",
+    "firstVideo": "assets/factory_previews/F004_first.mp4",
+    "secondVideo": "assets/factory_previews/F004_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F005",
+    "name": "F005",
+    "previewAsset": "assets/factory_previews/F005.png",
+    "firstVideo": "assets/factory_previews/F005_first.mp4",
+    "secondVideo": "assets/factory_previews/F005_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F006",
+    "name": "F006",
+    "previewAsset": "assets/factory_previews/F006.png",
+    "firstVideo": "assets/factory_previews/F006_first.mp4",
+    "secondVideo": "assets/factory_previews/F006_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F007",
+    "name": "F007",
+    "previewAsset": "assets/factory_previews/F007.png",
+    "firstVideo": "assets/factory_previews/F007_first.mp4",
+    "secondVideo": "assets/factory_previews/F007_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F008",
+    "name": "F008",
+    "previewAsset": "assets/factory_previews/F008.png",
+    "firstVideo": "assets/factory_previews/F008_first.mp4",
+    "secondVideo": "assets/factory_previews/F008_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F009",
+    "name": "F009",
+    "previewAsset": "assets/factory_previews/F009.png",
+    "firstVideo": "assets/factory_previews/F009_first.mp4",
+    "secondVideo": "assets/factory_previews/F009_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F010",
+    "name": "F010",
+    "previewAsset": "assets/factory_previews/F010.png",
+    "firstVideo": "assets/factory_previews/F010_first.mp4",
+    "secondVideo": "assets/factory_previews/F010_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F011",
+    "name": "F011",
+    "previewAsset": "assets/factory_previews/F011.png",
+    "firstVideo": "assets/factory_previews/F011_first.mp4",
+    "secondVideo": "assets/factory_previews/F011_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F012",
+    "name": "F012",
+    "previewAsset": "assets/factory_previews/F012.png",
+    "firstVideo": "assets/factory_previews/F012_first.mp4",
+    "secondVideo": "assets/factory_previews/F012_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F013",
+    "name": "F013",
+    "previewAsset": "assets/factory_previews/F013.png",
+    "firstVideo": "assets/factory_previews/F013_first.mp4",
+    "secondVideo": "assets/factory_previews/F013_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F014",
+    "name": "F014",
+    "previewAsset": "assets/factory_previews/F014.png",
+    "firstVideo": "assets/factory_previews/F014_first.mp4",
+    "secondVideo": "assets/factory_previews/F014_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F015",
+    "name": "F015",
+    "previewAsset": "assets/factory_previews/F015.png",
+    "firstVideo": "assets/factory_previews/F015_first.mp4",
+    "secondVideo": "assets/factory_previews/F015_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F016",
+    "name": "F016",
+    "previewAsset": "assets/factory_previews/F016.png",
+    "firstVideo": "assets/factory_previews/F016_first.mp4",
+    "secondVideo": "assets/factory_previews/F016_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F017",
+    "name": "F017",
+    "previewAsset": "assets/factory_previews/F017.png",
+    "firstVideo": "assets/factory_previews/F017_first.mp4",
+    "secondVideo": "assets/factory_previews/F017_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F018",
+    "name": "F018",
+    "previewAsset": "assets/factory_previews/F018.png",
+    "firstVideo": "assets/factory_previews/F018_first.mp4",
+    "secondVideo": "assets/factory_previews/F018_second.mp4",
+    "transitions": {}
+  }
+]

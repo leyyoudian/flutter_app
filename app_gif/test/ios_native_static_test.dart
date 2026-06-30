@@ -42,7 +42,7 @@ void main() {
     expect(source, contains('codecIndexedRepeat = 0x12'));
     expect(source, contains('videoPreviewGifSize = 192'));
     expect(source, contains('videoPreviewGifFps = 30'));
-    expect(source, contains('qualityStreamBytesPerSecond = 4 * 1024 * 1024'));
+    expect(source, contains('qualityStreamBytesPerSecond = 7 * 512 * 1024'));
     expect(plist, contains('NSLocalNetworkUsageDescription'));
     expect(plist, contains('NSAppTransportSecurity'));
     expect(plist, contains('CFBundleDisplayName'));
@@ -113,5 +113,37 @@ void main() {
     expect(source, contains('scheduleVideoAnimatedPreview'));
     expect(previewSource, isNot(contains('AVAssetImageGenerator')));
     expect(previewSource, isNot(contains('copyCGImage')));
+  });
+
+  test('iOS upload streams packages from disk instead of concatenating payloads', () {
+    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+    final uploadStart = source.indexOf('  private func uploadAsset(assetPath: String');
+    final uploadEnd = source.indexOf('  private func uploadAssetOverTcp', uploadStart);
+    expect(uploadStart, isNot(-1));
+    expect(uploadEnd, isNot(-1));
+    final uploadSource = source.substring(uploadStart, uploadEnd);
+    final tcpStart = source.indexOf('  private func uploadAssetOverTcp(');
+    final tcpEnd = source.indexOf('  private func uploadAssetOverHttp', tcpStart);
+    expect(tcpStart, isNot(-1));
+    expect(tcpEnd, isNot(-1));
+    final tcpSource = source.substring(tcpStart, tcpEnd);
+
+    expect(
+      uploadSource.indexOf('try self.uploadAssetOverHttp(package: package)'),
+      lessThan(uploadSource.indexOf('try self.uploadAssetOverTcp(package: package)')),
+    );
+    expect(source, contains('private struct UploadPackageInfo'));
+    expect(source, contains('private func preparePackageForUpload(fileURL: URL) throws -> UploadPackageInfo'));
+    expect(source, contains('private func sendTcpFileChunks('));
+    expect(source, contains('InputStream(url: package.fileURL)'));
+    expect(source, contains('URLSession.shared.uploadTask(with: request, fromFile: package.fileURL)'));
+    expect(tcpSource, contains('appendLe32(&header, UInt32(package.size))'));
+    expect(tcpSource, contains('readyText.hasPrefix("READY")'));
+    expect(
+      tcpSource.indexOf('readyText.hasPrefix("READY")'),
+      lessThan(tcpSource.indexOf('self.sendTcpFileChunks(connection: connection, package: package)')),
+    );
+    expect(tcpSource, isNot(contains('payload.append(packageBytes)')));
+    expect(tcpSource, isNot(contains('var payload = Data()')));
   });
 }

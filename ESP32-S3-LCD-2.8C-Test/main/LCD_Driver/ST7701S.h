@@ -19,11 +19,12 @@
 #define LCD_SCLK 2
 #define LCD_RST  16
 #define LCD_CS   0
+#define LCD_CS_ALWAYS_LOW_AFTER_BOOT 1
 // The pixel number in horizontal and vertical
 #define EXAMPLE_LCD_V_RES              480
 #define EXAMPLE_LCD_H_RES              480
 
-#define EXAMPLE_LCD_PIXEL_CLOCK_HZ     (12 * 1000 * 1000)
+#define EXAMPLE_LCD_PIXEL_CLOCK_HZ     (10 * 1000 * 1000)
 #define EXAMPLE_LCD_BK_LIGHT_ON_LEVEL  1
 #define EXAMPLE_LCD_BK_LIGHT_OFF_LEVEL !EXAMPLE_LCD_BK_LIGHT_ON_LEVEL
 #define EXAMPLE_PIN_NUM_BK_LIGHT       6
@@ -31,22 +32,22 @@
 #define EXAMPLE_PIN_NUM_VSYNC          39
 #define EXAMPLE_PIN_NUM_DE             40
 #define EXAMPLE_PIN_NUM_PCLK           41
-#define EXAMPLE_PIN_NUM_DATA0          5  // B0
-#define EXAMPLE_PIN_NUM_DATA1          45 // B1
-#define EXAMPLE_PIN_NUM_DATA2          48 // B2
-#define EXAMPLE_PIN_NUM_DATA3          47 // B3
-#define EXAMPLE_PIN_NUM_DATA4          21 // B4
-#define EXAMPLE_PIN_NUM_DATA5          14 // G0
-#define EXAMPLE_PIN_NUM_DATA6          13 // G1
-#define EXAMPLE_PIN_NUM_DATA7          12 // G2
-#define EXAMPLE_PIN_NUM_DATA8          11 // G3
-#define EXAMPLE_PIN_NUM_DATA9          10 // G4
-#define EXAMPLE_PIN_NUM_DATA10         9  // G5
-#define EXAMPLE_PIN_NUM_DATA11         46 // R0
-#define EXAMPLE_PIN_NUM_DATA12         3  // R1
-#define EXAMPLE_PIN_NUM_DATA13         8  // R2
-#define EXAMPLE_PIN_NUM_DATA14         18 // R3
-#define EXAMPLE_PIN_NUM_DATA15         17 // R4
+#define EXAMPLE_PIN_NUM_DATA0          5  // B1 (ÆÁÄ»DB1, 18bit RGBµÍÎ»DB0Î´½Ó)
+#define EXAMPLE_PIN_NUM_DATA1          45 // B2 (ÆÁÄ»DB2)
+#define EXAMPLE_PIN_NUM_DATA2          48 // B3 (ÆÁÄ»DB3)
+#define EXAMPLE_PIN_NUM_DATA3          47 // B4 (ÆÁÄ»DB4)
+#define EXAMPLE_PIN_NUM_DATA4          21 // B5 (ÆÁÄ»DB5)
+#define EXAMPLE_PIN_NUM_DATA5          14 // G0 (ÆÁÄ»DB6)
+#define EXAMPLE_PIN_NUM_DATA6          13 // G1 (ÆÁÄ»DB7)
+#define EXAMPLE_PIN_NUM_DATA7          12 // G2 (ÆÁÄ»DB8)
+#define EXAMPLE_PIN_NUM_DATA8          11 // G3 (ÆÁÄ»DB9)
+#define EXAMPLE_PIN_NUM_DATA9          10 // G4 (ÆÁÄ»DB10)
+#define EXAMPLE_PIN_NUM_DATA10         9  // G5 (ÆÁÄ»DB11)
+#define EXAMPLE_PIN_NUM_DATA11         46 // R1 (ÆÁÄ»DB13, 18bit RGBµÍÎ»R0=DB12Î´½Ó)
+#define EXAMPLE_PIN_NUM_DATA12         3  // R2 (ÆÁÄ»DB14)
+#define EXAMPLE_PIN_NUM_DATA13         8  // R3 (ÆÁÄ»DB15)
+#define EXAMPLE_PIN_NUM_DATA14         18 // R4 (ÆÁÄ»DB16)
+#define EXAMPLE_PIN_NUM_DATA15         17 // R5 (ÆÁÄ»DB17)
 #define EXAMPLE_PIN_NUM_DISP_EN        -1
 
 #if CONFIG_EXAMPLE_DOUBLE_FB

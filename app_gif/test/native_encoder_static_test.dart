@@ -18,18 +18,17 @@ void main() {
     expect(source, contains('CODEC_INDEXED_REPEAT'));
     expect(source, contains('selectStreamResolution'));
     expect(source, contains('sampleStreamResolution'));
-    expect(
-      source,
-      contains(
-        'encodeAtResolution(context, uri, mime, fps, delayMs, selectedStreamSize, crop)',
-      ),
-    );
+    expect(source, contains('candidateStreamResolutions(selectedStreamSize)'));
+    expect(source, contains('actualQualityBytesPerSecond(selected)'));
     expect(source, contains('rgb332Palette'));
     expect(source, contains('quantizeToIndexed'));
     expect(source, contains('orderedDither'));
     expect(source, contains('sharpenForIndexed'));
     expect(source, contains('PixelScratch'));
     expect(source, contains('QUALITY_STREAM_BYTES_PER_SECOND'));
+    expect(source, contains('PLAYBACK_STREAM_BYTES_PER_SECOND'));
+    expect(source, contains('playbackBudgetBytesPerSecond'));
+    expect(source, contains('isPlaybackSafeStream'));
     expect(source, contains('uploadAssetOverTcp'));
     expect(source, contains('BADGE_UPLOAD_TCP_PORT'));
     expect(source, contains('buildVideoAnimatedPreview'));
@@ -75,20 +74,59 @@ void main() {
     expect(source, isNot(contains('CODEC_TILE_RAW')));
   });
 
-  test('video package encoding uses sequential decode instead of random frame seek', () {
-    final source = File(
+  test('cropped video stream selection includes ESP32 playback budget', () {
+    final android = File(
       'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
     ).readAsStringSync();
+    final ios = File('ios/Runner/AppDelegate.swift').readAsStringSync();
 
-    expect(source, contains('import android.media.MediaExtractor'));
-    expect(source, contains('import android.media.MediaCodec'));
-    expect(source, contains('private fun decodeVideoFramesSequentially'));
-    expect(source, contains('decodeVideoFramesSequentially(context, uri, targetFrameTimesUs'));
-    expect(
-      source,
-      isNot(contains('private fun encodeVideoFrames(\n            context: Context,\n            uri: Uri,\n            delayMs: Int,\n            streamSize: Int,\n            crop: CropTransform,\n        ): List<EncodedFrame> {\n            val retriever = createRetriever(context, uri)')),
+    final androidSelectStart = android.indexOf('        private fun selectStreamResolution');
+    final androidSelectEnd = android.indexOf(
+      '        private fun candidateStreamResolutions',
+      androidSelectStart,
     );
+    expect(androidSelectStart, isNot(-1));
+    expect(androidSelectEnd, isNot(-1));
+    final androidSelect = android.substring(androidSelectStart, androidSelectEnd);
+
+    expect(android, contains('private const val PLAYBACK_STREAM_BYTES_PER_SECOND'));
+    expect(android, contains('private fun playbackBudgetBytesPerSecond(streamSize: Int): Long'));
+    expect(android, contains('private fun isPlaybackSafeStream(estimate: StreamEstimate): Boolean'));
+    expect(androidSelect, contains('isPlaybackSafeStream(estimate)'));
+    expect(androidSelect, isNot(contains('estimate.bytesPerSecond <= QUALITY_STREAM_BYTES_PER_SECOND')));
+
+    expect(ios, contains('static let playbackStreamBytesPerSecond'));
+    expect(ios, contains('private func playbackBudgetBytesPerSecond(_ streamSize: Int) -> Int'));
+    expect(ios, contains('private func isPlaybackSafeStream(_ estimate: StreamEstimate) -> Bool'));
+    expect(ios, contains('where isPlaybackSafeStream(estimate)'));
   });
+
+  test(
+    'video package encoding uses sequential decode instead of random frame seek',
+    () {
+      final source = File(
+        'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+      ).readAsStringSync();
+
+      expect(source, contains('import android.media.MediaExtractor'));
+      expect(source, contains('import android.media.MediaCodec'));
+      expect(source, contains('private fun decodeVideoFramesSequentially'));
+      expect(
+        source,
+        contains(
+          'decodeVideoFramesSequentially(context, uri, targetFrameTimesUs',
+        ),
+      );
+      expect(
+        source,
+        isNot(
+          contains(
+            'private fun encodeVideoFrames(\n            context: Context,\n            uri: Uri,\n            delayMs: Int,\n            streamSize: Int,\n            crop: CropTransform,\n        ): List<EncodedFrame> {\n            val retriever = createRetriever(context, uri)',
+          ),
+        ),
+      );
+    },
+  );
 
   test('video save returns before animated preview generation finishes', () {
     final source = File(
@@ -133,15 +171,19 @@ void main() {
       ),
     );
     expect(source, contains('private fun quantizeYuvImageToGifIndexed'));
-    expect(previewSource, contains('encodeIndexedGif(frames, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, delayMs)'));
     expect(
       previewSource,
-      isNot(contains('getFrameAtTime')),
+      contains(
+        'encodeIndexedGif(frames, VIDEO_PREVIEW_GIF_SIZE, VIDEO_PREVIEW_GIF_SIZE, delayMs)',
+      ),
     );
+    expect(previewSource, isNot(contains('getFrameAtTime')));
     expect(
       previewSource,
       isNot(
-        contains('decodeVideoFramesSequentially(context, uri, targetFrameTimesUs'),
+        contains(
+          'decodeVideoFramesSequentially(context, uri, targetFrameTimesUs',
+        ),
       ),
     );
   });

@@ -9,7 +9,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define BADGE_STREAM_SLOT_COUNT 3u
+#define BADGE_STREAM_SLOT_COUNT 16u
 #define BADGE_STREAM_TASK_STACK 4096u
 #define BADGE_STREAM_TASK_PRIORITY 5u
 
@@ -162,6 +162,36 @@ esp_err_t badge_stream_read_frame(badge_stream_t *stream,
     out_frame->status = slot->status;
     out_frame->read_us = slot->read_us;
     return ESP_OK;
+}
+
+esp_err_t badge_stream_wait_prefill(badge_stream_t *stream,
+                                    uint32_t min_ready_frames,
+                                    uint32_t timeout_ms)
+{
+    if (stream == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (min_ready_frames == 0) {
+        return ESP_OK;
+    }
+    if (min_ready_frames > BADGE_STREAM_SLOT_COUNT) {
+        min_ready_frames = BADGE_STREAM_SLOT_COUNT;
+    }
+
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (!stream->stopping) {
+        UBaseType_t ready = uxQueueMessagesWaiting(stream->ready_slots);
+        if ((uint32_t)ready >= min_ready_frames) {
+            return ESP_OK;
+        }
+        if (timeout_ms == 0 || esp_timer_get_time() >= deadline_us) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    return ESP_ERR_INVALID_STATE;
 }
 
 void badge_stream_release_frame(badge_stream_t *stream, badge_stream_frame_t *frame)

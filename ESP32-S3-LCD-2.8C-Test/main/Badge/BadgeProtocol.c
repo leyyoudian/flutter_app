@@ -79,6 +79,19 @@ esp_err_t badge_protocol_parse_data_chunk(const uint8_t *data, size_t len, badge
     return ESP_OK;
 }
 
+bool badge_protocol_fps_is_supported(uint16_t fps)
+{
+    return fps >= BADGE_EBAJ_MIN_FPS && fps <= BADGE_EBAJ_MAX_FPS;
+}
+
+uint16_t badge_protocol_frame_delay_ms(uint16_t fps)
+{
+    if (!badge_protocol_fps_is_supported(fps)) {
+        return 0;
+    }
+    return (uint16_t)((1000u + (uint32_t)fps / 2u) / (uint32_t)fps);
+}
+
 bool badge_protocol_validate_header(const badge_ebaj_header_t *header, uint32_t slot_size)
 {
     if (header == NULL) {
@@ -93,7 +106,10 @@ bool badge_protocol_validate_header(const badge_ebaj_header_t *header, uint32_t 
     if (header->width != BADGE_EBAJ_WIDTH || header->height != BADGE_EBAJ_HEIGHT) {
         return false;
     }
-    if (header->frame_count == 0 || header->fps != BADGE_EBAJ_FPS) {
+    if (header->frame_count == 0 || !badge_protocol_fps_is_supported(header->fps)) {
+        return false;
+    }
+    if (badge_protocol_frame_delay_ms(header->fps) == 0) {
         return false;
     }
     if (header->palette_entries != BADGE_EBAJ_PALETTE_ENTRIES) {

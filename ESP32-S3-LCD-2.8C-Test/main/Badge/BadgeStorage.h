@@ -27,10 +27,12 @@ typedef struct {
 } badge_upload_perf_t;
 
 esp_err_t badge_storage_init(void);
+void badge_storage_ensure_mounted(void);
 esp_err_t badge_storage_begin_upload(uint32_t total_size, uint32_t expected_crc32);
 esp_err_t badge_storage_write_chunk(uint32_t offset, const uint8_t *data, size_t len);
 esp_err_t badge_storage_finish_upload(void);
 void badge_storage_abort_upload(void);
+esp_err_t badge_storage_open_asset_path(const char *path, badge_asset_t *out);
 esp_err_t badge_storage_open_active_asset(badge_asset_t *out);
 void badge_storage_close_asset(badge_asset_t *asset);
 esp_err_t badge_storage_read_asset(badge_asset_t *asset, uint32_t offset, void *buffer, size_t len);

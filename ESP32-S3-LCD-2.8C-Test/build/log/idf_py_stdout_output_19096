@@ -1,0 +1,11 @@
+[1/9] Performing build step for 'bootloader'
+[1/1] C:\Windows\system32\cmd.exe /C "cd /D D:\Documents\esp-baji\ESP32-S3-LCD-2.8C-Test\build\bootloader\esp-idf\esptool_py && D:\Espressif\python_env\idf5.4_py3.8_env\Scripts\python.exe D:/espidf/v5.4.2/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 D:/Documents/esp-baji/ESP32-S3-LCD-2.8C-Test/build/bootloader/bootloader.bin"
+Bootloader binary size 0x51c0 bytes. 0x2e40 bytes (36%) free.
+[2/9] No install step for 'bootloader'
+[3/9] Completed 'bootloader'
+[4/9] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/LCD_Driver/ST7701S.c.obj
+[5/9] Linking C static library esp-idf\main\libmain.a
+FAILED: esp-idf/main/libmain.a 
+C:\Windows\system32\cmd.exe /C "cd . && D:\Espressif\tools\cmake\3.30.2\bin\cmake.exe -E rm -f esp-idf\main\libmain.a && D:\espidf-path\tools\xtensa-esp-elf\esp-14.2.0_20241119\xtensa-esp-elf\bin\xtensa-esp32s3-elf-ar.exe qc esp-idf\main\libmain.a  esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Badge/BadgeDisplay.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Badge/BadgeIndexed.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Badge/BadgeLz4.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Badge/BadgeProtocol.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Badge/BadgeStream.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Badge/BadgeStorage.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/SD_Card/SD_MMC.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Wireless/WifiUpload.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/LCD_Driver/ST7701S.c.obj esp-idf/main/CMakeFiles/__idf_main.dir/Wireless/Wireless.c.obj && D:\espidf-path\tools\xtensa-esp-elf\esp-14.2.0_20241119\xtensa-esp-elf\bin\xtensa-esp32s3-elf-ranlib.exe esp-idf\main\libmain.a && cd ."
+D:\espidf-path\tools\xtensa-esp-elf\esp-14.2.0_20241119\xtensa-esp-elf\bin\xtensa-esp-elf-ar.exe: unable to copy file 'esp-idf\main\libmain.a'; reason: Invalid argument
+ninja: build stopped: subcommand failed.

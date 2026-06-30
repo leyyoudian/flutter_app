@@ -26,5 +26,8 @@ esp_err_t badge_stream_start(badge_asset_t *asset,
 esp_err_t badge_stream_read_frame(badge_stream_t *stream,
                                   badge_stream_frame_t *out_frame,
                                   uint32_t timeout_ms);
+esp_err_t badge_stream_wait_prefill(badge_stream_t *stream,
+                                    uint32_t min_ready_frames,
+                                    uint32_t timeout_ms);
 void badge_stream_release_frame(badge_stream_t *stream, badge_stream_frame_t *frame);
 void badge_stream_stop(badge_stream_t *stream);

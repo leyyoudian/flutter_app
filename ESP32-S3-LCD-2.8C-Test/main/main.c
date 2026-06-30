@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "ST7701S.h"
 #include "Wireless.h"
+#include "BadgeAnimMgr.h"
 #include "BadgeDisplay.h"
 #include "BadgeStorage.h"
 
@@ -33,11 +34,16 @@ void app_main(void)
     ESP_LOGI(TAG, "Badge firmware build: %s", BADGE_FW_BUILD_ID);
     Driver_Init();
     ESP_ERROR_CHECK(badge_storage_init());
-    LCD_Init();
-    ESP_ERROR_CHECK(badge_display_init());
     ESP_ERROR_CHECK(Wireless_Init());
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    LCD_Init();   
 
+    vTaskDelay(pdMS_TO_TICKS(500));
+    /* Ensure SD is mounted before display init (player task needs SD) */
+    badge_storage_ensure_mounted();
+    ESP_ERROR_CHECK(badge_display_init());
+    ESP_ERROR_CHECK(badge_anim_mgr_init());
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

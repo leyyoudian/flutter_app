@@ -14,8 +14,11 @@
 #define BADGE_EBAJ_HEIGHT 480u
 #define BADGE_EBAJ_PIXELS (BADGE_EBAJ_WIDTH * BADGE_EBAJ_HEIGHT)
 #define BADGE_EBAJ_FRAME_BYTES (BADGE_EBAJ_PIXELS * 2u)
-#define BADGE_EBAJ_FPS 20u
-#define BADGE_EBAJ_FRAME_DELAY_MS 50u
+#define BADGE_EBAJ_MIN_FPS 25u
+#define BADGE_EBAJ_DEFAULT_FPS 25u
+#define BADGE_EBAJ_MAX_FPS 30u
+#define BADGE_EBAJ_FPS BADGE_EBAJ_DEFAULT_FPS
+#define BADGE_EBAJ_FRAME_DELAY_MS 40u
 #define BADGE_EBAJ_PALETTE_ENTRIES 256u
 #define BADGE_EBAJ_TILE_SIZE 16u
 
@@ -80,5 +83,7 @@ _Static_assert(sizeof(badge_ebaj_frame_t) == 16, "EBAJ4 frame entry size must be
 esp_err_t badge_protocol_parse_start(const uint8_t *data, size_t len, badge_upload_start_t *out);
 esp_err_t badge_protocol_parse_data_chunk(const uint8_t *data, size_t len, badge_data_chunk_t *out);
 bool badge_protocol_validate_header(const badge_ebaj_header_t *header, uint32_t slot_size);
+bool badge_protocol_fps_is_supported(uint16_t fps);
+uint16_t badge_protocol_frame_delay_ms(uint16_t fps);
 uint32_t badge_crc32_update(uint32_t crc, const uint8_t *data, size_t len);
 uint32_t badge_crc32_finish(uint32_t crc);

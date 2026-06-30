@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "BadgeAnimMgr.h"
 #include "BadgeDisplay.h"
 #include "BadgeStorage.h"
 #include "ST7701S.h"
@@ -30,13 +31,21 @@
 #define BADGE_WIFI_SSID "ESP-BAJI"
 #define BADGE_WIFI_CHANNEL 6
 #define BADGE_WIFI_MAX_STA 1
+#define BADGE_WIFI_INACTIVE_TIME_SEC 600u
 #define BADGE_UPLOAD_TCP_PORT 3333
 #define BADGE_TCP_UPLOAD_MAGIC 0x31505542u
-#define BADGE_HTTP_UPLOAD_BUF (32u * 1024u)
-#define BADGE_TCP_UPLOAD_BUF (32u * 1024u)
-#define BADGE_UPLOAD_WRITE_COALESCE_BYTES (32u * 1024u)
+#define BADGE_HTTP_UPLOAD_BUF (64u * 1024u)
+#define BADGE_TCP_UPLOAD_BUF (64u * 1024u)
+#define BADGE_TCP_RCVBUF_BYTES (128u * 1024u)
+#define BADGE_UPLOAD_BUF_FALLBACK_BYTES (32u * 1024u)
+#define BADGE_UPLOAD_BUF_MIN_BYTES (16u * 1024u)
+#define BADGE_UPLOAD_WRITE_COALESCE_BYTES (128u * 1024u)
+#define BADGE_UPLOAD_WRITE_COALESCE_FALLBACK_BYTES (64u * 1024u)
+#define BADGE_UPLOAD_WRITE_COALESCE_MIN_BYTES (32u * 1024u)
+#define BADGE_UPLOAD_DIAG_STEP_BYTES (64u * 1024u)
+#define BADGE_UPLOAD_DISPLAY_STOP_TIMEOUT_MS 1500u
 #define BADGE_HTTP_CRC_HEADER "X-EBAJ-CRC32"
-#define BADGE_TCP_TASK_STACK 8192u
+#define BADGE_TCP_TASK_STACK 6144u
 #define BADGE_TCP_TASK_PRIORITY 7u
 
 static const char *TAG = "WifiUpload";
@@ -48,9 +57,12 @@ typedef struct {
     uint32_t expected_crc;
     uint32_t offset;
     int64_t recv_us;
+    int64_t started_us;
     const char *upload_buf_caps;
     uint8_t *coalesce;
     size_t coalesce_len;
+    size_t coalesce_size;
+    uint32_t next_diag_at;
 } badge_upload_session_t;
 
 static esp_err_t start_wifi_ap(void)
@@ -70,22 +82,37 @@ static esp_err_t start_wifi_ap(void)
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&init_cfg), TAG, "wifi init failed");
 
+    wifi_country_t country = {
+        .cc = "CN",
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL,
+    };
+    ESP_RETURN_ON_ERROR(esp_wifi_set_country(&country), TAG, "wifi set country failed");
+
     wifi_config_t wifi_config = {0};
     snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", BADGE_WIFI_SSID);
     wifi_config.ap.ssid_len = strlen(BADGE_WIFI_SSID);
     wifi_config.ap.channel = BADGE_WIFI_CHANNEL;
     wifi_config.ap.max_connection = BADGE_WIFI_MAX_STA;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    wifi_config.ap.ssid_hidden = 0;
+    wifi_config.ap.beacon_interval = 100;
     wifi_config.ap.pmf_cfg.required = false;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "wifi mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &wifi_config), TAG, "wifi config failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N),
                         TAG, "wifi protocol failed");
-    (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT40);
+
+    (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     (void)esp_wifi_set_ps(WIFI_PS_NONE);
     (void)esp_wifi_set_max_tx_power(78);
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+    ret = esp_wifi_set_inactive_time(WIFI_IF_AP, BADGE_WIFI_INACTIVE_TIME_SEC);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "wifi inactive time config failed: %s", esp_err_to_name(ret));
+    }
 
     ESP_LOGI(TAG, "AP ready: ssid=%s http=http://192.168.4.1/upload tcp=192.168.4.1:%u",
              BADGE_WIFI_SSID, BADGE_UPLOAD_TCP_PORT);
@@ -100,7 +127,7 @@ static uint32_t read_le32(const uint8_t *data)
            ((uint32_t)data[3] << 24);
 }
 
-static uint8_t *alloc_upload_buffer(size_t size)
+static uint8_t *alloc_upload_buffer_exact(size_t size, bool try_spiram)
 {
     uint8_t *buffer = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (buffer != NULL) {
@@ -108,10 +135,54 @@ static uint8_t *alloc_upload_buffer(size_t size)
     }
 
     buffer = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (buffer == NULL) {
+    if (buffer == NULL && try_spiram) {
         buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     return buffer;
+}
+
+static uint8_t *alloc_upload_buffer(size_t preferred_size, size_t *out_size)
+{
+    const size_t candidates[] = {
+        preferred_size,
+        BADGE_UPLOAD_BUF_FALLBACK_BYTES,
+        BADGE_UPLOAD_BUF_MIN_BYTES,
+    };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        size_t size = candidates[i];
+        if (i > 0 && size >= preferred_size) {
+            continue;
+        }
+
+        uint8_t *buffer = alloc_upload_buffer_exact(size, false);
+        if (buffer != NULL) {
+            if (out_size != NULL) {
+                *out_size = size;
+            }
+            return buffer;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        size_t size = candidates[i];
+        if (i > 0 && size >= preferred_size) {
+            continue;
+        }
+
+        uint8_t *buffer = alloc_upload_buffer_exact(size, true);
+        if (buffer != NULL) {
+            if (out_size != NULL) {
+                *out_size = size;
+            }
+            return buffer;
+        }
+    }
+
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+    return NULL;
 }
 
 static const char *upload_buffer_caps(const void *buffer)
@@ -149,8 +220,10 @@ static esp_err_t begin_upload_session(badge_upload_session_t *session,
     memset(session, 0, sizeof(*session));
     session->total_size = total_size;
     session->expected_crc = expected_crc;
+    session->started_us = esp_timer_get_time();
+    session->next_diag_at = BADGE_UPLOAD_DIAG_STEP_BYTES;
 
-    esp_err_t ret = badge_display_enter_upload_mode(pdMS_TO_TICKS(5000));
+    esp_err_t ret = badge_display_enter_upload_mode(pdMS_TO_TICKS(BADGE_UPLOAD_DISPLAY_STOP_TIMEOUT_MS));
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "display upload mode timeout: %s", esp_err_to_name(ret));
     }
@@ -191,6 +264,27 @@ static esp_err_t flush_upload_coalesce(badge_upload_session_t *session)
     return ret;
 }
 
+static esp_err_t write_upload_direct(badge_upload_session_t *session, const uint8_t *data, size_t len)
+{
+    const uint8_t *src = data;
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        size_t chunk = remaining;
+        if (chunk > BADGE_UPLOAD_WRITE_COALESCE_MIN_BYTES) {
+            chunk = BADGE_UPLOAD_WRITE_COALESCE_MIN_BYTES;
+        }
+
+        esp_err_t ret = write_upload_session(session, src, chunk);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        src += chunk;
+        remaining -= chunk;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t append_upload_data(badge_upload_session_t *session, const uint8_t *data, size_t len)
 {
     if (session == NULL || data == NULL || len == 0) {
@@ -200,14 +294,18 @@ static esp_err_t append_upload_data(badge_upload_session_t *session, const uint8
     const uint8_t *src = data;
     size_t remaining = len;
     while (remaining > 0) {
-        size_t free_len = BADGE_UPLOAD_WRITE_COALESCE_BYTES - session->coalesce_len;
+        if (session->coalesce == NULL || session->coalesce_size == 0) {
+            return write_upload_direct(session, src, remaining);
+        }
+
+        size_t free_len = session->coalesce_size - session->coalesce_len;
         size_t chunk = remaining > free_len ? free_len : remaining;
         memcpy(session->coalesce + session->coalesce_len, src, chunk);
         session->coalesce_len += chunk;
         src += chunk;
         remaining -= chunk;
 
-        if (session->coalesce_len == BADGE_UPLOAD_WRITE_COALESCE_BYTES) {
+        if (session->coalesce_len == session->coalesce_size) {
             esp_err_t ret = flush_upload_coalesce(session);
             if (ret != ESP_OK) {
                 return ret;
@@ -215,6 +313,41 @@ static esp_err_t append_upload_data(badge_upload_session_t *session, const uint8
         }
     }
     return ESP_OK;
+}
+
+static void log_upload_chunk_diag(badge_upload_session_t *session,
+                                  const char *transport,
+                                  int received,
+                                  int64_t chunk_recv_us,
+                                  int64_t chunk_append_us,
+                                  uint32_t remaining)
+{
+    if (session == NULL || transport == NULL) {
+        return;
+    }
+    if (session->offset < session->next_diag_at && remaining != 0) {
+        return;
+    }
+
+    badge_upload_perf_t perf = {0};
+    badge_storage_get_last_upload_perf(&perf);
+    int64_t elapsed_us = esp_timer_get_time() - session->started_us;
+    uint32_t mbps_x100 = upload_speed_mbps_x100(session->offset, elapsed_us);
+    ESP_LOGI(TAG,
+             "%s upload chunk offset=%" PRIu32 "/%" PRIu32 " recv_len=%d recv=%lldms append=%lldms total_recv=%lldms total_write=%lldms elapsed=%lldms mbps_x100=%" PRIu32,
+             transport,
+             session->offset,
+             session->total_size,
+             received,
+             (long long)(chunk_recv_us / 1000),
+             (long long)(chunk_append_us / 1000),
+             (long long)(session->recv_us / 1000),
+             (long long)(perf.storage_write_us / 1000),
+             (long long)(elapsed_us / 1000),
+             mbps_x100);
+    while (session->next_diag_at <= session->offset) {
+        session->next_diag_at += BADGE_UPLOAD_DIAG_STEP_BYTES;
+    }
 }
 
 static esp_err_t finish_upload_session(badge_upload_session_t *session, const char *transport)
@@ -227,6 +360,8 @@ static esp_err_t finish_upload_session(badge_upload_session_t *session, const ch
     }
 
     badge_display_exit_upload_mode();
+    /* Give the player task a chance to start before we block on recv. */
+    vTaskDelay(pdMS_TO_TICKS(10));
     badge_upload_perf_t perf = {0};
     badge_storage_get_last_upload_perf(&perf);
     int64_t total_us = session->recv_us + perf.storage_write_us + perf.crc_us + perf.finish_us;
@@ -245,6 +380,9 @@ static esp_err_t finish_upload_session(badge_upload_session_t *session, const ch
     ESP_LOGI(TAG, "%s upload_buf_caps=%s",
              transport,
              session->upload_buf_caps != NULL ? session->upload_buf_caps : "unknown");
+    ESP_LOGI(TAG, "%s coalesce=%u",
+             transport,
+             (unsigned)session->coalesce_size);
     return ESP_OK;
 }
 
@@ -260,13 +398,28 @@ static esp_err_t alloc_upload_session_buffers(badge_upload_session_t *session)
         return ESP_ERR_INVALID_ARG;
     }
 
-    session->coalesce = heap_caps_malloc(BADGE_UPLOAD_WRITE_COALESCE_BYTES,
-                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (session->coalesce == NULL) {
-        session->coalesce = heap_caps_malloc(BADGE_UPLOAD_WRITE_COALESCE_BYTES,
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t candidates[] = {
+        BADGE_UPLOAD_WRITE_COALESCE_BYTES,
+        BADGE_UPLOAD_WRITE_COALESCE_FALLBACK_BYTES,
+        BADGE_UPLOAD_WRITE_COALESCE_MIN_BYTES,
+    };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        size_t size = candidates[i];
+        session->coalesce = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (session->coalesce == NULL) {
+            session->coalesce = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (session->coalesce != NULL) {
+            session->coalesce_size = size;
+            ESP_LOGI(TAG, "upload coalesce=%u caps=%s", (unsigned)size, upload_buffer_caps(session->coalesce));
+            return ESP_OK;
+        }
     }
-    return session->coalesce != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+
+    session->coalesce_size = 0;
+    ESP_LOGW(TAG, "upload coalesce disabled, writing chunks directly");
+    return ESP_OK;
 }
 
 static void free_upload_session_buffers(badge_upload_session_t *session)
@@ -279,6 +432,7 @@ static void free_upload_session_buffers(badge_upload_session_t *session)
         session->coalesce = NULL;
     }
     session->coalesce_len = 0;
+    session->coalesce_size = 0;
 }
 
 static esp_err_t parse_crc_header(httpd_req_t *req, uint32_t *out_crc)
@@ -369,11 +523,12 @@ static esp_err_t upload_handler(httpd_req_t *req)
     ret = alloc_upload_session_buffers(&session);
     if (ret != ESP_OK) {
         abort_upload_session();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no coalesce memory");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ret));
         return ESP_FAIL;
     }
 
-    uint8_t *buffer = alloc_upload_buffer(BADGE_HTTP_UPLOAD_BUF);
+    size_t buffer_size = 0;
+    uint8_t *buffer = alloc_upload_buffer(BADGE_HTTP_UPLOAD_BUF, &buffer_size);
     if (buffer == NULL) {
         free_upload_session_buffers(&session);
         abort_upload_session();
@@ -384,10 +539,11 @@ static esp_err_t upload_handler(httpd_req_t *req)
 
     size_t remaining = req->content_len;
     while (remaining > 0) {
-        size_t want = remaining > BADGE_HTTP_UPLOAD_BUF ? BADGE_HTTP_UPLOAD_BUF : remaining;
+        size_t want = remaining > buffer_size ? buffer_size : remaining;
         int64_t recv_start_us = esp_timer_get_time();
         int received = httpd_req_recv(req, (char *)buffer, want);
-        session.recv_us += esp_timer_get_time() - recv_start_us;
+        int64_t chunk_recv_us = esp_timer_get_time() - recv_start_us;
+        session.recv_us += chunk_recv_us;
         if (received == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;
         }
@@ -400,7 +556,9 @@ static esp_err_t upload_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
+        int64_t append_start_us = esp_timer_get_time();
         ret = append_upload_data(&session, buffer, (size_t)received);
+        int64_t chunk_append_us = esp_timer_get_time() - append_start_us;
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "write failed at %" PRIu32 ": %s", session.offset, esp_err_to_name(ret));
             heap_caps_free(buffer);
@@ -411,6 +569,7 @@ static esp_err_t upload_handler(httpd_req_t *req)
         }
 
         remaining -= (size_t)received;
+        log_upload_chunk_diag(&session, "HTTP", received, chunk_recv_us, chunk_append_us, (uint32_t)remaining);
     }
 
     heap_caps_free(buffer);
@@ -456,6 +615,30 @@ static esp_err_t recv_exact(int sock, void *buffer, size_t len, int64_t *recv_us
     return ESP_OK;
 }
 
+static esp_err_t send_tcp_line(int sock, const char *line)
+{
+    if (line == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *src = line;
+    size_t remaining = strlen(line);
+    while (remaining > 0) {
+        int sent = send(sock, src, remaining, 0);
+        if (sent <= 0) {
+            return ESP_FAIL;
+        }
+        src += sent;
+        remaining -= (size_t)sent;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t send_tcp_ready(int sock)
+{
+    return send_tcp_line(sock, "READY\n");
+}
+
 static void send_tcp_status(int sock, esp_err_t ret)
 {
     char response[64] = {0};
@@ -464,13 +647,15 @@ static void send_tcp_status(int sock, esp_err_t ret)
     } else {
         snprintf(response, sizeof(response), "ERR %s\n", esp_err_to_name(ret));
     }
-    (void)send(sock, response, strlen(response), 0);
+    (void)send_tcp_line(sock, response);
 }
 
 static esp_err_t handle_tcp_upload(int sock)
 {
     int opt = 1;
     (void)setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    int rcvbuf = BADGE_TCP_RCVBUF_BYTES;
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     struct timeval timeout = {
         .tv_sec = 120,
         .tv_usec = 0,
@@ -478,9 +663,58 @@ static esp_err_t handle_tcp_upload(int sock)
     (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    uint8_t header[12] = {0};
+    /* Peek the first 6 bytes to detect SWITCH command vs upload. */
+    uint8_t peek[6] = {0};
     int64_t header_recv_us = 0;
-    esp_err_t ret = recv_exact(sock, header, sizeof(header), &header_recv_us);
+    esp_err_t ret = recv_exact(sock, peek, sizeof(peek), &header_recv_us);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* SWITCH command: "SWITCH <ID>\n" */
+    if (memcmp(peek, "SWITCH", 6) == 0) {
+        char cmd[32] = {0};
+        int total = 0;
+        while (total < (int)sizeof(cmd) - 1) {
+            int r = recv(sock, cmd + total, 1, 0);
+            if (r <= 0) break;
+            total += r;
+            if (cmd[total - 1] == '\n') break;
+        }
+        cmd[total] = '\0';
+        /* Parse ID after "SWITCH " — note: "SWITCH" already consumed by peek above */
+        const char *id = cmd;
+        while (*id == ' ' || *id == '\t') id++;
+        /* Strip trailing whitespace/newline */
+        char clean_id[BADGE_ANIM_ID_LEN] = {0};
+        strncpy(clean_id, id, sizeof(clean_id) - 1);
+        size_t len = strlen(clean_id);
+        while (len > 0 && (clean_id[len - 1] == '\n' || clean_id[len - 1] == '\r' || clean_id[len - 1] == ' ')) {
+            clean_id[--len] = '\0';
+        }
+        ESP_LOGI(TAG, "SWITCH command: %s", clean_id);
+        if (strcmp(clean_id, "NEWID") == 0) {
+            const char *new_id = badge_anim_mgr_alloc_user_id();
+            char response[32];
+            snprintf(response, sizeof(response), "OK %s\n", new_id);
+            send_tcp_line(sock, response);
+            return ESP_OK;
+        }
+        ret = badge_anim_mgr_switch_to(clean_id);
+        if (ret == ESP_ERR_NOT_FOUND) {
+            send_tcp_line(sock, "NEED_UPLOAD ");
+            send_tcp_line(sock, clean_id);
+            send_tcp_line(sock, "\n");
+            return ESP_OK;
+        }
+        send_tcp_status(sock, ret);
+        return ret;
+    }
+
+    /* Binary upload: read remaining 6 bytes of the 12-byte header */
+    uint8_t header[12];
+    memcpy(header, peek, 6);
+    ret = recv_exact(sock, header + 6, 6, &header_recv_us);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -492,9 +726,19 @@ static esp_err_t handle_tcp_upload(int sock)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Send READY immediately ¨C the Android starts streaming data while we
+     * set up SD and allocate buffers.  The TCP receive window fills with
+     * in-flight data, keeping ACKs flowing and preventing congestion-window
+     * collapse once our recv() loop starts. */
+    ret = send_tcp_ready(sock);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     badge_upload_session_t session = {0};
     ret = begin_upload_session(&session, total_size, expected_crc);
     if (ret != ESP_OK) {
+        abort_upload_session();
         return ret;
     }
     session.recv_us = header_recv_us;
@@ -504,7 +748,8 @@ static esp_err_t handle_tcp_upload(int sock)
         return ret;
     }
 
-    uint8_t *buffer = alloc_upload_buffer(BADGE_TCP_UPLOAD_BUF);
+    size_t buffer_size = 0;
+    uint8_t *buffer = alloc_upload_buffer(BADGE_TCP_UPLOAD_BUF, &buffer_size);
     if (buffer == NULL) {
         free_upload_session_buffers(&session);
         abort_upload_session();
@@ -514,10 +759,11 @@ static esp_err_t handle_tcp_upload(int sock)
 
     uint32_t remaining = total_size;
     while (remaining > 0) {
-        size_t want = remaining > BADGE_TCP_UPLOAD_BUF ? BADGE_TCP_UPLOAD_BUF : remaining;
+        size_t want = remaining > buffer_size ? buffer_size : remaining;
         int64_t recv_start_us = esp_timer_get_time();
         int received = recv(sock, buffer, want, 0);
-        session.recv_us += esp_timer_get_time() - recv_start_us;
+        int64_t chunk_recv_us = esp_timer_get_time() - recv_start_us;
+        session.recv_us += chunk_recv_us;
         if (received <= 0) {
             heap_caps_free(buffer);
             free_upload_session_buffers(&session);
@@ -525,7 +771,9 @@ static esp_err_t handle_tcp_upload(int sock)
             return ESP_FAIL;
         }
 
+        int64_t append_start_us = esp_timer_get_time();
         ret = append_upload_data(&session, buffer, (size_t)received);
+        int64_t chunk_append_us = esp_timer_get_time() - append_start_us;
         if (ret != ESP_OK) {
             heap_caps_free(buffer);
             free_upload_session_buffers(&session);
@@ -533,6 +781,7 @@ static esp_err_t handle_tcp_upload(int sock)
             return ret;
         }
         remaining -= (uint32_t)received;
+        log_upload_chunk_diag(&session, "TCP", received, chunk_recv_us, chunk_append_us, remaining);
     }
 
     heap_caps_free(buffer);
@@ -548,8 +797,24 @@ static esp_err_t handle_tcp_upload(int sock)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    ret = finish_upload_session(&session, "TCP");
     free_upload_session_buffers(&session);
+    ret = finish_upload_session(&session, "TCP");
+    if (ret == ESP_OK) {
+        const char *user_id = badge_anim_mgr_alloc_user_id();
+        char user_path[72];
+        snprintf(user_path, sizeof(user_path), "/sdcard/user/%s.eb4", user_id);
+        unlink(user_path);
+        if (rename("/sdcard/badge.eb4", user_path) == 0) {
+            ESP_LOGI(TAG, "User upload saved as %s", user_path);
+            /* Let anim mgr handle it so NVS persistence + state update works */
+            badge_anim_mgr_play(user_id, BADGE_PLAY_MODE_LOOP);
+            char response[64];
+            snprintf(response, sizeof(response), "OK %s\n", user_id);
+            send_tcp_line(sock, response);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Failed to rename upload to user folder: errno=%d", errno);
+    }
     return ret;
 }
 
@@ -621,10 +886,10 @@ static esp_err_t start_http_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.ctrl_port = 32768;
-    config.stack_size = 10240;
-    config.task_priority = 6;
-    config.recv_wait_timeout = 120;
-    config.send_wait_timeout = 120;
+    config.stack_size = 12288;
+    config.task_priority = 10;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_httpd, &config), TAG, "httpd start failed");
 

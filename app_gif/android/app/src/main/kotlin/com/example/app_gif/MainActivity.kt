@@ -54,6 +54,8 @@ import org.json.JSONObject
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -86,9 +88,17 @@ class MainActivity : FlutterActivity() {
     @Volatile private var isUploading = false
     @Volatile private var badgeWifiNetwork: Network? = null
     @Volatile private var badgeSdAvailable = false
+    @Volatile private var badgeWifiManagedRequest = false
     private val preparingVideoUri = AtomicReference<String?>(null)
     private var badgeWifiCallback: ConnectivityManager.NetworkCallback? = null
     private var uploadWifiLock: WifiManager.WifiLock? = null
+    private var tcpUploadSocket: Socket? = null
+
+    private data class UploadPackageInfo(
+        val file: File,
+        val size: Long,
+        val crc: Long,
+    )
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -103,6 +113,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         stopScan()
+        stopUploadKeepAlive()
         releaseBadgeWifi()
         closeGatt()
         super.onDestroy()
@@ -274,6 +285,20 @@ class MainActivity : FlutterActivity() {
                 }
                 openExternalUrl(url, result)
             }
+            "switchToAsset" -> {
+                val id = call.argument<String>("id")
+                if (id.isNullOrBlank()) {
+                    result.error("bad_id", "素材ID为空", null)
+                    return
+                }
+                switchToAsset(id, result)
+            }
+            "getFactoryAnimations" -> {
+                result.success(buildFactoryAnimationList())
+            }
+            "requestUserId" -> {
+                requestNewUserId(result)
+            }
             else -> result.notImplemented()
         }
     }
@@ -377,14 +402,13 @@ class MainActivity : FlutterActivity() {
             .sortedByDescending { it.level }
             .forEach { result ->
                 val ssid = result.SSID.ifBlank { BADGE_WIFI_SSID }
-                val bssid = result.BSSID ?: ssid
                 val device = mapOf(
-                    "address" to bssid,
+                    "address" to ssid,
                     "name" to ssid,
                     "rssi" to result.level,
                     "serviceMatch" to true,
                 )
-                scanResults[bssid] = device
+                scanResults[ssid] = device
                 sendEvent(mapOf("type" to "scanResult", "device" to device))
             }
 
@@ -454,6 +478,7 @@ class MainActivity : FlutterActivity() {
 
     @SuppressLint("MissingPermission")
     private fun disconnect() {
+        closeTcpSocket()
         releaseBadgeWifi()
         closeGatt()
         badgeSdAvailable = false
@@ -737,6 +762,13 @@ class MainActivity : FlutterActivity() {
         assetPath: String? = null,
     ) {
         Thread {
+            if (isUploading) {
+                return@Thread
+            }
+            Thread.sleep(1200)
+            if (isUploading) {
+                return@Thread
+            }
             runCatching {
                 val previewStartMs = System.currentTimeMillis()
                 val preview = buildVideoAnimatedPreview(uri, crop) ?: return@Thread
@@ -761,64 +793,178 @@ class MainActivity : FlutterActivity() {
     private fun uploadAsset(assetPath: String, result: MethodChannel.Result) {
         Thread {
             try {
+                startUploadKeepAlive()
                 isUploading = true
+                sendEvent(mapOf("type" to "uploadProgress", "progress" to 0.0, "message" to "读取素材"))
                 val file = File(assetPath)
                 if (!file.exists()) {
                     throw IllegalArgumentException("素材包不存在")
                 }
-                val packageBytes = file.readBytes()
-                if (!isSupportedPackage(packageBytes)) {
-                    throw IllegalArgumentException("历史素材是旧格式，请重新导入生成 EBAJ4")
-                }
-                val crc = crc32(packageBytes)
-                uploadAssetWithRetry(packageBytes, crc)
+                sendEvent(mapOf("type" to "uploadProgress", "progress" to 0.0, "message" to "校验素材"))
+                val packageInfo = preparePackageForUpload(file)
+                sendEvent(mapOf("type" to "uploadProgress", "progress" to 0.0, "message" to "发送到设备"))
+                val assignedId = uploadAssetWithRetry(packageInfo)
                 sendEvent(mapOf("type" to "uploadProgress", "progress" to 1.0, "message" to "已切换显示"))
-                mainHandler.post { result.success(null) }
+                val resultMap = mutableMapOf<String, Any?>()
+                if (assignedId != null) resultMap["assignedId"] = assignedId
+                mainHandler.post { result.success(resultMap.ifEmpty { null }) }
             } catch (error: Exception) {
+                if (connectedAddress == null || badgeWifiNetwork == null) {
+                    sendConnectionEvent(false, false, null, "连接断开")
+                }
                 mainHandler.post {
                     result.error("upload_failed", error.message ?: "上传失败", null)
                 }
             } finally {
                 isUploading = false
+                stopUploadKeepAlive()
             }
         }.start()
     }
 
-    private fun isSupportedPackage(bytes: ByteArray): Boolean {
-        if (bytes.size < HEADER_SIZE) {
-            return false
+    private fun startUploadKeepAlive() {
+        val intent = Intent(this, UploadKeepAliveService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
-        val magic = (bytes[0].toInt() and 0xff) or
-            ((bytes[1].toInt() and 0xff) shl 8) or
-            ((bytes[2].toInt() and 0xff) shl 16) or
-            ((bytes[3].toInt() and 0xff) shl 24)
-        val version = (bytes[4].toInt() and 0xff) or
-            ((bytes[5].toInt() and 0xff) shl 8)
-        return magic == MAGIC &&
-            version == VERSION
     }
 
-    private fun uploadAssetWithRetry(packageBytes: ByteArray, crc: Long) {
+    private fun stopUploadKeepAlive() {
+        runCatching {
+            stopService(Intent(this, UploadKeepAliveService::class.java))
+        }
+    }
+
+    private fun preparePackageForUpload(file: File): UploadPackageInfo {
+        val size = file.length()
+        if (size < HEADER_SIZE) {
+            throw IllegalArgumentException("素材包头不完整，请重新导入生成 EBAJ4")
+        }
+        if (size > Int.MAX_VALUE) {
+            throw IllegalArgumentException("素材包过大，请换短一点的素材")
+        }
+
+        val header = ByteArray(HEADER_SIZE)
+        FileInputStream(file).use { input ->
+            var offset = 0
+            while (offset < header.size) {
+                val read = input.read(header, offset, header.size - offset)
+                if (read <= 0) {
+                    break
+                }
+                offset += read
+            }
+            if (offset != header.size) {
+                throw IllegalArgumentException("素材包头不完整，请重新导入生成 EBAJ4")
+            }
+        }
+
+        validatePackageForUpload(header, size)?.let { message ->
+            throw IllegalArgumentException(message)
+        }
+        return UploadPackageInfo(file, size, crc32(file))
+    }
+
+    private fun validatePackageForUpload(bytes: ByteArray, packageLength: Long = bytes.size.toLong()): String? {
+        if (bytes.size < HEADER_SIZE) {
+            return "素材包头不完整，请重新导入生成 EBAJ4"
+        }
+        val magic = readLe32(bytes, 0)
+        val version = readLe16(bytes, 4)
+        val headerSize = readLe16(bytes, 6)
+        val width = readLe16(bytes, 8)
+        val height = readLe16(bytes, 10)
+        val frameCount = readLe16(bytes, 12)
+        val fps = readLe16(bytes, 14)
+        val frameTableOffset = readLe32(bytes, 16)
+        val frameDataOffset = readLe32(bytes, 20)
+        val packageSize = readLe32(bytes, 24)
+        val streamWidth = readLe16(bytes, 36)
+        val streamHeight = readLe16(bytes, 38)
+        val paletteEntries = readLe16(bytes, 40)
+
+        if (magic != MAGIC.toLong() || version != VERSION) {
+            return "历史素材是旧格式，请重新导入生成 EBAJ4"
+        }
+        if (headerSize != HEADER_SIZE || width != WIDTH || height != HEIGHT) {
+            return "素材尺寸和当前设备不匹配，请重新导入生成"
+        }
+        if (frameCount == 0) {
+            return "素材没有可用帧，请重新导入生成"
+        }
+        if (fps < MIN_DEVICE_FPS || fps > MAX_DEVICE_FPS) {
+            return "历史素材帧率不是25-30fps，请重新导入生成"
+        }
+        if (paletteEntries != PALETTE_ENTRIES || !isValidStreamSize(streamWidth, streamHeight)) {
+            return "素材编码和当前固件不匹配，请重新导入生成"
+        }
+        if (packageSize != packageLength) {
+            return "素材包大小不匹配，请重新导入生成"
+        }
+        val tableBytes = frameCount.toLong() * FRAME_ENTRY_SIZE.toLong()
+        val tableEnd = frameTableOffset + tableBytes
+        if (frameTableOffset < HEADER_SIZE.toLong() ||
+            tableEnd > frameDataOffset ||
+            frameDataOffset > packageSize
+        ) {
+            return "素材帧表损坏，请重新导入生成"
+        }
+        return null
+    }
+
+    private fun isValidStreamSize(streamWidth: Int, streamHeight: Int): Boolean {
+        return (streamWidth == 480 && streamHeight == 480) ||
+            (streamWidth == 320 && streamHeight == 320) ||
+            (streamWidth == 240 && streamHeight == 240)
+    }
+
+    private fun readLe16(bytes: ByteArray, offset: Int): Int {
+        return (bytes[offset].toInt() and 0xff) or
+            ((bytes[offset + 1].toInt() and 0xff) shl 8)
+    }
+
+    private fun readLe32(bytes: ByteArray, offset: Int): Long {
+        return (bytes[offset].toLong() and 0xffL) or
+            ((bytes[offset + 1].toLong() and 0xffL) shl 8) or
+            ((bytes[offset + 2].toLong() and 0xffL) shl 16) or
+            ((bytes[offset + 3].toLong() and 0xffL) shl 24)
+    }
+
+    private fun uploadAssetWithRetry(packageInfo: UploadPackageInfo): String? {
         var lastError: Exception? = null
         for (attempt in 0 until HTTP_UPLOAD_ATTEMPTS) {
             try {
-                val network = ensureBadgeWifiNetwork()
-                bindUploadNetwork(network)
                 acquireUploadWifiLock()
+                val network = if (isTcpSocketAlive()) {
+                    badgeWifiNetwork ?: ensureBadgeWifiNetwork(fastUpload = true)
+                } else {
+                    ensureBadgeWifiNetwork(fastUpload = true)
+                }
                 try {
-                    uploadAssetOverTcp(network, packageBytes, crc)
+                    val assignedId = uploadAssetOverTcp(network, packageInfo)
+                    if (assignedId != null) return assignedId
                 } catch (tcpError: Exception) {
+                    if (isStaleBadgeNetworkError(tcpError)) {
+                        throw tcpError
+                    }
+                    closeTcpSocket()
                     sendEvent(
                         mapOf(
                             "type" to "status",
                             "message" to "TCP上传失败，回退HTTP",
                         ),
                     )
-                    uploadAssetOverHttp(network, packageBytes, crc)
+                    uploadAssetOverHttp(network, packageInfo)
                 }
-                return
+                return null
             } catch (error: Exception) {
                 lastError = error
+                closeTcpSocket()
+                if (isStaleBadgeNetworkError(error)) {
+                    releaseBadgeWifi()
+                }
                 sendEvent(
                     mapOf(
                         "type" to "status",
@@ -826,22 +972,26 @@ class MainActivity : FlutterActivity() {
                     ),
                 )
                 if (attempt + 1 < HTTP_UPLOAD_ATTEMPTS) {
-                    releaseBadgeWifi()
                     Thread.sleep(800)
                 }
             } finally {
-                releaseUploadWifiLock()
-                runCatching { connectivityManager().bindProcessToNetwork(null) }
+                releaseUploadWifiLock(keepIfConnected = true)
             }
         }
         throw lastError ?: IllegalStateException("上传失败")
     }
 
-    private fun bindUploadNetwork(network: Network) {
+    private fun isTcpSocketAlive(): Boolean {
+        val s = tcpUploadSocket ?: return false
+        return !s.isClosed && s.isConnected
+    }
+
+    private fun bindBadgeWifiNetwork(network: Network) {
         val bound = connectivityManager().bindProcessToNetwork(network)
         if (!bound) {
-            throw IllegalStateException("无法绑定 ESP-BAJI 网络")
+            throw IllegalStateException("ESP-BAJI 网络绑定失败，需重新连接")
         }
+        acquireUploadWifiLock()
     }
 
     @SuppressLint("WakelockTimeout")
@@ -855,7 +1005,10 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun releaseUploadWifiLock() {
+    private fun releaseUploadWifiLock(keepIfConnected: Boolean = false) {
+        if (keepIfConnected && badgeWifiNetwork != null) {
+            return
+        }
         runCatching {
             if (uploadWifiLock?.isHeld == true) {
                 uploadWifiLock?.release()
@@ -872,21 +1025,72 @@ class MainActivity : FlutterActivity() {
         return applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
     }
 
+    @Synchronized
     @SuppressLint("MissingPermission")
-    private fun ensureBadgeWifiNetwork(): Network {
+    private fun ensureBadgeWifiNetwork(fastUpload: Boolean = false): Network {
         if (!hasWifiPermissions()) {
             throw IllegalStateException("请允许 Wi-Fi 权限后重试")
         }
 
-        badgeWifiNetwork?.let { return it }
-
         val manager = connectivityManager()
+        if (fastUpload && !badgeWifiManagedRequest) {
+            val activeNetwork = manager.activeNetwork
+            if (activeNetwork != null && isCachedBadgeWifiNetworkTransportUsable(manager, activeNetwork)) {
+                bindBadgeWifiNetwork(activeNetwork)
+                try {
+                    val status = waitForBadgeStatus(activeNetwork, UPLOAD_NETWORK_READY_TIMEOUT_MS)
+                    badgeWifiNetwork = activeNetwork
+                    badgeSdAvailable = parseSdAvailable(status)
+                    connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+                    sendConnectionEvent(true, false, connectedAddress, "已复用 $BADGE_WIFI_SSID Wi-Fi")
+                    return activeNetwork
+                } catch (_: Exception) {
+                    runCatching { manager.bindProcessToNetwork(null) }
+                    releaseUploadWifiLock(keepIfConnected = false)
+                }
+            }
+        }
+
+        badgeWifiNetwork?.let { network ->
+            if (fastUpload && isCachedBadgeWifiNetworkTransportUsable(manager, network)) {
+                bindBadgeWifiNetwork(network)
+                try {
+                    val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)
+                    badgeSdAvailable = parseSdAvailable(status)
+                    connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+                    sendConnectionEvent(true, false, connectedAddress, "已复用 $BADGE_WIFI_SSID Wi-Fi")
+                    return network
+                } catch (_: Exception) {
+                    releaseBadgeWifi()
+                }
+            }
+            if (isCachedBadgeWifiNetworkUsable(manager, network)) {
+                bindBadgeWifiNetwork(network)
+                sendEvent(mapOf("type" to "status", "message" to "已复用 $BADGE_WIFI_SSID Wi-Fi"))
+                return network
+            }
+            releaseBadgeWifi()
+        }
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            return manager.activeNetwork ?: throw IllegalStateException("请先手动连接 $BADGE_WIFI_SSID Wi-Fi")
+            val network = manager.activeNetwork ?: throw IllegalStateException("请先手动连接 $BADGE_WIFI_SSID Wi-Fi")
+            badgeWifiNetwork = network
+            connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+            bindBadgeWifiNetwork(network)
+            return network
+        }
+
+        findExistingBadgeWifiNetwork(manager)?.let { network ->
+            badgeWifiNetwork = network
+            connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+            bindBadgeWifiNetwork(network)
+            sendEvent(mapOf("type" to "status", "message" to "已复用 $BADGE_WIFI_SSID Wi-Fi"))
+            return network
         }
 
         sendEvent(mapOf("type" to "status", "message" to "连接 $BADGE_WIFI_SSID Wi-Fi"))
         releaseBadgeWifi()
+        badgeWifiManagedRequest = true
 
         val specifier = WifiNetworkSpecifier.Builder()
             .setSsid(BADGE_WIFI_SSID)
@@ -915,7 +1119,9 @@ class MainActivity : FlutterActivity() {
                 if (badgeWifiNetwork == network) {
                     badgeWifiNetwork = null
                     connectedAddress = null
-                    sendConnectionEvent(false, false, null, "断开连接")
+                    badgeSdAvailable = false
+                    runCatching { connectivityManager().bindProcessToNetwork(null) }
+                    sendConnectionEvent(false, false, null, "连接断开")
                 }
             }
         }
@@ -930,57 +1136,238 @@ class MainActivity : FlutterActivity() {
             throw IllegalStateException(errorRef.get() ?: "$BADGE_WIFI_SSID Wi-Fi 连接超时")
         }
 
+        bindBadgeWifiNetwork(network)
+        connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+        if (fastUpload) {
+            val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)
+            badgeSdAvailable = parseSdAvailable(status)
+            sendConnectionEvent(true, false, connectedAddress, "已连接 Wi-Fi")
+        }
         return network
     }
 
-    private fun releaseBadgeWifi() {
-        val callback = badgeWifiCallback ?: return
-        runCatching { connectivityManager().unregisterNetworkCallback(callback) }
-        badgeWifiCallback = null
-        badgeWifiNetwork = null
+    private fun waitForBadgeStatus(network: Network, timeoutMs: Long): String {
+        val deadlineMs = System.currentTimeMillis() + timeoutMs
+        var lastError: Throwable? = null
+        while (System.currentTimeMillis() <= deadlineMs) {
+            val status = runCatching {
+                requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS)
+            }.onFailure { error ->
+                lastError = error
+            }.getOrNull()
+            if (!status.isNullOrBlank()) {
+                return status
+            }
+            Thread.sleep(150)
+        }
+        throw IllegalStateException(lastError?.message ?: "$BADGE_WIFI_SSID Wi-Fi 未就绪")
     }
 
-    private fun uploadAssetOverTcp(network: Network, packageBytes: ByteArray, crc: Long) {
-        val socket = network.socketFactory.createSocket() as Socket
-        socket.use { active ->
-            active.tcpNoDelay = true
-            active.sendBufferSize = TCP_UPLOAD_CHUNK_BYTES
-            active.soTimeout = HTTP_READ_TIMEOUT_MS
-            active.connect(InetSocketAddress(BADGE_HOST, BADGE_UPLOAD_TCP_PORT), HTTP_CONNECT_TIMEOUT_MS)
+    private fun isCachedBadgeWifiNetworkTransportUsable(manager: ConnectivityManager, network: Network): Boolean {
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
 
-            val header = ByteArray(12)
-            writeLe32(header, 0, BADGE_TCP_UPLOAD_MAGIC.toLong())
-            writeLe32(header, 4, packageBytes.size.toLong())
-            writeLe32(header, 8, crc)
-
-            val output = BufferedOutputStream(active.getOutputStream(), TCP_UPLOAD_CHUNK_BYTES)
-            output.write(header)
-            var offset = 0
-            while (offset < packageBytes.size) {
-                val length = min(TCP_UPLOAD_CHUNK_BYTES, packageBytes.size - offset)
-                output.write(packageBytes, offset, length)
-                offset += length
-                if (offset == packageBytes.size || offset % (TCP_UPLOAD_CHUNK_BYTES * 2) == 0) {
-                    sendEvent(
-                        mapOf(
-                            "type" to "uploadProgress",
-                            "progress" to offset.toDouble() / packageBytes.size.toDouble(),
-                            "message" to "TCP上传 ${offset * 100 / packageBytes.size}%",
-                        ),
-                    )
-                }
-            }
-            output.flush()
-            active.shutdownOutput()
-
-            val response = active.getInputStream().bufferedReader().use { it.readLine() }.orEmpty()
-            if (!response.startsWith("OK")) {
-                throw IllegalStateException(response.ifBlank { "TCP上传失败" })
-            }
+    private fun findExistingBadgeWifiNetwork(manager: ConnectivityManager): Network? {
+        return manager.allNetworks.firstOrNull { network ->
+            isBadgeWifiNetworkUsable(manager, network)
         }
     }
 
-    private fun uploadAssetOverHttp(network: Network, packageBytes: ByteArray, crc: Long) {
+    private fun isCachedBadgeWifiNetworkUsable(manager: ConnectivityManager, network: Network): Boolean {
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return false
+        }
+        return runCatching {
+            requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS).isNotBlank()
+        }.getOrDefault(false)
+    }
+
+    private fun isBadgeWifiNetworkUsable(manager: ConnectivityManager, network: Network): Boolean {
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return false
+        }
+        return runCatching {
+            requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS).isNotBlank()
+        }.getOrDefault(false)
+    }
+
+    private fun isStaleBadgeNetworkError(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            val message = current.message.orEmpty()
+            if (message.contains("binding socket to network", ignoreCase = true) ||
+                message.contains("EPERM", ignoreCase = true) ||
+                message.contains("ENONET", ignoreCase = true) ||
+                message.contains("ENETUNREACH", ignoreCase = true) ||
+                message.contains("EHOSTUNREACH", ignoreCase = true) ||
+                message.contains("ECONNREFUSED", ignoreCase = true) ||
+                message.contains("EACCES", ignoreCase = true) ||
+                message.contains("No route to host", ignoreCase = true) ||
+                message.contains("failed to connect", ignoreCase = true) ||
+                message.contains("timed out", ignoreCase = true) ||
+                message.contains("网络绑定失败", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun releaseBadgeWifi() {
+        closeTcpSocket()
+        val callback = badgeWifiCallback
+        if (callback != null) {
+            runCatching { connectivityManager().unregisterNetworkCallback(callback) }
+        }
+        badgeWifiCallback = null
+        badgeWifiNetwork = null
+        badgeWifiManagedRequest = false
+        connectedAddress = null
+        badgeSdAvailable = false
+        runCatching { connectivityManager().bindProcessToNetwork(null) }
+        releaseUploadWifiLock(keepIfConnected = false)
+    }
+
+    private fun uploadAssetOverTcp(network: Network, packageInfo: UploadPackageInfo): String? {
+        val active = ensureTcpSocket(network)
+
+        val header = ByteArray(12)
+        writeLe32(header, 0, BADGE_TCP_UPLOAD_MAGIC.toLong())
+        writeLe32(header, 4, packageInfo.size.toLong())
+        writeLe32(header, 8, packageInfo.crc)
+
+        val sockOut = active.getOutputStream()
+        val reader = active.getInputStream().bufferedReader()
+        active.soTimeout = UPLOAD_READY_TIMEOUT_MS
+        sockOut.write(header)
+        sockOut.flush()
+        val ready = reader.readLine().orEmpty()
+        if (!ready.startsWith("READY")) {
+            closeTcpSocket()
+            throw IllegalStateException(ready.ifBlank { "设备未准备好上传" })
+        }
+        active.soTimeout = HTTP_READ_TIMEOUT_MS
+        streamPackageToOutput(packageInfo, sockOut, "TCP上传")
+        sockOut.flush()
+
+        val response = reader.readLine().orEmpty()
+        if (!response.startsWith("OK")) {
+            closeTcpSocket()
+            throw IllegalStateException(response.ifBlank { "TCP上传失败" })
+        }
+        closeTcpSocket()
+        // Extract assigned user ID: "OK U001" → "U001"
+        return response.removePrefix("OK").trim().ifEmpty { null }
+    }
+
+    private fun ensureTcpSocket(network: Network): Socket {
+        /* Always create a fresh socket – ESP32 single-file mode closes after each upload,
+         * and a "connected" socket may already be dead (peer-closed). */
+        closeTcpSocket()
+        val socket = network.socketFactory.createSocket() as Socket
+        socket.tcpNoDelay = true
+        socket.sendBufferSize = UPLOAD_IO_CHUNK_BYTES
+        socket.soTimeout = UPLOAD_TCP_CONNECT_TIMEOUT_MS
+        socket.connect(InetSocketAddress(BADGE_HOST, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
+        tcpUploadSocket = socket
+        return socket
+    }
+
+    private fun switchToAsset(id: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                acquireUploadWifiLock()
+                val network = ensureBadgeWifiNetwork(fastUpload = true)
+                val response = sendSwitchCommand(network, id)
+                when {
+                    response.startsWith("OK") -> {
+                        sendEvent(mapOf("type" to "switchResult", "id" to id, "success" to true))
+                        mainHandler.post { result.success(true) }
+                    }
+                    response.startsWith("NEED_UPLOAD") -> {
+                        mainHandler.post {
+                            result.success(mapOf("needsUpload" to true, "id" to id))
+                        }
+                    }
+                    else -> {
+                        throw IllegalStateException(response.ifBlank { "切换失败" })
+                    }
+                }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("switch_failed", error.message ?: "切换失败", null)
+                }
+            } finally {
+                releaseUploadWifiLock(keepIfConnected = true)
+            }
+        }.start()
+    }
+
+    private fun sendSwitchCommand(network: Network, id: String): String {
+        val socket = network.socketFactory.createSocket() as Socket
+        socket.use { s ->
+            s.tcpNoDelay = true
+            s.soTimeout = 5000
+            s.connect(InetSocketAddress(BADGE_HOST, BADGE_UPLOAD_TCP_PORT), 2500)
+            val cmd = "SWITCH $id\n"
+            s.getOutputStream().write(cmd.toByteArray())
+            s.getOutputStream().flush()
+            return s.getInputStream().bufferedReader().readLine().orEmpty()
+        }
+    }
+
+    private fun requestNewUserId(result: MethodChannel.Result) {
+        Thread {
+            try {
+                acquireUploadWifiLock()
+                val network = ensureBadgeWifiNetwork(fastUpload = true)
+                val response = sendSwitchCommand(network, "NEWID")
+                if (response.startsWith("OK ")) {
+                    val newId = response.substring(3).trim()
+                    mainHandler.post { result.success(newId) }
+                } else {
+                    throw IllegalStateException(response)
+                }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("id_failed", error.message, null)
+                }
+            } finally {
+                releaseUploadWifiLock(keepIfConnected = true)
+            }
+        }.start()
+    }
+
+    private fun buildFactoryAnimationList(): List<Map<String, Any?>> {
+        return listOf(
+            mapOf(
+                "id" to "F001",
+                "name" to "F001",
+                "previewAsset" to "assets/factory_previews/F001.png",
+            ),
+            mapOf(
+                "id" to "F002",
+                "name" to "F002",
+                "previewAsset" to "assets/factory_previews/F002.png",
+            ),
+            mapOf(
+                "id" to "F003",
+                "name" to "F003",
+                "previewAsset" to "assets/factory_previews/F003.png",
+            ),
+        )
+    }
+
+    private fun closeTcpSocket() {
+        runCatching { tcpUploadSocket?.close() }
+        tcpUploadSocket = null
+    }
+
+    private fun uploadAssetOverHttp(network: Network, packageInfo: UploadPackageInfo) {
         val url = URL(BADGE_UPLOAD_URL)
         val connection = network.openConnection(url) as HttpURLConnection
         connection.requestMethod = "POST"
@@ -988,27 +1375,13 @@ class MainActivity : FlutterActivity() {
         connection.useCaches = false
         connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
         connection.readTimeout = HTTP_READ_TIMEOUT_MS
-        connection.setFixedLengthStreamingMode(packageBytes.size)
+        connection.setFixedLengthStreamingMode(packageInfo.size.toInt())
         connection.setRequestProperty("Content-Type", "application/octet-stream")
-        connection.setRequestProperty("X-EBAJ-CRC32", "%08x".format(crc))
+        connection.setRequestProperty("X-EBAJ-CRC32", "%08x".format(packageInfo.crc))
 
         try {
-            connection.outputStream.use { output ->
-                var offset = 0
-                while (offset < packageBytes.size) {
-                    val length = min(HTTP_UPLOAD_CHUNK_BYTES, packageBytes.size - offset)
-                    output.write(packageBytes, offset, length)
-                    offset += length
-                    if (offset == packageBytes.size || offset % (HTTP_UPLOAD_CHUNK_BYTES * 8) == 0) {
-                        sendEvent(
-                            mapOf(
-                                "type" to "uploadProgress",
-                                "progress" to offset.toDouble() / packageBytes.size.toDouble(),
-                                "message" to "上传 ${offset * 100 / packageBytes.size}%",
-                            ),
-                        )
-                    }
-                }
+            BufferedOutputStream(connection.outputStream, UPLOAD_IO_CHUNK_BYTES).use { output ->
+                streamPackageToOutput(packageInfo, output, "上传")
             }
 
             val code = connection.responseCode
@@ -1020,6 +1393,37 @@ class MainActivity : FlutterActivity() {
             connection.inputStream?.close()
         } finally {
             connection.disconnect()
+        }
+    }
+
+    private fun streamPackageToOutput(packageInfo: UploadPackageInfo, output: OutputStream, progressPrefix: String) {
+        val buffer = ByteArray(UPLOAD_IO_CHUNK_BYTES)
+        var offset = 0L
+        var nextProgressAt = UPLOAD_PROGRESS_STEP_BYTES
+        FileInputStream(packageInfo.file).use { input ->
+            while (offset < packageInfo.size) {
+                val read = input.read(buffer)
+                if (read <= 0) {
+                    break
+                }
+                output.write(buffer, 0, read)
+                offset += read.toLong()
+                if (offset >= nextProgressAt || offset == packageInfo.size) {
+                    sendEvent(
+                        mapOf(
+                            "type" to "uploadProgress",
+                            "progress" to offset.toDouble() / packageInfo.size.toDouble(),
+                            "message" to "$progressPrefix ${offset * 100 / packageInfo.size}%",
+                        ),
+                    )
+                    while (nextProgressAt <= offset) {
+                        nextProgressAt += UPLOAD_PROGRESS_STEP_BYTES
+                    }
+                }
+            }
+        }
+        if (offset != packageInfo.size) {
+            throw IllegalStateException("素材读取中断")
         }
     }
 
@@ -1325,19 +1729,9 @@ class MainActivity : FlutterActivity() {
         val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(HISTORY_KEY, "[]")
         val array = JSONArray(raw)
         val output = mutableListOf<Map<String, Any?>>()
-        var changed = false
         for (index in 0 until array.length()) {
             val item = array.optJSONObject(index) ?: continue
-            val repaired = repairHistoryItem(item)
-            changed = changed || repaired.toString() != item.toString()
-            output += historyMap(repaired)
-            array.put(index, repaired)
-        }
-        if (changed) {
-            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putString(HISTORY_KEY, array.toString())
-                .apply()
+            output += historyMap(item)
         }
         return output
     }
@@ -1358,6 +1752,7 @@ class MainActivity : FlutterActivity() {
                 "cropScale" to item.optDouble("cropScale", 1.0),
                 "cropOffsetX" to item.optDouble("cropOffsetX", 0.0),
                 "cropOffsetY" to item.optDouble("cropOffsetY", 0.0),
+                "deviceId" to item.optString("deviceId", null),
             )
     }
 
@@ -1410,7 +1805,7 @@ class MainActivity : FlutterActivity() {
 
         if (!existingFilePath(repaired.optString("assetPath"))) {
             val restoredAsset = runCatching {
-                val fps = repaired.optInt("fps", 25).coerceIn(1, 60)
+                val fps = DEVICE_FPS
                 val encoded = EbajEncoder {}.encode(
                     this,
                     uri,
@@ -1475,6 +1870,7 @@ class MainActivity : FlutterActivity() {
             item.put("cropScale", map["cropScale"])
             item.put("cropOffsetX", map["cropOffsetX"])
             item.put("cropOffsetY", map["cropOffsetY"])
+            item.put("deviceId", map["deviceId"])
             array.put(item)
         }
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1494,14 +1890,26 @@ class MainActivity : FlutterActivity() {
             maxPackageBytes: Int,
             crop: CropTransform,
         ): EncodedPackage {
-            val fps = requestedFps.coerceIn(1, 60)
+            val fps = DEVICE_FPS
             val delayMs = frameDelayMs(fps)
             val selectedStreamSize = sampleStreamResolution(context, uri, mime, fps, delayMs, crop)
-            val selected = encodeAtResolution(context, uri, mime, fps, delayMs, selectedStreamSize, crop)
-            if (selected.packageBytes.size > maxPackageBytes) {
-                throw PackageTooLargeException(ASSET_TOO_LARGE_MESSAGE)
+            val candidates = candidateStreamResolutions(selectedStreamSize)
+            for ((index, streamSize) in candidates.withIndex()) {
+                val selected = encodeAtResolution(context, uri, mime, fps, delayMs, streamSize, crop)
+                if (selected.packageBytes.size > maxPackageBytes) {
+                    continue
+                }
+                if (actualQualityBytesPerSecond(selected) <= QUALITY_STREAM_BYTES_PER_SECOND ||
+                    index == candidates.lastIndex
+                ) {
+                    return selected
+                }
+                android.util.Log.i(
+                    "BadgePrepare",
+                    "stream $streamSize actual=${actualQualityBytesPerSecond(selected)}Bps exceeds target=$QUALITY_STREAM_BYTES_PER_SECOND, retry lower",
+                )
             }
-            return selected
+            throw PackageTooLargeException(ASSET_TOO_LARGE_MESSAGE)
         }
 
         private fun encodeAtResolution(
@@ -2135,11 +2543,109 @@ class MainActivity : FlutterActivity() {
             if (!forceKeyframe && previous != null) {
                 val tile = encodeIndexedTile(indexed, previous, streamSize)
                 if (tile.size < key.size) {
-                    return EncodedFrame(tile, CODEC_INDEXED_TILE, delayMs, streamSize, streamSize)
+                    return compressAndWrap(tile, CODEC_INDEXED_TILE, delayMs, streamSize)
                 }
             }
 
-            return EncodedFrame(key, CODEC_INDEXED_KEY, delayMs, streamSize, streamSize)
+            return compressAndWrap(key, CODEC_INDEXED_KEY, delayMs, streamSize)
+        }
+
+        private fun compressAndWrap(
+            raw: ByteArray,
+            codec: Int,
+            delayMs: Int,
+            streamSize: Int,
+        ): EncodedFrame {
+            val compressed = lz4Compress(raw)
+            if (compressed.size + 4 < raw.size) {
+                val wrapped = ByteArray(compressed.size + 4)
+                writeLe32(wrapped, 0, raw.size.toLong())
+                compressed.copyInto(wrapped, 4)
+                return EncodedFrame(wrapped, codec, delayMs, streamSize, streamSize, FRAME_FLAG_LZ4)
+            }
+            return EncodedFrame(raw, codec, delayMs, streamSize, streamSize)
+        }
+
+        private fun lz4Compress(data: ByteArray): ByteArray {
+            if (data.size < 8) return data.copyOf()
+            val srcEnd = data.size
+            val out = ByteArray(srcEnd + srcEnd / 255 + 32)
+            var dst = 0
+            var src = 0
+            var litStart = 0
+
+            val hashLog = 14
+            val hashSize = 1 shl hashLog
+            val hashTable = IntArray(hashSize)
+            val minMatch = 4
+            val lastMatchPos = srcEnd - minMatch
+            val prime = 2654435761L.toInt()
+
+            while (src < lastMatchPos) {
+                val h = (((data[src].toInt() and 0xFF))
+                    or ((data[src + 1].toInt() and 0xFF) shl 8)
+                    or ((data[src + 2].toInt() and 0xFF) shl 16)
+                    or ((data[src + 3].toInt() and 0xFF) shl 24)) * prime
+                val idx = h ushr (32 - hashLog)
+                val ref = hashTable[idx]
+                hashTable[idx] = src
+
+                if (ref == 0 || src - ref > 65535 ||
+                    data[ref] != data[src] || data[ref + 1] != data[src + 1] ||
+                    data[ref + 2] != data[src + 2] || data[ref + 3] != data[src + 3]) {
+                    src++
+                    continue
+                }
+
+                var matchLen = minMatch
+                val maxMatch = minOf(srcEnd - src, 0x1F + minMatch - 1)
+                while (matchLen < maxMatch && data[ref + matchLen] == data[src + matchLen]) {
+                    matchLen++
+                }
+
+                val litLen = src - litStart
+                val token = (minOf(litLen, 15).toInt() shl 4) or minOf(matchLen - minMatch, 15)
+                out[dst++] = token.toByte()
+
+                var extra = litLen - 15
+                while (extra >= 255) {
+                    out[dst++] = 255.toByte()
+                    extra -= 255
+                }
+                if (litLen >= 15) out[dst++] = extra.toByte()
+
+                System.arraycopy(data, litStart, out, dst, litLen)
+                dst += litLen
+
+                out[dst++] = (src - ref).toByte()
+                out[dst++] = ((src - ref) shr 8).toByte()
+
+                extra = matchLen - minMatch - 15
+                while (extra >= 255) {
+                    out[dst++] = 255.toByte()
+                    extra -= 255
+                }
+                if (matchLen - minMatch >= 15) out[dst++] = extra.toByte()
+
+                src += matchLen
+                litStart = src
+            }
+
+            val litLen = srcEnd - litStart
+            if (litLen > 0) {
+                val token = minOf(litLen, 15) shl 4
+                out[dst++] = token.toByte()
+                var extra = litLen - 15
+                while (extra >= 255) {
+                    out[dst++] = 255.toByte()
+                    extra -= 255
+                }
+                if (litLen >= 15) out[dst++] = extra.toByte()
+                System.arraycopy(data, litStart, out, dst, litLen)
+                dst += litLen
+            }
+
+            return out.copyOf(dst)
         }
 
         private fun encodeIndexedKey(indexed: ByteArray): ByteArray {
@@ -2236,7 +2742,7 @@ class MainActivity : FlutterActivity() {
                 writeLe32(output, tableOffset + 4, frame.data.size.toLong())
                 writeLe16(output, tableOffset + 8, frame.delayMs)
                 output[tableOffset + 10] = frame.codec.toByte()
-                output[tableOffset + 11] = 0
+                output[tableOffset + 11] = frame.flags.toByte()
                 writeLe16(output, tableOffset + 12, frame.width)
                 writeLe16(output, tableOffset + 14, frame.height)
                 frame.data.copyInto(output, dataOffset)
@@ -2296,11 +2802,38 @@ class MainActivity : FlutterActivity() {
 
         private fun selectStreamResolution(estimates: List<StreamEstimate>): Int {
             for (estimate in estimates) {
-                if (estimate.bytesPerSecond <= QUALITY_STREAM_BYTES_PER_SECOND) {
+                if (isPlaybackSafeStream(estimate)) {
                     return estimate.streamSize
                 }
             }
             return estimates.lastOrNull()?.streamSize ?: STREAM_RESOLUTIONS.last()
+        }
+
+        private fun isPlaybackSafeStream(estimate: StreamEstimate): Boolean {
+            val budget = min(
+                QUALITY_STREAM_BYTES_PER_SECOND.toLong(),
+                playbackBudgetBytesPerSecond(estimate.streamSize),
+            )
+            return estimate.bytesPerSecond <= budget
+        }
+
+        private fun playbackBudgetBytesPerSecond(streamSize: Int): Long {
+            return when (streamSize) {
+                WIDTH -> PLAYBACK_STREAM_BYTES_PER_SECOND.toLong()
+                else -> QUALITY_STREAM_BYTES_PER_SECOND.toLong()
+            }
+        }
+
+        private fun candidateStreamResolutions(selectedStreamSize: Int): List<Int> {
+            val start = STREAM_RESOLUTIONS.indexOf(selectedStreamSize).takeIf { it >= 0 } ?: 0
+            return STREAM_RESOLUTIONS.drop(start)
+        }
+
+        private fun actualQualityBytesPerSecond(selected: EncodedPackage): Long {
+            val tableBytes = selected.frameCount.toLong() * FRAME_ENTRY_SIZE.toLong()
+            val payloadBytes = (selected.packageBytes.size.toLong() - HEADER_SIZE.toLong() - tableBytes)
+                .coerceAtLeast(0L)
+            return payloadBytes * selected.fps.toLong() / max(1, selected.frameCount).toLong()
         }
 
         private fun rgb332Palette(): ByteArray {
@@ -2374,6 +2907,7 @@ class MainActivity : FlutterActivity() {
         val delayMs: Int,
         val width: Int,
         val height: Int,
+        val flags: Int = 0,
     )
     private data class EncodedPackage(
         val packageBytes: ByteArray,
@@ -2419,11 +2953,15 @@ class MainActivity : FlutterActivity() {
         private const val WRITE_TIMEOUT_MS = 30000L
         private const val WIFI_CONNECT_TIMEOUT_MS = 45000L
         private const val HTTP_CONNECT_TIMEOUT_MS = 15000
+        private const val UPLOAD_TCP_CONNECT_TIMEOUT_MS = 2500
+        private const val UPLOAD_READY_TIMEOUT_MS = 10000
+        private const val UPLOAD_NETWORK_READY_TIMEOUT_MS = 5000L
         private const val HTTP_READ_TIMEOUT_MS = 60000
         private const val HTTP_STATUS_TIMEOUT_MS = 2500
-        private const val HTTP_UPLOAD_ATTEMPTS = 1
-        private const val HTTP_UPLOAD_CHUNK_BYTES = 256 * 1024
-        private const val TCP_UPLOAD_CHUNK_BYTES = 256 * 1024
+        private const val FAST_BADGE_STATUS_TIMEOUT_MS = 800
+        private const val HTTP_UPLOAD_ATTEMPTS = 2
+        private const val UPLOAD_IO_CHUNK_BYTES = 256 * 1024
+        private const val UPLOAD_PROGRESS_STEP_BYTES = 512 * 1024L
         private const val MAX_INPUT_BYTES = 40 * 1024 * 1024
         private const val MAX_VIDEO_INPUT_BYTES = 200 * 1024 * 1024
         private const val LEGACY_FLASH_BUDGET_BYTES = 10 * 1024 * 1024
@@ -2436,6 +2974,9 @@ class MainActivity : FlutterActivity() {
 
         private const val WIDTH = 480
         private const val HEIGHT = 480
+        private const val MIN_DEVICE_FPS = 25
+        private const val DEVICE_FPS = 25
+        private const val MAX_DEVICE_FPS = 30
         private const val PREVIEW_SIZE = 320
         private const val VIDEO_PREVIEW_GIF_SIZE = 192
         private const val VIDEO_PREVIEW_GIF_FPS = 25
@@ -2451,10 +2992,12 @@ class MainActivity : FlutterActivity() {
         private const val CODEC_INDEXED_KEY = 0x10
         private const val CODEC_INDEXED_TILE = 0x11
         private const val CODEC_INDEXED_REPEAT = 0x12
+        private const val FRAME_FLAG_LZ4 = 0x80
         private const val PALETTE_ENTRIES = 256
         private const val PALETTE_BYTES = PALETTE_ENTRIES * 2
         private const val SAMPLE_FRAME_COUNT = 4
-        private const val QUALITY_STREAM_BYTES_PER_SECOND = 4 * 1024 * 1024
+        private const val QUALITY_STREAM_BYTES_PER_SECOND = 10 * 512 * 1024
+        private const val PLAYBACK_STREAM_BYTES_PER_SECOND = 10 * 512 * 1024
         private const val SHARPEN_PERCENT = 106
         private val DITHER_4X4 = intArrayOf(
             0, 8, 2, 10,
@@ -2716,6 +3259,21 @@ class MainActivity : FlutterActivity() {
         private fun crc32(bytes: ByteArray): Long {
             val crc = CRC32()
             crc.update(bytes)
+            return crc.value
+        }
+
+        private fun crc32(file: File): Long {
+            val crc = CRC32()
+            val buffer = ByteArray(UPLOAD_IO_CHUNK_BYTES)
+            FileInputStream(file).use { input ->
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) {
+                        break
+                    }
+                    crc.update(buffer, 0, read)
+                }
+            }
             return crc.value
         }
     }

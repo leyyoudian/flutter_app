@@ -2,19 +2,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-lcd_h = (ROOT / "main" / "LCD_Driver" / "ST7701S.h").read_text(encoding="utf-8")
-lcd_c = (ROOT / "main" / "LCD_Driver" / "ST7701S.c").read_text(encoding="utf-8")
-sd_h = (ROOT / "main" / "SD_Card" / "SD_MMC.h").read_text(encoding="utf-8")
-storage_c = (ROOT / "main" / "Badge" / "BadgeStorage.c").read_text(encoding="utf-8")
-main_c = (ROOT / "main" / "main.c").read_text(encoding="utf-8")
-cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+lcd_h = (ROOT / "main" / "LCD_Driver" / "ST7701S.h").read_text(encoding="utf-8", errors="ignore")
+lcd_c = (ROOT / "main" / "LCD_Driver" / "ST7701S.c").read_text(encoding="utf-8", errors="ignore")
+sd_h = (ROOT / "main" / "SD_Card" / "SD_MMC.h").read_text(encoding="utf-8", errors="ignore")
+storage_c = (ROOT / "main" / "Badge" / "BadgeStorage.c").read_text(encoding="utf-8", errors="ignore")
+main_c = (ROOT / "main" / "main.c").read_text(encoding="utf-8", errors="ignore")
+cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8", errors="ignore")
 
 expected_sd_pins = {
     "CONFIG_EXAMPLE_PIN_CLK": "7",
     "CONFIG_EXAMPLE_PIN_CMD": "15",
     "CONFIG_EXAMPLE_PIN_D0": "42",
-    "CONFIG_EXAMPLE_PIN_D1": "19",
-    "CONFIG_EXAMPLE_PIN_D2": "20",
+    "CONFIG_EXAMPLE_PIN_D1": "20",
+    "CONFIG_EXAMPLE_PIN_D2": "19",
     "CONFIG_EXAMPLE_PIN_D3": "4",
 }
 for name, value in expected_sd_pins.items():
@@ -27,6 +27,18 @@ assert "#define LCD_SCLK 2" in lcd_h, "LCD SCK should stay on GPIO2"
 assert "#define LCD_RST  16" in lcd_h or "#define LCD_RST 16" in lcd_h, "LCD reset should use GPIO16"
 assert "#define LCD_CS   0" in lcd_h or "#define LCD_CS  0" in lcd_h or "#define LCD_CS 0" in lcd_h, (
     "LCD CS should default to GPIO0; hardware jumper may tie CS to GND"
+)
+assert "#define LCD_CS_ALWAYS_LOW_AFTER_BOOT 1" in lcd_h, (
+    "GPIO0 is a boot strap pin; test CS-low behavior in firmware after boot instead of hard-grounding IO0"
+)
+assert "st7701s_protocol_config_t.spics_io_num = -1" in lcd_c, (
+    "CS-low test firmware should not let SPI auto-drive GPIO0 high during LCD init"
+)
+assert "if (!LCD_CS_ALWAYS_LOW_AFTER_BOOT)" in lcd_c, (
+    "CS-low test firmware must skip deasserting LCD_CS after init"
+)
+assert "#define EXAMPLE_PIN_NUM_DATA11         46" in lcd_h, (
+    "RGB565 red data bit 0 must drive LCD DB13 through GPIO46 on the new board"
 )
 
 for text, path in [

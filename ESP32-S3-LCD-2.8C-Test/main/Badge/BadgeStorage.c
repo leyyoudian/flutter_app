@@ -28,8 +28,10 @@
 #define BADGE_SD_ASSET_PATH BADGE_SD_MOUNT_POINT "/badge.eb4"
 #define BADGE_SD_TEMP_PATH BADGE_SD_MOUNT_POINT "/badge.tmp"
 #define BADGE_UPLOAD_LOG_STEP (512u * 1024u)
-#define BADGE_SD_READ_STAGING_BYTES (64u * 1024u)
-#define BADGE_SD_WRITE_BUFFER_BYTES (64u * 1024u)
+#define BADGE_SD_READ_STAGING_BYTES (256u * 1024u)
+#define BADGE_SD_READ_STAGING_FALLBACK_BYTES (128u * 1024u)
+#define BADGE_SD_READ_STAGING_MIN_BYTES (64u * 1024u)
+#define BADGE_SD_WRITE_BUFFER_BYTES (128u * 1024u)
 
 typedef struct {
     bool active;
@@ -39,6 +41,7 @@ typedef struct {
     uint32_t next_log_at;
     uint32_t crc;
     FILE *sd_file;
+    void *sd_file_buf;
 } badge_upload_ctx_t;
 
 static const char *TAG = "BadgeStorage";
@@ -149,10 +152,26 @@ static esp_err_t begin_sd_upload_locked(uint32_t total_size)
         mark_sd_failed_locked();
         return ESP_FAIL;
     }
-    setvbuf(file, NULL, _IOFBF, BADGE_SD_WRITE_BUFFER_BYTES);
-    int fd = fileno(file);
-    if (fd >= 0 && ftruncate(fd, (off_t)total_size) == 0) {
-        rewind(file);
+    /* Allocate FILE buffer from internal DMA RAM so SDMMC can DMA directly.
+     * PSRAM is NOT DMA-capable for SDMMC ¨C never fall back to malloc (PSRAM). */
+    static const size_t file_buf_candidates[] = { 128u * 1024u, 64u * 1024u, 32u * 1024u };
+    void *file_buf = NULL;
+    size_t file_buf_size = 0;
+    for (size_t i = 0; i < sizeof(file_buf_candidates) / sizeof(file_buf_candidates[0]); ++i) {
+        file_buf = heap_caps_malloc(file_buf_candidates[i],
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (file_buf != NULL) {
+            file_buf_size = file_buf_candidates[i];
+            break;
+        }
+    }
+    if (file_buf != NULL) {
+        setvbuf(file, (char *)file_buf, _IOFBF, file_buf_size);
+        s_upload.sd_file_buf = file_buf;
+    } else {
+        /* Last resort: use a tiny internal buffer.  Never use PSRAM. */
+        setvbuf(file, NULL, _IOFBF, 4096);
+        s_upload.sd_file_buf = NULL;
     }
 
     s_upload.sd_file = file;
@@ -188,6 +207,13 @@ static esp_err_t read_header_from_file(FILE *file, badge_ebaj_header_t *header)
         return ESP_ERR_INVALID_SIZE;
     }
     return ESP_OK;
+}
+
+void badge_storage_ensure_mounted(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    ensure_sd_mounted_locked();
+    xSemaphoreGive(s_lock);
 }
 
 esp_err_t badge_storage_init(void)
@@ -285,7 +311,9 @@ esp_err_t badge_storage_finish_upload(void)
 
     int64_t finish_start_us = esp_timer_get_time();
     FILE *file = s_upload.sd_file;
+    void *file_buf = s_upload.sd_file_buf;
     s_upload.sd_file = NULL;
+    s_upload.sd_file_buf = NULL;
     if (file == NULL) {
         unlink(BADGE_SD_TEMP_PATH);
         s_upload.active = false;
@@ -297,6 +325,9 @@ esp_err_t badge_storage_finish_upload(void)
     bool flush_failed = fflush(file) != 0;
     bool fsync_failed = fd >= 0 && fsync(fd) != 0;
     bool close_failed = fclose(file) != 0;
+    if (file_buf != NULL) {
+        heap_caps_free(file_buf);
+    }
     if (flush_failed || fsync_failed || close_failed) {
         unlink(BADGE_SD_TEMP_PATH);
         s_upload.active = false;
@@ -326,7 +357,29 @@ esp_err_t badge_storage_finish_upload(void)
         ret = ESP_ERR_INVALID_RESPONSE;
     }
     if (ret != ESP_OK || header.package_size != s_upload.expected_size) {
-        ESP_LOGE(TAG, "uploaded asset header is invalid");
+        ESP_LOGE(TAG,
+                 "uploaded asset header invalid: ret=%s magic=%08" PRIx32
+                 " version=%u header=%u size=%ux%u frames=%u fps=%u"
+                 " table=%" PRIu32 " data=%" PRIu32 " package=%" PRIu32
+                 " expected=%" PRIu32 " crc=%08" PRIx32 " flags=%08" PRIx32
+                 " stream=%ux%u palette=%u",
+                 esp_err_to_name(ret),
+                 header.magic,
+                 header.version,
+                 header.header_size,
+                 header.width,
+                 header.height,
+                 header.frame_count,
+                 header.fps,
+                 header.frame_table_offset,
+                 header.frame_data_offset,
+                 header.package_size,
+                 s_upload.expected_size,
+                 header.package_crc32,
+                 header.flags,
+                 header.stream_width,
+                 header.stream_height,
+                 header.palette_entries);
         unlink(BADGE_SD_TEMP_PATH);
         s_upload.active = false;
         s_last_upload_perf.finish_us += esp_timer_get_time() - finish_start_us;
@@ -371,9 +424,68 @@ void badge_storage_abort_upload(void)
         fclose(s_upload.sd_file);
         s_upload.sd_file = NULL;
     }
+    if (s_upload.sd_file_buf != NULL) {
+        heap_caps_free(s_upload.sd_file_buf);
+        s_upload.sd_file_buf = NULL;
+    }
     unlink(BADGE_SD_TEMP_PATH);
     memset(&s_upload, 0, sizeof(s_upload));
     xSemaphoreGive(s_lock);
+}
+
+esp_err_t badge_storage_open_asset_path(const char *path, badge_asset_t *out)
+{
+    if (path == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_upload.active) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = ensure_sd_mounted_locked();
+    if (ret != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        return ret;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    badge_ebaj_header_t header = {0};
+    ret = read_header_from_file(file, &header);
+    if (ret != ESP_OK || !badge_protocol_validate_header(&header, UINT32_MAX)) {
+        fclose(file);
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Allocate DMA-capable read buffer for SD reads */
+    size_t read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES;
+    uint8_t *read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (read_buf == NULL) {
+        read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES / 2;
+        read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
+    if (read_buf == NULL) {
+        fclose(file);
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    out->header = header;
+    out->file = file;
+    out->sd_read_buf = read_buf;
+    out->sd_read_buf_size = read_buf_size;
+    out->sd_file_pos = 0;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
 }
 
 esp_err_t badge_storage_open_active_asset(badge_asset_t *out)
@@ -409,7 +521,16 @@ esp_err_t badge_storage_open_active_asset(badge_asset_t *out)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    uint8_t *read_buf = heap_caps_malloc(BADGE_SD_READ_STAGING_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    size_t read_buf_size = BADGE_SD_READ_STAGING_BYTES;
+    uint8_t *read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (read_buf == NULL) {
+        read_buf_size = BADGE_SD_READ_STAGING_FALLBACK_BYTES;
+        read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
+    if (read_buf == NULL) {
+        read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES;
+        read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
     if (read_buf == NULL) {
         fclose(file);
         xSemaphoreGive(s_lock);
@@ -418,7 +539,7 @@ esp_err_t badge_storage_open_active_asset(badge_asset_t *out)
 
     out->file = file;
     out->sd_read_buf = read_buf;
-    out->sd_read_buf_size = BADGE_SD_READ_STAGING_BYTES;
+    out->sd_read_buf_size = read_buf_size;
     out->sd_file_pos = 0;
     out->header = header;
     xSemaphoreGive(s_lock);

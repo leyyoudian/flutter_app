@@ -5,6 +5,7 @@ idf_component_register(
                               "Badge/BadgeLz4.c"
                               "Badge/BadgeProtocol.c"
                               "Badge/BadgeStream.c"
+                              "Badge/BadgeAnimMgr.c"
                               "Badge/BadgeStorage.c"
                               "SD_Card/SD_MMC.c"
                               "Wireless/WifiUpload.c"
