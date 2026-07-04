@@ -98,6 +98,24 @@ void main() {
     );
   });
 
+  test('iOS AppIcon set only contains referenced generated app icons', () {
+    final iconDir = Directory('ios/Runner/Assets.xcassets/AppIcon.appiconset');
+    final contents = File('${iconDir.path}/Contents.json').readAsStringSync();
+    final referenced = RegExp(
+      r'"filename"\s*:\s*"([^"]+\.png)"',
+    ).allMatches(contents).map((match) => match.group(1)!).toSet();
+    final pngFiles = iconDir
+        .listSync()
+        .whereType<File>()
+        .where((file) => file.path.toLowerCase().endsWith('.png'))
+        .map((file) => file.uri.pathSegments.last)
+        .toSet();
+
+    expect(referenced, contains('Icon-App-1024x1024@1x.png'));
+    expect(pngFiles.difference(referenced), isEmpty);
+    expect(File('${iconDir.path}/icon_1024.png').existsSync(), isFalse);
+  });
+
   test('iOS video animated previews use asset reader instead of image generator frame seeking', () {
     final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
     final previewStart = source.indexOf(
@@ -119,6 +137,34 @@ void main() {
     expect(source, contains('scheduleVideoAnimatedPreview'));
     expect(previewSource, isNot(contains('AVAssetImageGenerator')));
     expect(previewSource, isNot(contains('copyCGImage')));
+  });
+
+  test('iOS video asset encoding skips intermediate GIF conversion', () {
+    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+    final encodeStart = source.indexOf(
+      '  private func encodeAtResolution(url: URL, mime: String, fps: Int, delayMs: Int, streamSize: Int, crop: CropTransform) throws -> EncodedPackage {',
+    );
+    final encodeEnd = source.indexOf(
+      '  private func convertVideoToAnimatedGif',
+      encodeStart,
+    );
+    expect(encodeStart, isNot(-1));
+    expect(encodeEnd, isNot(-1));
+    final encodeSource = source.substring(encodeStart, encodeEnd);
+    final videoBranchStart = encodeSource.indexOf(
+      'if mime.lowercased().hasPrefix("video/")',
+    );
+    final imageBranchStart = encodeSource.indexOf('} else {', videoBranchStart);
+    expect(videoBranchStart, isNot(-1));
+    expect(imageBranchStart, isNot(-1));
+    final videoBranch = encodeSource.substring(videoBranchStart, imageBranchStart);
+
+    expect(
+      videoBranch,
+      contains('frames = try encodeVideoFrames(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)'),
+    );
+    expect(videoBranch, isNot(contains('convertVideoToAnimatedGif')));
+    expect(videoBranch, isNot(contains('视频转GIF失败')));
   });
 
   test('iOS upload streams packages from disk instead of concatenating payloads', () {

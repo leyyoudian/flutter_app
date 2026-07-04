@@ -70,12 +70,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: 'http://60.205.122.153',
   );
-  static const _appVersion = '1.0.6';
+  static const _appVersion = '1.0.8';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
   Timer? _brightnessTimer;
   Timer? _connectionTimer;
+  final Map<String, Completer<String?>> _assetPreviewWaiters = {};
   int _pageIndex = 1;
   int _brightness = 70;
   bool _scanning = false;
@@ -126,6 +127,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     WidgetsBinding.instance.removeObserver(this);
     _brightnessTimer?.cancel();
     _connectionTimer?.cancel();
+    for (final waiter in _assetPreviewWaiters.values) {
+      if (!waiter.isCompleted) {
+        waiter.complete(null);
+      }
+    }
+    _assetPreviewWaiters.clear();
     super.dispose();
   }
 
@@ -224,6 +231,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         final uri = event['uri'] as String?;
         final assetPath = event['assetPath'] as String?;
         if (_hasPreviewPath(assetPreviewPath)) {
+          final waiter = assetPath == null
+              ? null
+              : _assetPreviewWaiters.remove(assetPath);
+          if (waiter != null && !waiter.isCompleted) {
+            waiter.complete(assetPreviewPath);
+          }
           setState(() {
             if (_asset?.assetPath == assetPath) {
               _asset = _asset?.copyWith(animatedPreviewPath: assetPreviewPath);
@@ -556,6 +569,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       final rawAsset = PreparedAsset.fromMap(_asStringMap(prepared));
       var asset = rawAsset.copyWith(cropTransform: _cropTransform);
       var saveMessage = '素材已保存，已提交审核';
+      if (_isVideoMime(asset.mime) && !_hasPreviewPath(asset.animatedPreviewPath)) {
+        setState(() => _status = '生成审核预览');
+        asset = await _withReviewPreviewReady(asset);
+        if (!mounted) {
+          return;
+        }
+      }
       try {
         setState(() => _status = '提交审核');
         asset = await _submitAssetForReview(asset);
@@ -780,6 +800,32 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       return asset.copyWith(reviewId: reviewId, reviewStatus: 'pending');
     }
     return asset.copyWith(reviewId: reviewId, reviewStatus: reviewStatus);
+  }
+
+  Future<PreparedAsset> _withReviewPreviewReady(PreparedAsset asset) async {
+    if (!_isVideoMime(asset.mime) || _hasPreviewPath(asset.animatedPreviewPath)) {
+      return asset;
+    }
+    if (asset.assetPath.isEmpty) {
+      return asset;
+    }
+    final previous = _assetPreviewWaiters.remove(asset.assetPath);
+    if (previous != null && !previous.isCompleted) {
+      previous.complete(null);
+    }
+    final waiter = Completer<String?>();
+    _assetPreviewWaiters[asset.assetPath] = waiter;
+    final previewPath = await waiter.future
+        .timeout(const Duration(seconds: 6), onTimeout: () => null)
+        .whenComplete(() {
+      if (identical(_assetPreviewWaiters[asset.assetPath], waiter)) {
+        _assetPreviewWaiters.remove(asset.assetPath);
+      }
+    });
+    if (_hasPreviewPath(previewPath)) {
+      return asset.copyWith(animatedPreviewPath: previewPath);
+    }
+    return asset;
   }
 
   Future<PreparedAsset> _refreshReviewStatus(PreparedAsset asset) async {

@@ -1510,12 +1510,7 @@ private final class EbajEncoder {
   private func encodeAtResolution(url: URL, mime: String, fps: Int, delayMs: Int, streamSize: Int, crop: CropTransform) throws -> EncodedPackage {
     let frames: [EncodedFrame]
     if mime.lowercased().hasPrefix("video/") {
-      let gifData = try convertVideoToAnimatedGif(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)
-      guard let source = CGImageSourceCreateWithData(gifData as CFData, nil),
-            CGImageSourceGetCount(source) > 1 else {
-        throw BadgeError.message("视频转GIF失败")
-      }
-      frames = try encodeImageSequence(source: source, delayMs: delayMs, streamSize: streamSize, crop: crop)
+      frames = try encodeVideoFrames(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)
     } else {
       guard
         let source = CGImageSourceCreateWithURL(url as CFURL, nil),

@@ -44,8 +44,8 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.6';"));
-    expect(pubspec, contains('version: 1.0.6+6'));
+    expect(source, contains("static const _appVersion = '1.0.8';"));
+    expect(pubspec, contains('version: 1.0.8+8'));
   });
 
   test('maker save submits review before storing history and shows policy hint', () {
@@ -58,6 +58,22 @@ void main() {
     expect(submitAtSave, greaterThan(saveStart));
     expect(insertHistory, greaterThan(submitAtSave));
     expect(source, contains('素材已保存，已提交审核'));
+  });
+
+  test('video review waits for animated preview before moderation upload', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    final saveStart = source.indexOf('Future<void> _saveMakerAsset()');
+    final waitForPreview = source.indexOf(
+      '_withReviewPreviewReady(asset)',
+      saveStart,
+    );
+    final submitAtSave = source.indexOf('_submitAssetForReview(asset)', saveStart);
+
+    expect(source, contains('Map<String, Completer<String?>>'));
+    expect(source, contains('Future<PreparedAsset> _withReviewPreviewReady'));
+    expect(source, contains('const Duration(seconds: 6)'));
+    expect(waitForPreview, greaterThan(saveStart));
+    expect(waitForPreview, lessThan(submitAtSave));
   });
 
   test('asset history persists review metadata', () {
