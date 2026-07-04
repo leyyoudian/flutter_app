@@ -1071,7 +1071,9 @@ import UIKit
     composition.renderSize = CGSize(width: target, height: target)
     composition.frameDuration = CMTime(value: CMTimeValue(frameDelayMs(BadgeConstants.videoPreviewGifFps)), timescale: 1000)
     composition.instructions = [instruction]
-    composition.backgroundColor = UIColor.black.cgColor
+    if #available(iOS 16.0, *) {
+      composition.backgroundColor = UIColor.black.cgColor
+    }
     return composition
   }
 
@@ -1545,7 +1547,7 @@ private final class EbajEncoder {
     generator.requestedTimeToleranceAfter = .zero
 
     guard let destination = CGImageDestinationCreateWithData(
-      NSMutableData() as CFMutableData, kUTTypeGIF, totalFrames, nil
+      NSMutableData() as CFMutableData, UTType.gif.identifier as CFString, totalFrames, nil
     ) else {
       throw BadgeError.message("无法创建GIF编码器")
     }
