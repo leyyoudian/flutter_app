@@ -1067,14 +1067,14 @@ import UIKit
     layerInstruction.setTransform(previewTransform, at: .zero)
     instruction.layerInstructions = [layerInstruction]
 
-    let composition = AVMutableVideoComposition()
-    composition.renderSize = CGSize(width: target, height: target)
-    composition.frameDuration = CMTime(value: CMTimeValue(frameDelayMs(BadgeConstants.videoPreviewGifFps)), timescale: 1000)
-    composition.instructions = [instruction]
-    if #available(iOS 16.0, *) {
-      composition.backgroundColor = UIColor.black.cgColor
-    }
-    return composition
+    let videoComposition = AVMutableVideoComposition()
+    videoComposition.renderSize = CGSize(width: target, height: target)
+    videoComposition.frameDuration = CMTime(value: CMTimeValue(frameDelayMs(BadgeConstants.videoPreviewGifFps)), timescale: 1000)
+    videoComposition.instructions = [instruction]
+    let bgLayer = CALayer()
+    bgLayer.frame = CGRect(x: 0, y: 0, width: target, height: target)
+    bgLayer.backgroundColor = UIColor.black.cgColor
+    return videoComposition
   }
 
   private func renderFirstFrame(url: URL, mime: String, size: Int, crop: CropTransform) throws -> CGImage {
