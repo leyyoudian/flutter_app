@@ -70,7 +70,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: 'http://60.205.122.153',
   );
-  static const _appVersion = '1.0.5';
+  static const _appVersion = '1.0.6';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -87,6 +87,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   bool _appActive = true;
   bool _demoMode = false;
   bool _checkingVersion = false;
+  bool _reviewRefreshInFlight = false;
   double _prepareProgress = 0;
   double _uploadProgress = 0;
   String _status = '未连接';
@@ -101,6 +102,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   int _videoIndex = 0;
 
   bool get _previewActive => _appActive && !_preparing;
+  bool get _hasPendingReviewStatuses => _history.any(
+        (entry) =>
+            entry.reviewId != null &&
+            entry.reviewStatus != 'approved' &&
+            entry.reviewStatus != 'rejected',
+      );
 
   @override
   void initState() {
@@ -145,6 +152,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     _connectionTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (!_appActive || _preparing || _uploading) {
         return;
+      }
+      if (_hasPendingReviewStatuses) {
+        unawaited(_refreshHistoryReviewStatuses());
       }
       if (_connected || _connecting) {
         unawaited(_refreshConnectionState());
@@ -795,39 +805,44 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _refreshHistoryReviewStatuses() async {
-    if (_demoMode || _history.isEmpty) {
+    if (_reviewRefreshInFlight || _demoMode || !_hasPendingReviewStatuses) {
       return;
     }
-    final updates = <String, String>{};
-    for (final entry in _history) {
-      if (entry.reviewId == null ||
-          entry.reviewStatus == 'approved' ||
-          entry.reviewStatus == 'rejected') {
-        continue;
-      }
-      try {
-        final result = await _getBackendJson('/api/assets/${entry.reviewId}');
-        final status = _readNullableString(result?['status']);
-        if (status != null && status != entry.reviewStatus) {
-          updates[entry.reviewId!] = status;
+    _reviewRefreshInFlight = true;
+    try {
+      final updates = <String, String>{};
+      for (final entry in _history) {
+        if (entry.reviewId == null ||
+            entry.reviewStatus == 'approved' ||
+            entry.reviewStatus == 'rejected') {
+          continue;
         }
-      } catch (_) {
-        // Keep local status if the review server is temporarily unavailable.
-      }
-    }
-    if (!mounted || updates.isEmpty) {
-      return;
-    }
-    setState(() {
-      for (var index = 0; index < _history.length; index++) {
-        final reviewId = _history[index].reviewId;
-        final status = reviewId == null ? null : updates[reviewId];
-        if (status != null) {
-          _history[index] = _history[index].copyWith(reviewStatus: status);
+        try {
+          final result = await _getBackendJson('/api/assets/${entry.reviewId}');
+          final status = _readNullableString(result?['status']);
+          if (status != null && status != entry.reviewStatus) {
+            updates[entry.reviewId!] = status;
+          }
+        } catch (_) {
+          // Keep local status if the review server is temporarily unavailable.
         }
       }
-    });
-    unawaited(_saveHistory());
+      if (!mounted || updates.isEmpty) {
+        return;
+      }
+      setState(() {
+        for (var index = 0; index < _history.length; index++) {
+          final reviewId = _history[index].reviewId;
+          final status = reviewId == null ? null : updates[reviewId];
+          if (status != null) {
+            _history[index] = _history[index].copyWith(reviewStatus: status);
+          }
+        }
+      });
+      unawaited(_saveHistory());
+    } finally {
+      _reviewRefreshInFlight = false;
+    }
   }
 
   void _rememberReviewedAsset(PreparedAsset asset) {

@@ -4,6 +4,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const { createApp } = require('../src/app');
 
@@ -273,6 +274,16 @@ test('admin page renders playable video previews', async () => {
     assert.equal(adminPage.status, 200);
     assert.match(adminPage.text, /function buildPreviewHtml/);
     assert.match(adminPage.text, /<video class="asset-thumb" controls/);
+  });
+});
+
+test('admin page inline script is valid JavaScript', async () => {
+  await withServer(async (baseUrl) => {
+    const adminPage = await request(baseUrl, 'GET', '/');
+    assert.equal(adminPage.status, 200);
+    const script = adminPage.text.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    assert.ok(script);
+    assert.doesNotThrow(() => new vm.Script(script));
   });
 });
 

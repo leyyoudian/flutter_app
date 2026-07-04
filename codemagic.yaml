@@ -12,7 +12,7 @@ workflows:
       cocoapods: default
       ios_signing:
         distribution_type: app_store
-        bundle_identifier: com.leyyoudian.espbaji
+        bundle_identifier: com.domainname.DotLoop
     scripts:
       - name: Get Flutter packages
         script: |

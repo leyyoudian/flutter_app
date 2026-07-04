@@ -1,11 +1,11 @@
 {
     "android":  {
                     "platform":  "android",
-                    "latestVersion":  "1.0.5",
+                    "latestVersion":  "1.0.6",
                     "minimumVersion":  "1.0.0",
                     "force":  false,
-                    "storeUrl":  "http://60.205.122.153/downloads/apk/app_gif_1.0.5.apk",
-                    "notes":  "公网 80 端口版本 1.0.5"
+                    "storeUrl":  "http://60.205.122.153/downloads/apk/app_gif_1.0.6.apk",
+                    "notes":  "修复素材审核状态自动刷新"
                 },
     "ios":  {
                 "platform":  "ios",

@@ -70,6 +70,7 @@ function sendJson(res, status, data) {
 function sendText(res, status, text, contentType = 'text/plain; charset=utf-8') {
   res.writeHead(status, {
     'content-type': contentType,
+    'cache-control': 'no-store',
     'content-length': Buffer.byteLength(text),
   });
   res.end(text);
@@ -722,8 +723,8 @@ async function loadAppHistory() {
       const latestTag = i === 0 ? '<span class="tag tag-green">最新</span> ' : '';
       const actions =
         '<a class="btn btn-sm" href="' + escapeHtml(item.url || '#') + '" target="_blank">下载</a> ' +
-        '<button class="btn btn-sm btn-danger" onclick=\'deleteAppVersion(' +
-        jsArg(item.platform || 'android') + ',' + jsArg(item.version) + ')\'>删除</button>';
+        '<button class="btn btn-sm btn-danger" onclick=\\'deleteAppVersion(' +
+        jsArg(item.platform || 'android') + ',' + jsArg(item.version) + ')\\'>删除</button>';
       html += '<tr>' +
         '<td>' + latestTag + escapeHtml(item.version || '-') + '</td>' +
         '<td>' + formatSize(Number(item.size) || 0) + '</td>' +
@@ -757,8 +758,8 @@ async function loadFirmwareHistory() {
       const sha = item.sha256 ? String(item.sha256).slice(0, 16) + '...' : '-';
       const actions =
         '<a class="btn btn-sm" href="' + escapeHtml(item.url || '#') + '" target="_blank">下载</a> ' +
-        '<button class="btn btn-sm btn-danger" onclick=\'deleteFirmwareVersion(' +
-        jsArg(item.hardware || 'esp32s3') + ',' + jsArg(item.version) + ')\'>删除</button>';
+        '<button class="btn btn-sm btn-danger" onclick=\\'deleteFirmwareVersion(' +
+        jsArg(item.hardware || 'esp32s3') + ',' + jsArg(item.version) + ')\\'>删除</button>';
       html += '<tr>' +
         '<td>' + latestTag + escapeHtml(item.version || '-') + '</td>' +
         '<td>' + formatSize(Number(item.size) || 0) + '</td>' +

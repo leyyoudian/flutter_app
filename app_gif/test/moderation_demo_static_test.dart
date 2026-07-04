@@ -44,8 +44,8 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.5';"));
-    expect(pubspec, contains('version: 1.0.5+5'));
+    expect(source, contains("static const _appVersion = '1.0.6';"));
+    expect(pubspec, contains('version: 1.0.6+6'));
   });
 
   test('maker save submits review before storing history and shows policy hint', () {
@@ -82,6 +82,24 @@ void main() {
     expect(source, contains("return '未审核';"));
     expect(source, contains("entry.reviewStatus == 'approved'"));
     expect(source, contains('Colors.redAccent.withValues'));
+  });
+
+  test('pending review statuses refresh while the app stays open', () {
+    final source = File('lib/main.dart').readAsStringSync();
+    final timerStart = source.indexOf('void _restartConnectionTimer()');
+    final timerEnd = source.indexOf('Future<void> _handleNativeCall', timerStart);
+
+    expect(timerStart, isNot(-1));
+    expect(timerEnd, isNot(-1));
+    final timerSource = source.substring(timerStart, timerEnd);
+    final reviewRefresh = timerSource.indexOf('_refreshHistoryReviewStatuses()');
+    final connectionRefresh = timerSource.indexOf('_refreshConnectionState()');
+
+    expect(source, contains('bool _reviewRefreshInFlight = false;'));
+    expect(source, contains('bool get _hasPendingReviewStatuses'));
+    expect(reviewRefresh, isNot(-1));
+    expect(connectionRefresh, isNot(-1));
+    expect(reviewRefresh, lessThan(connectionRefresh));
   });
 
   test('local server skeleton exposes required deployment APIs', () {
