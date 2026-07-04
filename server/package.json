@@ -1,0 +1,14 @@
+{
+  "name": "esp-baji-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local backend for ESP BAJI app version checks, asset review, and firmware OTA manifests.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

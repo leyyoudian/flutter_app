@@ -1,0 +1,35 @@
+[
+    {
+        "platform":  "android",
+        "version":  "1.0.5",
+        "filename":  "app_gif_1.0.5.apk",
+        "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.5.apk",
+        "size":  144730004,
+        "sha256":  "7c255ab17734efb10a3957237bc2fd56512f465ff09ee74362c2a83753588d7d",
+        "force":  false,
+        "notes":  "公网 80 端口版本 1.0.5",
+        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
+    },
+    {
+        "platform":  "android",
+        "version":  "1.0.4",
+        "filename":  "app_gif_1.0.4.apk",
+        "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.4.apk",
+        "size":  144730105,
+        "sha256":  "34f1899614f9ce9601a5278d303009725c80a7baaccfe5fd6b3313519a973cfc",
+        "force":  false,
+        "notes":  "历史版本 1.0.4",
+        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
+    },
+    {
+        "platform":  "android",
+        "version":  "1.0.3",
+        "filename":  "app_gif_1.0.3.apk",
+        "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.3.apk",
+        "size":  144730095,
+        "sha256":  "2ea5fc6e778557d44430fd8d622e95213f5de801edb2d9264e3b3aebc7d01d15",
+        "force":  false,
+        "notes":  "历史版本 1.0.3",
+        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
+    }
+]

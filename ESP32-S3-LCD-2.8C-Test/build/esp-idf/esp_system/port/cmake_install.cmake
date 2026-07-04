@@ -42,3 +42,9 @@ if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   include("D:/Documents/esp-baji/ESP32-S3-LCD-2.8C-Test/build/esp-idf/esp_system/port/soc/esp32s3/cmake_install.cmake")
 endif()
 
+string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
+       "${CMAKE_INSTALL_MANIFEST_FILES}")
+if(CMAKE_INSTALL_LOCAL_ONLY)
+  file(WRITE "D:/Documents/esp-baji/ESP32-S3-LCD-2.8C-Test/build/esp-idf/esp_system/port/install_local_manifest.txt"
+     "${CMAKE_INSTALL_MANIFEST_CONTENT}")
+endif()

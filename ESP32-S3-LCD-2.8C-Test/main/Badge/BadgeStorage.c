@@ -28,9 +28,9 @@
 #define BADGE_SD_ASSET_PATH BADGE_SD_MOUNT_POINT "/badge.eb4"
 #define BADGE_SD_TEMP_PATH BADGE_SD_MOUNT_POINT "/badge.tmp"
 #define BADGE_UPLOAD_LOG_STEP (512u * 1024u)
-#define BADGE_SD_READ_STAGING_BYTES (256u * 1024u)
-#define BADGE_SD_READ_STAGING_FALLBACK_BYTES (128u * 1024u)
-#define BADGE_SD_READ_STAGING_MIN_BYTES (64u * 1024u)
+#define BADGE_SD_READ_STAGING_BYTES (64u * 1024u)
+#define BADGE_SD_READ_STAGING_FALLBACK_BYTES (32u * 1024u)
+#define BADGE_SD_READ_STAGING_MIN_BYTES (16u * 1024u)
 #define BADGE_SD_WRITE_BUFFER_BYTES (128u * 1024u)
 
 typedef struct {
@@ -467,10 +467,14 @@ esp_err_t badge_storage_open_asset_path(const char *path, badge_asset_t *out)
     }
 
     /* Allocate DMA-capable read buffer for SD reads */
-    size_t read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES;
+    size_t read_buf_size = BADGE_SD_READ_STAGING_BYTES;
     uint8_t *read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (read_buf == NULL) {
-        read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES / 2;
+        read_buf_size = BADGE_SD_READ_STAGING_FALLBACK_BYTES;
+        read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
+    if (read_buf == NULL) {
+        read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES;
         read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     }
     if (read_buf == NULL) {

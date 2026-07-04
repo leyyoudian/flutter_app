@@ -17,5 +17,7 @@ idf_component_register(
                                      "./LCD_Driver"
                                      "./Wireless"
                                      "."
-                        REQUIRES esp_lcd esp_timer esp_partition heap nvs_flash spi_flash esp_wifi esp_http_server esp_netif esp_event fatfs sdmmc esp_driver_sdmmc driver esp_driver_gpio esp_driver_ledc esp_driver_spi
+                        REQUIRES esp_lcd esp_timer esp_partition heap nvs_flash spi_flash esp_wifi esp_http_server esp_netif esp_event esp_https_ota esp_http_client app_update mbedtls json fatfs sdmmc esp_driver_sdmmc driver esp_driver_gpio esp_driver_ledc esp_driver_spi
                         )
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE BADGE_FW_VERSION=\"${PROJECT_VER}\")

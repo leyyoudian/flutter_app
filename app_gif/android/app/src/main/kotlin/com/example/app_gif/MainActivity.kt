@@ -61,9 +61,13 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
 import java.nio.ByteBuffer
+import java.util.LinkedHashSet
 import java.util.LinkedHashMap
 import java.util.UUID
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.CRC32
@@ -89,6 +93,7 @@ class MainActivity : FlutterActivity() {
     @Volatile private var badgeWifiNetwork: Network? = null
     @Volatile private var badgeSdAvailable = false
     @Volatile private var badgeWifiManagedRequest = false
+    @Volatile private var activeBadgeHost = BADGE_AP_HOST
     private val preparingVideoUri = AtomicReference<String?>(null)
     private var badgeWifiCallback: ConnectivityManager.NetworkCallback? = null
     private var uploadWifiLock: WifiManager.WifiLock? = null
@@ -98,6 +103,11 @@ class MainActivity : FlutterActivity() {
         val file: File,
         val size: Long,
         val crc: Long,
+    )
+
+    private data class DiscoveredBadge(
+        val host: String,
+        val status: String,
     )
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -242,7 +252,7 @@ class MainActivity : FlutterActivity() {
                     return
                 }
                 val name = call.argument<String>("name") ?: "asset"
-                val fps = (call.argument<Int>("fps") ?: 30).coerceIn(1, 60)
+                val fps = (call.argument<Int>("fps") ?: 40).coerceIn(1, 60)
                 val maxPackageBytes = (call.argument<Int>("maxPackageBytes")
                     ?: resolveBadgePackageBudget(badgeSdAvailable))
                     .coerceAtLeast(HEADER_SIZE + FRAME_ENTRY_SIZE + PALETTE_BYTES + STREAM_240_PIXELS)
@@ -374,6 +384,7 @@ class MainActivity : FlutterActivity() {
         isScanning = true
         sendEvent(mapOf("type" to "scanState", "scanning" to true))
         sendEvent(mapOf("type" to "status", "message" to "扫描 $BADGE_WIFI_SSID"))
+        Thread { publishLanBadgeScanResult() }.start()
 
         runCatching { wifi.startScan() }
         mainHandler.postDelayed({
@@ -415,6 +426,23 @@ class MainActivity : FlutterActivity() {
         if (scanResults.isEmpty()) {
             sendEvent(mapOf("type" to "status", "message" to "未发现 $BADGE_WIFI_SSID"))
         }
+    }
+
+    private fun publishLanBadgeScanResult() {
+        val manager = connectivityManager()
+        val network = manager.activeNetwork ?: return
+        val discovered = discoverBadgeOnLan(manager, network) ?: return
+        setActiveBadgeHost(discovered.host)
+        badgeSdAvailable = parseSdAvailable(discovered.status)
+        val device = mapOf(
+            "address" to discovered.host,
+            "name" to "$BADGE_DEVICE_NAME LAN",
+            "rssi" to 0,
+            "serviceMatch" to true,
+        )
+        scanResults[discovered.host] = device
+        sendEvent(mapOf("type" to "scanResult", "device" to device))
+        sendEvent(mapOf("type" to "status", "message" to "已发现局域网设备 ${discovered.host}"))
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -461,13 +489,18 @@ class MainActivity : FlutterActivity() {
     private fun connect(address: String) {
         stopScan()
         closeGatt()
+        if (isIpv4Address(address)) {
+            setActiveBadgeHost(address)
+        } else {
+            setActiveBadgeHost(BADGE_AP_HOST)
+        }
         Thread {
             sendConnectionEvent(connected = false, connecting = true, address = address, message = "连接 Wi-Fi")
             try {
                 val network = ensureBadgeWifiNetwork()
                 val status = readBadgeStatus(network)
                 badgeSdAvailable = parseSdAvailable(status)
-                connectedAddress = address.ifBlank { BADGE_WIFI_SSID }
+                connectedAddress = activeBadgeHost
                 sendConnectionEvent(true, false, connectedAddress, status.ifBlank { "已连接 Wi-Fi" })
             } catch (error: Exception) {
                 connectedAddress = null
@@ -482,6 +515,7 @@ class MainActivity : FlutterActivity() {
         releaseBadgeWifi()
         closeGatt()
         badgeSdAvailable = false
+        setActiveBadgeHost(BADGE_AP_HOST)
         sendConnectionEvent(connected = false, connecting = false, address = null, message = "未连接")
     }
 
@@ -611,7 +645,7 @@ class MainActivity : FlutterActivity() {
         Thread {
             val ok = runCatching {
                 val network = ensureBadgeWifiNetwork()
-                requestBadgeText(network, "$BADGE_BRIGHTNESS_URL?value=$value")
+                requestBadgeText(network, "${badgeUrl("/brightness")}?value=$value")
             }.isSuccess
             mainHandler.post {
                 if (ok) {
@@ -1025,6 +1059,154 @@ class MainActivity : FlutterActivity() {
         return applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
     }
 
+    private fun badgeUrl(path: String, host: String = activeBadgeHost): String {
+        val normalizedPath = if (path.startsWith("/")) path else "/$path"
+        return "http://$host$normalizedPath"
+    }
+
+    private fun setActiveBadgeHost(host: String) {
+        activeBadgeHost = if (isIpv4Address(host)) host else BADGE_AP_HOST
+    }
+
+    private fun isIpv4Address(value: String): Boolean {
+        val parts = value.split('.')
+        if (parts.size != 4) {
+            return false
+        }
+        return parts.all { part ->
+            part.isNotEmpty() && part.length <= 3 && part.all { it.isDigit() } &&
+                part.toIntOrNull()?.let { it in 0..255 } == true
+        }
+    }
+
+    private fun isBadgeStatusText(status: String): Boolean {
+        val normalized = status.trim().lowercase()
+        if (normalized.isEmpty()) {
+            return false
+        }
+        return (normalized.startsWith("idle ") || normalized.startsWith("upload ")) &&
+            normalized.contains("storage=") &&
+            normalized.contains("sd=") &&
+            normalized.contains("format=")
+    }
+
+    private fun rememberDiscoveredBadge(discovered: DiscoveredBadge) {
+        setActiveBadgeHost(discovered.host)
+        badgeSdAvailable = parseSdAvailable(discovered.status)
+        connectedAddress = activeBadgeHost
+    }
+
+    private fun probeBadgeHost(network: Network, host: String): DiscoveredBadge? {
+        if (!isIpv4Address(host)) {
+            return null
+        }
+        val status = runCatching {
+            requestBadgeText(network, badgeUrl("/status", host), LAN_DISCOVERY_PROBE_TIMEOUT_MS)
+        }.getOrNull() ?: return null
+        return if (isBadgeStatusText(status)) DiscoveredBadge(host, status) else null
+    }
+
+    private fun resolveBadgeOnNetwork(manager: ConnectivityManager, network: Network): DiscoveredBadge? {
+        if (!isCachedBadgeWifiNetworkTransportUsable(manager, network)) {
+            return null
+        }
+        probeBadgeHost(network, activeBadgeHost)?.let { return it }
+        if (activeBadgeHost != BADGE_AP_HOST) {
+            probeBadgeHost(network, BADGE_AP_HOST)?.let { return it }
+        }
+        return discoverBadgeOnLan(manager, network)
+    }
+
+    private fun reuseBadgeNetworkIfReachable(
+        manager: ConnectivityManager,
+        network: Network,
+        message: String,
+    ): Network? {
+        val discovered = resolveBadgeOnNetwork(manager, network) ?: return null
+        bindBadgeWifiNetwork(network)
+        badgeWifiNetwork = network
+        rememberDiscoveredBadge(discovered)
+        val displayMessage = if (discovered.host == BADGE_AP_HOST) message else "已发现局域网设备"
+        sendConnectionEvent(true, false, connectedAddress, displayMessage)
+        return network
+    }
+
+    private fun discoverBadgeOnLan(manager: ConnectivityManager, network: Network): DiscoveredBadge? {
+        if (!isCachedBadgeWifiNetworkTransportUsable(manager, network)) {
+            return null
+        }
+        val candidates = lanScanCandidates()
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        val executor = Executors.newFixedThreadPool(LAN_DISCOVERY_THREADS)
+        return try {
+            val completion = ExecutorCompletionService<DiscoveredBadge?>(executor)
+            var submitted = 0
+            candidates.take(LAN_DISCOVERY_MAX_CANDIDATES).forEach { host ->
+                completion.submit(Callable { probeBadgeHost(network, host) })
+                submitted += 1
+            }
+
+            val deadline = System.currentTimeMillis() + LAN_DISCOVERY_TIMEOUT_MS
+            repeat(submitted) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0L) {
+                    return@repeat
+                }
+                val future = completion.poll(remaining, TimeUnit.MILLISECONDS) ?: return@repeat
+                val discovered = runCatching { future.get() }.getOrNull()
+                if (discovered != null) {
+                    return discovered
+                }
+            }
+            null
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun lanScanCandidates(): List<String> {
+        val fallbackCandidates = listOf(activeBadgeHost, BADGE_AP_HOST).filter(::isIpv4Address).distinct()
+        val dhcp = runCatching { wifiManager().dhcpInfo }.getOrNull() ?: return fallbackCandidates
+        val localIp = dhcp.ipAddress
+        if (localIp == 0) {
+            return fallbackCandidates
+        }
+
+        val first = localIp and 0xff
+        val second = (localIp shr 8) and 0xff
+        val third = (localIp shr 16) and 0xff
+        val localLast = (localIp shr 24) and 0xff
+        val prefix = "$first.$second.$third."
+        val candidates = LinkedHashSet<String>()
+
+        if (isIpv4Address(activeBadgeHost)) {
+            candidates += activeBadgeHost
+        }
+        candidates += BADGE_AP_HOST
+        intToIpv4(dhcp.gateway)
+            ?.takeIf { it.startsWith(prefix) }
+            ?.let { candidates += it }
+
+        for (last in 1..254) {
+            if (last == localLast) {
+                continue
+            }
+            candidates += "$prefix$last"
+        }
+        return candidates.toList()
+    }
+
+    private fun intToIpv4(value: Int): String? {
+        if (value == 0) {
+            return null
+        }
+        return "${value and 0xff}.${(value shr 8) and 0xff}.${(value shr 16) and 0xff}.${(value shr 24) and 0xff}"
+    }
+
     @Synchronized
     @SuppressLint("MissingPermission")
     private fun ensureBadgeWifiNetwork(fastUpload: Boolean = false): Network {
@@ -1035,15 +1217,11 @@ class MainActivity : FlutterActivity() {
         val manager = connectivityManager()
         if (fastUpload && !badgeWifiManagedRequest) {
             val activeNetwork = manager.activeNetwork
-            if (activeNetwork != null && isCachedBadgeWifiNetworkTransportUsable(manager, activeNetwork)) {
-                bindBadgeWifiNetwork(activeNetwork)
+            if (activeNetwork != null) {
                 try {
-                    val status = waitForBadgeStatus(activeNetwork, UPLOAD_NETWORK_READY_TIMEOUT_MS)
-                    badgeWifiNetwork = activeNetwork
-                    badgeSdAvailable = parseSdAvailable(status)
-                    connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
-                    sendConnectionEvent(true, false, connectedAddress, "已复用 $BADGE_WIFI_SSID Wi-Fi")
-                    return activeNetwork
+                    reuseBadgeNetworkIfReachable(manager, activeNetwork, "已复用 $BADGE_WIFI_SSID Wi-Fi")?.let {
+                        return it
+                    }
                 } catch (_: Exception) {
                     runCatching { manager.bindProcessToNetwork(null) }
                     releaseUploadWifiLock(keepIfConnected = false)
@@ -1052,44 +1230,48 @@ class MainActivity : FlutterActivity() {
         }
 
         badgeWifiNetwork?.let { network ->
-            if (fastUpload && isCachedBadgeWifiNetworkTransportUsable(manager, network)) {
-                bindBadgeWifiNetwork(network)
+            if (isCachedBadgeWifiNetworkTransportUsable(manager, network)) {
                 try {
-                    val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)
-                    badgeSdAvailable = parseSdAvailable(status)
-                    connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
-                    sendConnectionEvent(true, false, connectedAddress, "已复用 $BADGE_WIFI_SSID Wi-Fi")
-                    return network
+                    reuseBadgeNetworkIfReachable(manager, network, "已复用 $BADGE_WIFI_SSID Wi-Fi")?.let {
+                        return it
+                    }
                 } catch (_: Exception) {
                     releaseBadgeWifi()
                 }
+            } else {
+                releaseBadgeWifi()
             }
-            if (isCachedBadgeWifiNetworkUsable(manager, network)) {
-                bindBadgeWifiNetwork(network)
-                sendEvent(mapOf("type" to "status", "message" to "已复用 $BADGE_WIFI_SSID Wi-Fi"))
-                return network
+        }
+
+        manager.activeNetwork?.let { activeNetwork ->
+            try {
+                reuseBadgeNetworkIfReachable(manager, activeNetwork, "已连接 Wi-Fi")?.let {
+                    return it
+                }
+            } catch (_: Exception) {
+                runCatching { manager.bindProcessToNetwork(null) }
+                releaseUploadWifiLock(keepIfConnected = false)
             }
-            releaseBadgeWifi()
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             val network = manager.activeNetwork ?: throw IllegalStateException("请先手动连接 $BADGE_WIFI_SSID Wi-Fi")
             badgeWifiNetwork = network
-            connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+            setActiveBadgeHost(BADGE_AP_HOST)
+            connectedAddress = activeBadgeHost
             bindBadgeWifiNetwork(network)
             return network
         }
 
         findExistingBadgeWifiNetwork(manager)?.let { network ->
-            badgeWifiNetwork = network
-            connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
             bindBadgeWifiNetwork(network)
-            sendEvent(mapOf("type" to "status", "message" to "已复用 $BADGE_WIFI_SSID Wi-Fi"))
+            sendEvent(mapOf("type" to "status", "message" to "已复用 ${connectedAddress ?: BADGE_WIFI_SSID}"))
             return network
         }
 
         sendEvent(mapOf("type" to "status", "message" to "连接 $BADGE_WIFI_SSID Wi-Fi"))
         releaseBadgeWifi()
+        setActiveBadgeHost(BADGE_AP_HOST)
         badgeWifiManagedRequest = true
 
         val specifier = WifiNetworkSpecifier.Builder()
@@ -1136,11 +1318,12 @@ class MainActivity : FlutterActivity() {
             throw IllegalStateException(errorRef.get() ?: "$BADGE_WIFI_SSID Wi-Fi 连接超时")
         }
 
+        setActiveBadgeHost(BADGE_AP_HOST)
         bindBadgeWifiNetwork(network)
-        connectedAddress = connectedAddress ?: BADGE_WIFI_SSID
+        val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)
+        badgeSdAvailable = parseSdAvailable(status)
+        connectedAddress = activeBadgeHost
         if (fastUpload) {
-            val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)
-            badgeSdAvailable = parseSdAvailable(status)
             sendConnectionEvent(true, false, connectedAddress, "已连接 Wi-Fi")
         }
         return network
@@ -1151,11 +1334,11 @@ class MainActivity : FlutterActivity() {
         var lastError: Throwable? = null
         while (System.currentTimeMillis() <= deadlineMs) {
             val status = runCatching {
-                requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS)
+                requestBadgeText(network, badgeUrl("/status"), FAST_BADGE_STATUS_TIMEOUT_MS)
             }.onFailure { error ->
                 lastError = error
             }.getOrNull()
-            if (!status.isNullOrBlank()) {
+            if (!status.isNullOrBlank() && isBadgeStatusText(status)) {
                 return status
             }
             Thread.sleep(150)
@@ -1169,9 +1352,13 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun findExistingBadgeWifiNetwork(manager: ConnectivityManager): Network? {
-        return manager.allNetworks.firstOrNull { network ->
-            isBadgeWifiNetworkUsable(manager, network)
+        manager.allNetworks.forEach { network ->
+            val discovered = resolveBadgeOnNetwork(manager, network) ?: return@forEach
+            badgeWifiNetwork = network
+            rememberDiscoveredBadge(discovered)
+            return network
         }
+        return null
     }
 
     private fun isCachedBadgeWifiNetworkUsable(manager: ConnectivityManager, network: Network): Boolean {
@@ -1179,19 +1366,11 @@ class MainActivity : FlutterActivity() {
         if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
             return false
         }
-        return runCatching {
-            requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS).isNotBlank()
-        }.getOrDefault(false)
+        return resolveBadgeOnNetwork(manager, network) != null
     }
 
     private fun isBadgeWifiNetworkUsable(manager: ConnectivityManager, network: Network): Boolean {
-        val capabilities = manager.getNetworkCapabilities(network) ?: return false
-        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-            return false
-        }
-        return runCatching {
-            requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS).isNotBlank()
-        }.getOrDefault(false)
+        return resolveBadgeOnNetwork(manager, network) != null
     }
 
     private fun isStaleBadgeNetworkError(error: Throwable): Boolean {
@@ -1272,7 +1451,7 @@ class MainActivity : FlutterActivity() {
         socket.tcpNoDelay = true
         socket.sendBufferSize = UPLOAD_IO_CHUNK_BYTES
         socket.soTimeout = UPLOAD_TCP_CONNECT_TIMEOUT_MS
-        socket.connect(InetSocketAddress(BADGE_HOST, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
+        socket.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
         tcpUploadSocket = socket
         return socket
     }
@@ -1312,7 +1491,7 @@ class MainActivity : FlutterActivity() {
         socket.use { s ->
             s.tcpNoDelay = true
             s.soTimeout = 5000
-            s.connect(InetSocketAddress(BADGE_HOST, BADGE_UPLOAD_TCP_PORT), 2500)
+            s.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), 2500)
             val cmd = "SWITCH $id\n"
             s.getOutputStream().write(cmd.toByteArray())
             s.getOutputStream().flush()
@@ -1368,7 +1547,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun uploadAssetOverHttp(network: Network, packageInfo: UploadPackageInfo) {
-        val url = URL(BADGE_UPLOAD_URL)
+        val url = URL(badgeUrl("/upload"))
         val connection = network.openConnection(url) as HttpURLConnection
         connection.requestMethod = "POST"
         connection.doOutput = true
@@ -1428,7 +1607,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun readBadgeStatus(network: Network): String {
-        return requestBadgeText(network, BADGE_STATUS_URL)
+        return requestBadgeText(network, badgeUrl("/status"))
     }
 
     private fun parseSdAvailable(status: String): Boolean {
@@ -1538,7 +1717,7 @@ class MainActivity : FlutterActivity() {
             val address = connectedAddress
             val state = if (network != null && address != null) {
                 val ok = runCatching {
-                    val status = requestBadgeText(network, BADGE_STATUS_URL, HTTP_STATUS_TIMEOUT_MS)
+                    val status = requestBadgeText(network, badgeUrl("/status"), HTTP_STATUS_TIMEOUT_MS)
                     badgeSdAvailable = parseSdAvailable(status)
                 }.isSuccess
                 if (ok) {
@@ -1560,7 +1739,21 @@ class MainActivity : FlutterActivity() {
                     )
                 }
             } else {
-                connectionState()
+                val manager = connectivityManager()
+                val activeNetwork = manager.activeNetwork
+                val discovered = activeNetwork?.let { resolveBadgeOnNetwork(manager, it) }
+                if (activeNetwork != null && discovered != null) {
+                    badgeWifiNetwork = activeNetwork
+                    rememberDiscoveredBadge(discovered)
+                    mapOf(
+                        "connected" to true,
+                        "address" to connectedAddress,
+                        "sdAvailable" to badgeSdAvailable,
+                        "message" to "已发现局域网设备",
+                    )
+                } else {
+                    connectionState()
+                }
             }
             mainHandler.post { result.success(state) }
         }.start()
@@ -2939,14 +3132,11 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val CHANNEL = "esp_baji/native"
-        private const val BADGE_DEVICE_NAME = "ESP-BAJI"
-        private const val BADGE_WIFI_SSID = "ESP-BAJI"
-        private const val BADGE_HOST = "192.168.4.1"
+        private const val BADGE_DEVICE_NAME = "ESP-DotLoop"
+        private const val BADGE_WIFI_SSID = "ESP-DotLoop"
+        private const val BADGE_AP_HOST = "192.168.4.1"
         private const val BADGE_UPLOAD_TCP_PORT = 3333
         private const val BADGE_TCP_UPLOAD_MAGIC = 0x31505542
-        private const val BADGE_UPLOAD_URL = "http://192.168.4.1/upload"
-        private const val BADGE_STATUS_URL = "http://192.168.4.1/status"
-        private const val BADGE_BRIGHTNESS_URL = "http://192.168.4.1/brightness"
         private const val REQUEST_PICK_MEDIA = 8101
         private const val REQUEST_BLE_PERMISSIONS = 8102
         private const val SCAN_WINDOW_MS = 8000L
@@ -2959,6 +3149,10 @@ class MainActivity : FlutterActivity() {
         private const val HTTP_READ_TIMEOUT_MS = 60000
         private const val HTTP_STATUS_TIMEOUT_MS = 2500
         private const val FAST_BADGE_STATUS_TIMEOUT_MS = 800
+        private const val LAN_DISCOVERY_PROBE_TIMEOUT_MS = 450
+        private const val LAN_DISCOVERY_TIMEOUT_MS = 4500L
+        private const val LAN_DISCOVERY_THREADS = 32
+        private const val LAN_DISCOVERY_MAX_CANDIDATES = 260
         private const val HTTP_UPLOAD_ATTEMPTS = 2
         private const val UPLOAD_IO_CHUNK_BYTES = 256 * 1024
         private const val UPLOAD_PROGRESS_STEP_BYTES = 512 * 1024L
@@ -2975,8 +3169,8 @@ class MainActivity : FlutterActivity() {
         private const val WIDTH = 480
         private const val HEIGHT = 480
         private const val MIN_DEVICE_FPS = 25
-        private const val DEVICE_FPS = 25
-        private const val MAX_DEVICE_FPS = 30
+        private const val DEVICE_FPS = 40
+        private const val MAX_DEVICE_FPS = 40
         private const val PREVIEW_SIZE = 320
         private const val VIDEO_PREVIEW_GIF_SIZE = 192
         private const val VIDEO_PREVIEW_GIF_FPS = 25

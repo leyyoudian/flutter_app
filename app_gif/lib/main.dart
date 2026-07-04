@@ -66,6 +66,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   static const _channel = MethodChannel('esp_baji/native');
   static const _privacyPolicyUrl =
       'https://leyyoudian.github.io/flutter_app/privacy.html';
+  static const _backendBaseUrl = String.fromEnvironment(
+    'ESP_BAJI_API_BASE',
+    defaultValue: 'http://60.205.122.153',
+  );
+  static const _appVersion = '1.0.5';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -80,6 +85,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   bool _preparing = false;
   bool _uploading = false;
   bool _appActive = true;
+  bool _demoMode = false;
+  bool _checkingVersion = false;
   double _prepareProgress = 0;
   double _uploadProgress = 0;
   String _status = '未连接';
@@ -89,8 +96,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   CropTransform _cropTransform = const CropTransform();
   List<FactoryAnimation> _factoryAnims = [];
   String? _selectedFactoryId;
-  String? _activeFactoryId;       // currently playing on dial
-  List<String> _videoQueue = [];  // pending video sequence
+  String? _activeFactoryId; // currently playing on dial
+  List<String> _videoQueue = []; // pending video sequence
   int _videoIndex = 0;
 
   bool get _previewActive => _appActive && !_preparing;
@@ -103,6 +110,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     unawaited(_loadHistory());
     unawaited(_refreshConnectionState());
     unawaited(_loadFactoryAnimations());
+    unawaited(_checkRemoteVersion());
     _restartConnectionTimer();
   }
 
@@ -124,6 +132,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     _restartConnectionTimer();
     if (appActive) {
       unawaited(_refreshConnectionState());
+      unawaited(_refreshHistoryReviewStatuses());
     }
   }
 
@@ -238,12 +247,14 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           result.map((item) => HistoryEntry.fromMap(_asStringMap(item))),
         );
     });
+    unawaited(_refreshHistoryReviewStatuses());
   }
 
   Future<void> _loadFactoryAnimations() async {
     try {
-      final jsonStr = await DefaultAssetBundle.of(context)
-          .loadString('assets/factory_previews/manifest.json');
+      final jsonStr = await DefaultAssetBundle.of(
+        context,
+      ).loadString('assets/factory_previews/manifest.json');
       final list = json.decode(jsonStr) as List<dynamic>;
       if (!mounted) return;
       setState(() {
@@ -261,12 +272,15 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _selectedFactoryId = anim.id;
       _asset = null;
     });
-    // Build video sequence: exit video + entrance video (unless third_half)
+    // Build video sequence: exit + entrance (skip exit for F006->F007, third_half replaces both)
     final queue = <String>[];
     bool isThirdHalf = false;
-    if (_activeFactoryId != null && _activeFactoryId != anim.id) {
+    bool skipExit = _activeFactoryId == 'F006' && anim.id == 'F007';
+    if (_activeFactoryId != null && _activeFactoryId != anim.id && !skipExit) {
       final current = _factoryAnims.cast<FactoryAnimation?>().firstWhere(
-            (a) => a?.id == _activeFactoryId, orElse: () => null);
+        (a) => a?.id == _activeFactoryId,
+        orElse: () => null,
+      );
       isThirdHalf = current?.transitions.containsKey(anim.id) ?? false;
       final exitVid = current?.exitVideo(anim.id);
       if (exitVid != null) queue.add(exitVid);
@@ -278,11 +292,17 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _videoIndex = 0;
       _activeFactoryId = anim.id;
     });
+    if (_demoMode) {
+      setState(() => _status = '演示切换 ${anim.name}');
+      return;
+    }
     // Send switch command to device
     if (!_connected) return;
     setState(() => _status = '切换中...');
     try {
-      final result = await _invokeNative<dynamic>('switchToAsset', {'id': anim.id});
+      final result = await _invokeNative<dynamic>('switchToAsset', {
+        'id': anim.id,
+      });
       if (!mounted) return;
       if (result == true) {
         setState(() => _status = '已切换');
@@ -303,7 +323,88 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     );
   }
 
+  void _enterDemoMode() {
+    setState(() {
+      _demoMode = true;
+      _devices
+        ..clear()
+        ..add(
+          const BadgeDevice(
+            name: 'Demo ESP-BAJI',
+            address: '192.168.4.1',
+            rssi: -38,
+            serviceMatch: true,
+          ),
+        );
+      _connected = true;
+      _connecting = false;
+      _sdAvailable = true;
+      _connectedAddress = 'Demo ESP-BAJI';
+      _status = '审核演示模式';
+      _pageIndex = 1;
+    });
+    _showSnack('已进入演示模式');
+  }
+
+  void _exitDemoMode() {
+    setState(() {
+      _demoMode = false;
+      _connected = false;
+      _connecting = false;
+      _connectedAddress = null;
+      _sdAvailable = false;
+      _status = '未连接';
+      _devices.clear();
+    });
+    unawaited(_refreshConnectionState());
+  }
+
+  Future<void> _simulateDemoScan() async {
+    setState(() {
+      _scanning = true;
+      _status = '审核演示扫描';
+      _devices.clear();
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 450));
+    if (!mounted) return;
+    setState(() {
+      _scanning = false;
+      _devices.add(
+        const BadgeDevice(
+          name: 'Demo ESP-BAJI',
+          address: '192.168.4.1',
+          rssi: -38,
+          serviceMatch: true,
+        ),
+      );
+      _status = '已发现演示设备';
+    });
+  }
+
+  Future<Map<String, Object?>> _simulateDemoUpload(PreparedAsset asset) async {
+    setState(() {
+      _uploading = true;
+      _uploadProgress = 0.12;
+      _status = '演示上传中';
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    if (mounted) {
+      setState(() => _uploadProgress = 0.68);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    return {'assignedId': asset.reviewId ?? 'demo-approved'};
+  }
+
   Future<void> _refreshConnectionState() async {
+    if (_demoMode) {
+      setState(() {
+        _connected = true;
+        _sdAvailable = true;
+        _connectedAddress = 'Demo ESP-BAJI';
+        _status = '审核演示模式';
+      });
+      return;
+    }
     final result = await _invokeNative<Map<dynamic, dynamic>>(
       'connectionState',
     );
@@ -323,6 +424,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _scan() async {
+    if (_demoMode) {
+      await _simulateDemoScan();
+      return;
+    }
     setState(() {
       _devices.clear();
       _scanning = true;
@@ -337,6 +442,16 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _connect(BadgeDevice device) async {
+    if (_demoMode) {
+      setState(() {
+        _connected = true;
+        _connecting = false;
+        _sdAvailable = true;
+        _connectedAddress = device.address;
+        _status = '审核演示模式';
+      });
+      return;
+    }
     setState(() {
       _connecting = true;
       _status = '连接 ${device.name}';
@@ -350,6 +465,14 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _disconnect() async {
+    if (_demoMode) {
+      setState(() {
+        _connected = false;
+        _connectedAddress = null;
+        _status = '演示设备已断开';
+      });
+      return;
+    }
     await _invokeNative<void>('disconnect');
     await _refreshConnectionState();
   }
@@ -407,7 +530,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         {
           'uri': media.uri,
           'name': media.name,
-          'fps': 25,
+          'fps': 40,
           'maxPackageBytes': resolveBadgePackageBudget(
             sdAvailable: _sdAvailable,
           ),
@@ -421,7 +544,25 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         return;
       }
       final rawAsset = PreparedAsset.fromMap(_asStringMap(prepared));
-      final asset = rawAsset.copyWith(cropTransform: _cropTransform);
+      var asset = rawAsset.copyWith(cropTransform: _cropTransform);
+      var saveMessage = '素材已保存，已提交审核';
+      try {
+        setState(() => _status = '提交审核');
+        asset = await _submitAssetForReview(asset);
+        if (!mounted) {
+          return;
+        }
+        if (asset.reviewStatus == 'approved') {
+          saveMessage = '素材已保存，审核已通过';
+        } else if (asset.reviewStatus == 'rejected') {
+          saveMessage = '素材已保存，但审核未通过';
+        }
+      } catch (_) {
+        if (!mounted) {
+          return;
+        }
+        saveMessage = '素材已本地保存，联网后将重新提交审核';
+      }
       final entry = HistoryEntry.fromAsset(
         asset,
         cropTransform: _cropTransform,
@@ -436,8 +577,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         if (_history.length > 20) {
           _history.removeRange(20, _history.length);
         }
-        _status = '已保存';
+        _status = asset.reviewStatus == 'pending' ? '待审核' : '已保存';
       });
+      _showSnack(saveMessage);
       unawaited(_saveHistory());
     } on PlatformException catch (error) {
       setState(() {
@@ -454,16 +596,21 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       setState(() => _pageIndex = 0);
       return;
     }
+    final approvedAsset = await _ensureAssetApproved(asset);
+    if (!mounted || approvedAsset == null) {
+      return;
+    }
     setState(() {
       _uploading = true;
       _uploadProgress = 0;
       _status = '准备上传';
     });
     try {
-      final result = await _invokeNative<Map<dynamic, dynamic>>(
-        'uploadAsset',
-        {'assetPath': asset.assetPath},
-      );
+      final result = _demoMode
+          ? await _simulateDemoUpload(approvedAsset)
+          : await _invokeNative<Map<dynamic, dynamic>>('uploadAsset', {
+              'assetPath': approvedAsset.assetPath,
+            });
       if (!mounted) return;
       final assignedId = _readNullableString(result?['assignedId']);
       setState(() {
@@ -472,7 +619,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         _status = '已切换';
         // Store assigned device ID on the history entry
         for (var i = 0; i < _history.length; i++) {
-          if (_history[i].assetPath == asset.assetPath) {
+          if (_history[i].assetPath == approvedAsset.assetPath) {
             _history[i] = _history[i].copyWith(deviceId: assignedId);
             break;
           }
@@ -490,7 +637,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
 
   Future<void> _setBrightness(int value) async {
     setState(() => _brightness = value);
-    if (!_connected) {
+    if (!_connected || _demoMode) {
       return;
     }
     _brightnessTimer?.cancel();
@@ -505,6 +652,241 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     } on PlatformException catch (error) {
       _showSnack(error.message ?? error.code);
     }
+  }
+
+  Uri _backendUri(String path) {
+    final base = Uri.parse(_backendBaseUrl);
+    return base.resolve(path);
+  }
+
+  Future<Map<String, dynamic>?> _getBackendJson(String path) async {
+    final client = HttpClient();
+    try {
+      final request = await client.getUrl(_backendUri(path));
+      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      final response = await request.close();
+      final text = await response.transform(utf8.decoder).join();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(text, uri: _backendUri(path));
+      }
+      return _asStringMap(json.decode(text));
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<Map<String, dynamic>?> _postBackendJson(
+    String path,
+    Map<String, Object?> body,
+  ) async {
+    final client = HttpClient();
+    try {
+      final request = await client.postUrl(_backendUri(path));
+      request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      request.write(json.encode(body));
+      final response = await request.close();
+      final text = await response.transform(utf8.decoder).join();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(text, uri: _backendUri(path));
+      }
+      return _asStringMap(json.decode(text));
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  bool _isNewerVersion(String latest, String current) {
+    final latestParts = latest
+        .split('.')
+        .map((item) => int.tryParse(item) ?? 0)
+        .toList(growable: false);
+    final currentParts = current
+        .split('.')
+        .map((item) => int.tryParse(item) ?? 0)
+        .toList(growable: false);
+    for (
+      var index = 0;
+      index < math.max(latestParts.length, currentParts.length);
+      index++
+    ) {
+      final left = index < latestParts.length ? latestParts[index] : 0;
+      final right = index < currentParts.length ? currentParts[index] : 0;
+      if (left != right) {
+        return left > right;
+      }
+    }
+    return false;
+  }
+
+  Future<void> _checkRemoteVersion() async {
+    if (_checkingVersion) {
+      return;
+    }
+    _checkingVersion = true;
+    try {
+      final platform = Platform.isIOS ? 'ios' : 'android';
+      final manifest = await _getBackendJson(
+        '/api/version?platform=$platform&current=$_appVersion',
+      );
+      if (!mounted || manifest == null) {
+        return;
+      }
+      final latestVersion = _readNullableString(manifest['latestVersion']);
+      if (latestVersion != null &&
+          _isNewerVersion(latestVersion, _appVersion)) {
+        final force = manifest['force'] == true;
+        final storeUrl = _readNullableString(manifest['storeUrl']);
+        _showUpdateSnack(latestVersion, force: force, storeUrl: storeUrl);
+      }
+    } catch (_) {
+      // The app remains fully usable if the public server is temporarily offline.
+    } finally {
+      _checkingVersion = false;
+    }
+  }
+
+  Future<PreparedAsset> _submitAssetForReview(PreparedAsset asset) async {
+    final packageBytes = await File(asset.assetPath).readAsBytes();
+    String? previewBase64;
+    final reviewPreviewPath = _preferredReviewPreviewPath(asset);
+    if (reviewPreviewPath != null && File(reviewPreviewPath).existsSync()) {
+      previewBase64 = base64Encode(await File(reviewPreviewPath).readAsBytes());
+    }
+    final result = await _postBackendJson('/api/assets', {
+      'userId': Platform.isIOS ? 'ios-user' : 'android-user',
+      'name': asset.name,
+      'packageBase64': base64Encode(packageBytes),
+      'previewBase64': previewBase64,
+      'previewMime': _guessMimeFromPath(reviewPreviewPath),
+      'crc32': asset.crc32.toRadixString(16).padLeft(8, '0'),
+      'packageSize': asset.packageSize,
+      'frameCount': asset.frameCount,
+      'fps': asset.fps,
+    });
+    final reviewId = _readNullableString(result?['id']);
+    final reviewStatus = _readNullableString(result?['status']);
+    if (reviewStatus == null || reviewStatus == 'pending') {
+      return asset.copyWith(reviewId: reviewId, reviewStatus: 'pending');
+    }
+    return asset.copyWith(reviewId: reviewId, reviewStatus: reviewStatus);
+  }
+
+  Future<PreparedAsset> _refreshReviewStatus(PreparedAsset asset) async {
+    final reviewId = asset.reviewId;
+    if (reviewId == null) {
+      return asset;
+    }
+    final result = await _getBackendJson('/api/assets/$reviewId');
+    return asset.copyWith(
+      reviewStatus:
+          _readNullableString(result?['status']) ?? asset.reviewStatus,
+    );
+  }
+
+  String? _preferredReviewPreviewPath(PreparedAsset asset) {
+    if (_hasPreviewPath(asset.animatedPreviewPath)) {
+      return asset.animatedPreviewPath;
+    }
+    if (_hasPreviewPath(asset.previewPath)) {
+      return asset.previewPath;
+    }
+    return null;
+  }
+
+  Future<void> _refreshHistoryReviewStatuses() async {
+    if (_demoMode || _history.isEmpty) {
+      return;
+    }
+    final updates = <String, String>{};
+    for (final entry in _history) {
+      if (entry.reviewId == null ||
+          entry.reviewStatus == 'approved' ||
+          entry.reviewStatus == 'rejected') {
+        continue;
+      }
+      try {
+        final result = await _getBackendJson('/api/assets/${entry.reviewId}');
+        final status = _readNullableString(result?['status']);
+        if (status != null && status != entry.reviewStatus) {
+          updates[entry.reviewId!] = status;
+        }
+      } catch (_) {
+        // Keep local status if the review server is temporarily unavailable.
+      }
+    }
+    if (!mounted || updates.isEmpty) {
+      return;
+    }
+    setState(() {
+      for (var index = 0; index < _history.length; index++) {
+        final reviewId = _history[index].reviewId;
+        final status = reviewId == null ? null : updates[reviewId];
+        if (status != null) {
+          _history[index] = _history[index].copyWith(reviewStatus: status);
+        }
+      }
+    });
+    unawaited(_saveHistory());
+  }
+
+  void _rememberReviewedAsset(PreparedAsset asset) {
+    setState(() {
+      if (_asset?.assetPath == asset.assetPath) {
+        _asset = asset;
+      }
+      for (var index = 0; index < _history.length; index++) {
+        if (_history[index].assetPath == asset.assetPath) {
+          _history[index] = _history[index].copyWith(
+            reviewId: asset.reviewId,
+            reviewStatus: asset.reviewStatus,
+          );
+          break;
+        }
+      }
+    });
+    unawaited(_saveHistory());
+  }
+
+  Future<PreparedAsset?> _ensureAssetApproved(PreparedAsset asset) async {
+    if (_demoMode) {
+      return asset.copyWith(
+        reviewId: asset.reviewId ?? 'demo-approved',
+        reviewStatus: 'approved',
+      );
+    }
+    if (asset.reviewStatus == 'approved') {
+      return asset;
+    }
+    try {
+      PreparedAsset reviewed;
+      if (asset.reviewId == null) {
+        setState(() => _status = '提交审核');
+        reviewed = await _submitAssetForReview(asset);
+        if (!mounted) return null;
+        _rememberReviewedAsset(reviewed);
+        _showSnack('素材已提交审核，管理员审核通过后可上传');
+        return null;
+      }
+
+      setState(() => _status = '检查审核状态');
+      reviewed = await _refreshReviewStatus(asset);
+      if (!mounted) return null;
+      _rememberReviewedAsset(reviewed);
+      if (reviewed.reviewStatus == 'approved') {
+        return reviewed;
+      }
+      if (reviewed.reviewStatus == 'rejected') {
+        _showSnack('素材审核未通过，请更换内容');
+      } else {
+        _showSnack('素材仍在审核中');
+      }
+    } catch (_) {
+      if (mounted) {
+        _showSnack('审核服务暂时不可用，请稍后再试');
+      }
+    }
+    return null;
   }
 
   Future<T?> _invokeNative<T>(String method, [Object? arguments]) async {
@@ -534,7 +916,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         content: SingleChildScrollView(
           child: Text(
             'ESP Baji 不收集、出售或分享个人信息。\n\n'
-            '导入的图片、GIF 和视频只在本机处理，并仅在用户操作时通过本地 Wi-Fi 发送到已连接的 ESP 设备。'
+            '导入的图片、GIF 和视频会在本机处理。用户自定义素材在上传到 ESP 设备前，需要提交到 ESP Baji 服务器审核。'
+            '审核通过后，应用仅在用户操作时通过本地 Wi-Fi 发送到已连接的 ESP 设备。'
             '应用不会上传素材到第三方服务器，也不使用广告或分析 SDK。\n\n'
             '公开隐私政策链接：\n$_privacyPolicyUrl',
             style: const TextStyle(height: 1.45),
@@ -574,15 +957,41 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
     // If already uploaded, just switch to it
     if (entry.deviceId != null && _connected) {
+      final reviewed = await _ensureAssetApproved(
+        PreparedAsset(
+          assetPath: entry.assetPath,
+          previewPath: entry.previewPath,
+          animatedPreviewPath: entry.animatedPreviewPath,
+          sourceUri: entry.sourceUri,
+          mime: entry.mime,
+          name: entry.name,
+          packageSize: entry.packageSize,
+          frameCount: entry.frameCount,
+          fps: entry.fps,
+          crc32: entry.crc32,
+          cropScale: entry.cropScale,
+          cropOffsetX: entry.cropOffsetX,
+          cropOffsetY: entry.cropOffsetY,
+          reviewId: entry.reviewId,
+          reviewStatus: entry.reviewStatus,
+        ),
+      );
+      if (!mounted || reviewed == null) {
+        return;
+      }
       setState(() {
         _status = '切换中...';
         _selectedFactoryId = null;
       });
+      if (_demoMode) {
+        setState(() {
+          _status = '演示已切换';
+          _asset = reviewed;
+        });
+        return;
+      }
       try {
-        await _invokeNative<dynamic>(
-          'switchToAsset',
-          {'id': entry.deviceId},
-        );
+        await _invokeNative<dynamic>('switchToAsset', {'id': entry.deviceId});
         if (!mounted) return;
         setState(() {
           _status = '已切换';
@@ -597,6 +1006,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
             frameCount: entry.frameCount,
             fps: entry.fps,
             crc32: entry.crc32,
+            reviewId: entry.reviewId,
+            reviewStatus: entry.reviewStatus,
           );
         });
       } catch (e) {
@@ -620,13 +1031,16 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       cropScale: entry.cropScale,
       cropOffsetX: entry.cropOffsetX,
       cropOffsetY: entry.cropOffsetY,
+      reviewId: entry.reviewId,
+      reviewStatus: entry.reviewStatus,
     );
     setState(() {
       _media = null;
       _asset = asset;
       _pageIndex = 1;
       _status = '上传历史素材';
-      _selectedFactoryId = null; // clear factory selection when uploading user content
+      _selectedFactoryId =
+          null; // clear factory selection when uploading user content
     });
     await _uploadAsset(asset);
   }
@@ -701,6 +1115,42 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     );
   }
 
+  void _showUpdateSnack(
+    String latestVersion, {
+    required bool force,
+    required String? storeUrl,
+  }) {
+    if (!mounted) {
+      return;
+    }
+    final message = force ? '发现必须更新版本 $latestVersion' : '发现新版本 $latestVersion';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          message,
+          style: const TextStyle(
+            color: Colors.black,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        action: storeUrl == null
+            ? null
+            : SnackBarAction(
+                label: '更新',
+                textColor: Colors.black,
+                onPressed: () {
+                  unawaited(_invokeNative<void>('openUrl', {'url': storeUrl}));
+                },
+              ),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: Colors.white,
+        showCloseIcon: true,
+        closeIconColor: Colors.black,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final previewActive = _previewActive;
@@ -719,6 +1169,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onDisconnect: _disconnect,
         onBrightness: _setBrightness,
         onPrivacyPolicy: _showPrivacyPolicy,
+        demoMode: _demoMode,
+        onEnterDemoMode: _enterDemoMode,
+        onExitDemoMode: _exitDemoMode,
       ),
       _DisplayLibraryPage(
         active: previewActive && _pageIndex == 1,
@@ -795,9 +1248,7 @@ class _FloatingBottomNav extends StatelessWidget {
             decoration: BoxDecoration(
               color: const Color(0xff181818).withValues(alpha: 0.82),
               borderRadius: BorderRadius.circular(30),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.035),
-              ),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.035)),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withValues(alpha: 0.34),
@@ -934,9 +1385,9 @@ class _DisplayLibraryPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final selectedFactory = selectedFactoryId != null
         ? factoryAnims.cast<FactoryAnimation?>().firstWhere(
-              (a) => a?.id == selectedFactoryId,
-              orElse: () => null,
-            )
+            (a) => a?.id == selectedFactoryId,
+            orElse: () => null,
+          )
         : null;
     return Column(
       children: [
@@ -951,7 +1402,9 @@ class _DisplayLibraryPage extends StatelessWidget {
                     height: 8,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: connected ? const Color(0xff32d583) : const Color(0xffff5b5b),
+                      color: connected
+                          ? const Color(0xff32d583)
+                          : const Color(0xffff5b5b),
                     ),
                   ),
                 ],
@@ -962,13 +1415,18 @@ class _DisplayLibraryPage extends StatelessWidget {
                   active: active,
                   media: null,
                   asset: asset,
-                  factoryVideo: videoQueue.isNotEmpty && videoIndex < videoQueue.length
+                  factoryVideo:
+                      videoQueue.isNotEmpty && videoIndex < videoQueue.length
                       ? videoQueue[videoIndex]
                       : null,
-                  nextVideo: videoQueue.isNotEmpty && videoIndex + 1 < videoQueue.length
+                  nextVideo:
+                      videoQueue.isNotEmpty &&
+                          videoIndex + 1 < videoQueue.length
                       ? videoQueue[videoIndex + 1]
                       : null,
-                  onFactoryVideoDone: videoQueue.isNotEmpty ? onVideoDone : null,
+                  onFactoryVideoDone: videoQueue.isNotEmpty
+                      ? onVideoDone
+                      : null,
                   preparing: uploading,
                   progress: uploadProgress,
                 ),
@@ -1002,13 +1460,12 @@ class _DisplayLibraryPage extends StatelessWidget {
             child: GridView.builder(
               padding: const EdgeInsets.fromLTRB(18, 8, 18, 104),
               itemCount: factoryAnims.length + history.length,
-              gridDelegate:
-                  const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 3,
-                    mainAxisSpacing: 12,
-                    crossAxisSpacing: 12,
-                    childAspectRatio: 1,
-                  ),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                mainAxisSpacing: 12,
+                crossAxisSpacing: 12,
+                childAspectRatio: 1,
+              ),
               itemBuilder: (context, index) {
                 if (index < history.length) {
                   final entry = history[index];
@@ -1139,6 +1596,15 @@ class _MakerPage extends StatelessWidget {
                   ),
                 ],
               ),
+              const SizedBox(height: 8),
+              Text(
+                '素材需审核，请勿上传非法素材',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.white.withValues(alpha: 0.48),
+                  height: 1.25,
+                ),
+              ),
               if (preparing) ...[
                 const SizedBox(height: 16),
                 LinearProgressIndicator(
@@ -1172,6 +1638,9 @@ class _DevicePage extends StatelessWidget {
     required this.onDisconnect,
     required this.onBrightness,
     required this.onPrivacyPolicy,
+    required this.demoMode,
+    required this.onEnterDemoMode,
+    required this.onExitDemoMode,
   });
 
   final List<BadgeDevice> devices;
@@ -1187,6 +1656,9 @@ class _DevicePage extends StatelessWidget {
   final VoidCallback onDisconnect;
   final ValueChanged<int> onBrightness;
   final VoidCallback onPrivacyPolicy;
+  final bool demoMode;
+  final VoidCallback onEnterDemoMode;
+  final VoidCallback onExitDemoMode;
 
   @override
   Widget build(BuildContext context) {
@@ -1337,17 +1809,42 @@ class _DevicePage extends StatelessWidget {
           ),
         const SizedBox(height: 8),
         Center(
-          child: TextButton(
-            key: const ValueKey('privacy-policy-link'),
-            onPressed: onPrivacyPolicy,
-            style: TextButton.styleFrom(
-              foregroundColor: Colors.white.withValues(alpha: 0.46),
-              minimumSize: Size.zero,
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              textStyle: const TextStyle(fontSize: 12),
-            ),
-            child: const Text('隐私政策'),
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 10,
+            runSpacing: 6,
+            children: [
+              TextButton.icon(
+                onPressed: demoMode ? onExitDemoMode : onEnterDemoMode,
+                icon: Icon(demoMode ? Icons.visibility_off : Icons.visibility),
+                label: Text(demoMode ? '退出演示模式' : '审核演示'),
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white.withValues(alpha: 0.62),
+                  minimumSize: Size.zero,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  textStyle: const TextStyle(fontSize: 12),
+                ),
+              ),
+              TextButton(
+                key: const ValueKey('privacy-policy-link'),
+                onPressed: onPrivacyPolicy,
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white.withValues(alpha: 0.46),
+                  minimumSize: Size.zero,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  textStyle: const TextStyle(fontSize: 12),
+                ),
+                child: const Text('隐私政策'),
+              ),
+            ],
           ),
         ),
       ],
@@ -1373,6 +1870,8 @@ class _HistoryGridTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final previewPath = entry.previewPath ?? entry.animatedPreviewPath;
+    final overlayColor = _reviewOverlayColor(entry);
+    final reviewLabel = _reviewStatusLabel(entry);
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: BackdropFilter(
@@ -1393,13 +1892,47 @@ class _HistoryGridTile extends StatelessWidget {
               child: Padding(
                 padding: const EdgeInsets.all(8),
                 child: ClipOval(
-                  child: SizedBox.expand(
-                    child: _HistoryPreview(
-                      active: active,
-                      entry: entry,
-                      previewPath: previewPath,
-                      transform: entry.cropTransform,
-                    ),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      _HistoryPreview(
+                        active: active,
+                        entry: entry,
+                        previewPath: previewPath,
+                        transform: entry.cropTransform,
+                      ),
+                      if (overlayColor != null)
+                        ColoredBox(color: overlayColor),
+                      if (reviewLabel != null)
+                        Center(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.58),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.2),
+                              ),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 4,
+                              ),
+                              child: Text(
+                                reviewLabel,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 0,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ),
@@ -1965,21 +2498,32 @@ class _DualVideoPlayer extends StatefulWidget {
 }
 
 class _DualVideoPlayerState extends State<_DualVideoPlayer> {
-  VideoPlayerController? _active;   // currently displayed (always initialized)
+  VideoPlayerController? _active; // currently displayed (always initialized)
   VideoPlayerController? _preloaded; // next video ready to go
   String? _activePath;
   String? _preloadedPath;
   bool _done = false;
 
   @override
-  void initState() { super.initState(); _loadCurrent(); _maybePreload(); }
+  void initState() {
+    super.initState();
+    _loadCurrent();
+    _maybePreload();
+  }
 
   @override
   void didUpdateWidget(covariant _DualVideoPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.currentVideo != widget.currentVideo) { _done = false; _switchTo(widget.currentVideo); }
-    if (oldWidget.nextVideo != widget.nextVideo) { _maybePreload(); }
-    if (oldWidget.active != widget.active) { unawaited(_syncActive()); }
+    if (oldWidget.currentVideo != widget.currentVideo) {
+      _done = false;
+      _switchTo(widget.currentVideo);
+    }
+    if (oldWidget.nextVideo != widget.nextVideo) {
+      _maybePreload();
+    }
+    if (oldWidget.active != widget.active) {
+      unawaited(_syncActive());
+    }
   }
 
   void _maybePreload() {
@@ -1987,16 +2531,32 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
     if (nv == null || nv == _activePath || nv == _preloadedPath) return;
     _preloaded?.removeListener(_onUpdate);
     _preloaded?.dispose();
-    _preloaded = null; _preloadedPath = null;
+    _preloaded = null;
+    _preloadedPath = null;
     final c = VideoPlayerController.asset(nv);
-    _preloaded = c; _preloadedPath = nv;
-    c.initialize().then((_) {
-      if (!mounted || _preloaded != c) return;
-      c.setLooping(false); c.setVolume(0);
-    }).catchError((_) { c.dispose(); if (mounted && _preloaded == c) { _preloaded = null; _preloadedPath = null; } });
+    _preloaded = c;
+    _preloadedPath = nv;
+    c
+        .initialize()
+        .then((_) {
+          if (!mounted || _preloaded != c) return;
+          c.setLooping(false);
+          c.setVolume(0);
+        })
+        .catchError((_) {
+          c.dispose();
+          if (mounted && _preloaded == c) {
+            _preloaded = null;
+            _preloadedPath = null;
+          }
+        });
   }
 
-  Future<void> _loadCurrent() async { _done = false; await _activate(widget.currentVideo); _maybePreload(); }
+  Future<void> _loadCurrent() async {
+    _done = false;
+    await _activate(widget.currentVideo);
+    _maybePreload();
+  }
 
   Future<void> _switchTo(String path) async {
     if (_activePath == path && _active != null) return;
@@ -2004,8 +2564,10 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
     // If preloaded has this, instant swap
     if (_preloadedPath == path && _preloaded?.value.isInitialized == true) {
       final old = _active;
-      _active = _preloaded; _activePath = _preloadedPath;
-      _preloaded = old; _preloadedPath = null;
+      _active = _preloaded;
+      _activePath = _preloadedPath;
+      _preloaded = old;
+      _preloadedPath = null;
       _active?.removeListener(_onUpdate);
       _active?.addListener(_onUpdate);
       await _active!.seekTo(Duration.zero);
@@ -2025,12 +2587,18 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
     // Load new controller while keeping _active displayed
     final c = VideoPlayerController.asset(path);
     try {
-      await c.initialize(); await c.setLooping(false); await c.setVolume(0);
-      if (!mounted) { c.dispose(); return; }
+      await c.initialize();
+      await c.setLooping(false);
+      await c.setVolume(0);
+      if (!mounted) {
+        c.dispose();
+        return;
+      }
       c.addListener(_onUpdate);
       // Swap: new becomes active, old goes to disposal
       final old = _active;
-      _active = c; _activePath = path;
+      _active = c;
+      _activePath = path;
       if (mounted) setState(() {});
       await c.seekTo(Duration.zero);
       await c.play();
@@ -2050,24 +2618,44 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
 
   void _onUpdate() {
     if (_done || _active == null || !_active!.value.isInitialized) return;
-    if (_active!.value.position >= _active!.value.duration - const Duration(milliseconds: 100)) {
-      _done = true; widget.onDone?.call();
+    if (_active!.value.position >=
+        _active!.value.duration - const Duration(milliseconds: 100)) {
+      _done = true;
+      widget.onDone?.call();
     }
   }
 
   Future<void> _syncActive() async {
-    final c = _active; if (c == null || !c.value.isInitialized) return;
-    try { if (widget.active) { await c.play(); } else { await c.pause(); } } catch (_) {}
+    final c = _active;
+    if (c == null || !c.value.isInitialized) return;
+    try {
+      if (widget.active) {
+        await c.play();
+      } else {
+        await c.pause();
+      }
+    } catch (_) {}
   }
 
   @override
-  void deactivate() { final c = _active; if (c != null && c.value.isInitialized) unawaited(c.pause()); super.deactivate(); }
+  void deactivate() {
+    final c = _active;
+    if (c != null && c.value.isInitialized) unawaited(c.pause());
+    super.deactivate();
+  }
+
   @override
-  void activate() { super.activate(); unawaited(_syncActive()); }
+  void activate() {
+    super.activate();
+    unawaited(_syncActive());
+  }
+
   @override
   void dispose() {
-    _active?.removeListener(_onUpdate); _active?.dispose();
-    _preloaded?.removeListener(_onUpdate); _preloaded?.dispose();
+    _active?.removeListener(_onUpdate);
+    _active?.dispose();
+    _preloaded?.removeListener(_onUpdate);
+    _preloaded?.dispose();
     super.dispose();
   }
 
@@ -2075,7 +2663,14 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
   Widget build(BuildContext context) {
     final c = _active;
     if (c == null || !c.value.isInitialized) return const SizedBox.expand();
-    return FittedBox(fit: BoxFit.cover, child: SizedBox(width: c.value.size.width, height: c.value.size.height, child: VideoPlayer(c)));
+    return FittedBox(
+      fit: BoxFit.cover,
+      child: SizedBox(
+        width: c.value.size.width,
+        height: c.value.size.height,
+        child: VideoPlayer(c),
+      ),
+    );
   }
 }
 
@@ -2316,6 +2911,8 @@ class PreparedAsset {
     this.cropScale = 1,
     this.cropOffsetX = 0,
     this.cropOffsetY = 0,
+    this.reviewId,
+    this.reviewStatus = 'local',
   });
 
   factory PreparedAsset.fromMap(Map<String, dynamic> map) {
@@ -2333,6 +2930,8 @@ class PreparedAsset {
       cropScale: (map['cropScale'] as num?)?.toDouble() ?? 1,
       cropOffsetX: (map['cropOffsetX'] as num?)?.toDouble() ?? 0,
       cropOffsetY: (map['cropOffsetY'] as num?)?.toDouble() ?? 0,
+      reviewId: _readNullableString(map['reviewId']),
+      reviewStatus: (map['reviewStatus'] as String?) ?? 'local',
     );
   }
 
@@ -2349,10 +2948,14 @@ class PreparedAsset {
   final double cropScale;
   final double cropOffsetX;
   final double cropOffsetY;
+  final String? reviewId;
+  final String reviewStatus;
 
   PreparedAsset copyWith({
     CropTransform? cropTransform,
     String? animatedPreviewPath,
+    String? reviewId,
+    String? reviewStatus,
   }) {
     return PreparedAsset(
       assetPath: assetPath,
@@ -2368,6 +2971,8 @@ class PreparedAsset {
       cropScale: cropTransform?.scale ?? cropScale,
       cropOffsetX: cropTransform?.offset.dx ?? cropOffsetX,
       cropOffsetY: cropTransform?.offset.dy ?? cropOffsetY,
+      reviewId: reviewId ?? this.reviewId,
+      reviewStatus: reviewStatus ?? this.reviewStatus,
     );
   }
 
@@ -2377,7 +2982,6 @@ class PreparedAsset {
       offset: Offset(cropOffsetX, cropOffsetY),
     );
   }
-
 }
 
 class CropTransform {
@@ -2411,6 +3015,8 @@ class HistoryEntry {
     required this.cropOffsetX,
     required this.cropOffsetY,
     this.deviceId,
+    this.reviewId,
+    this.reviewStatus = 'local',
   });
 
   factory HistoryEntry.fromAsset(
@@ -2432,6 +3038,8 @@ class HistoryEntry {
       cropScale: cropTransform.scale,
       cropOffsetX: cropTransform.offset.dx,
       cropOffsetY: cropTransform.offset.dy,
+      reviewId: asset.reviewId,
+      reviewStatus: asset.reviewStatus,
     );
   }
 
@@ -2452,6 +3060,8 @@ class HistoryEntry {
       cropOffsetX: (map['cropOffsetX'] as num?)?.toDouble() ?? 0,
       cropOffsetY: (map['cropOffsetY'] as num?)?.toDouble() ?? 0,
       deviceId: _readNullableString(map['deviceId']),
+      reviewId: _readNullableString(map['reviewId']),
+      reviewStatus: (map['reviewStatus'] as String?) ?? 'local',
     );
   }
 
@@ -2472,6 +3082,8 @@ class HistoryEntry {
       'cropOffsetX': cropOffsetX,
       'cropOffsetY': cropOffsetY,
       if (deviceId != null) 'deviceId': deviceId,
+      if (reviewId != null) 'reviewId': reviewId,
+      'reviewStatus': reviewStatus,
     };
   }
 
@@ -2490,6 +3102,8 @@ class HistoryEntry {
   final double cropOffsetX;
   final double cropOffsetY;
   final String? deviceId;
+  final String? reviewId;
+  final String reviewStatus;
 
   CropTransform get cropTransform {
     return CropTransform(
@@ -2498,7 +3112,12 @@ class HistoryEntry {
     );
   }
 
-  HistoryEntry copyWith({String? animatedPreviewPath, String? deviceId}) {
+  HistoryEntry copyWith({
+    String? animatedPreviewPath,
+    String? deviceId,
+    String? reviewId,
+    String? reviewStatus,
+  }) {
     return HistoryEntry(
       assetPath: assetPath,
       previewPath: previewPath,
@@ -2515,6 +3134,8 @@ class HistoryEntry {
       cropOffsetX: cropOffsetX,
       cropOffsetY: cropOffsetY,
       deviceId: deviceId ?? this.deviceId,
+      reviewId: reviewId ?? this.reviewId,
+      reviewStatus: reviewStatus ?? this.reviewStatus,
     );
   }
 }
@@ -2552,6 +3173,26 @@ Color _connectionColor(bool connected) {
   return connected ? const Color(0xff32d583) : const Color(0xffff5b5b);
 }
 
+Color? _reviewOverlayColor(HistoryEntry entry) {
+  if (entry.reviewStatus == 'approved') {
+    return null;
+  }
+  if (entry.reviewStatus == 'rejected') {
+    return Colors.redAccent.withValues(alpha: 0.34);
+  }
+  return Colors.black.withValues(alpha: 0.48);
+}
+
+String? _reviewStatusLabel(HistoryEntry entry) {
+  if (entry.reviewStatus == 'approved') {
+    return null;
+  }
+  if (entry.reviewStatus == 'rejected') {
+    return '违规';
+  }
+  return '未审核';
+}
+
 String? _readNullableString(Object? value) {
   if (value is String && value.isNotEmpty && value != 'null') {
     return value;
@@ -2580,6 +3221,19 @@ Widget _blackPreviewFallback(
 
 bool _isVideoMime(String mime) => mime.toLowerCase().startsWith('video/');
 
+String? _guessMimeFromPath(String? path) {
+  if (path == null || path.isEmpty) {
+    return null;
+  }
+  final lower = path.toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  return 'application/octet-stream';
+}
+
 class FactoryAnimation {
   const FactoryAnimation({
     required this.id,
@@ -2604,8 +3258,9 @@ class FactoryAnimation {
       previewAsset: (map['previewAsset'] as String?) ?? '',
       firstVideo: _readNullableString(map['firstVideo']),
       secondVideo: _readNullableString(map['secondVideo']),
-      transitions: _asStringMap(map['transitions'])
-          .map((k, v) => MapEntry(k, v.toString())),
+      transitions: _asStringMap(
+        map['transitions'],
+      ).map((k, v) => MapEntry(k, v.toString())),
     );
   }
 
@@ -2636,7 +3291,9 @@ class _FactoryGridTile extends StatelessWidget {
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: Material(
-        color: selected ? Colors.white.withValues(alpha: 0.05) : Colors.transparent,
+        color: selected
+            ? Colors.white.withValues(alpha: 0.05)
+            : Colors.transparent,
         child: InkWell(
           onTap: onTap,
           borderRadius: BorderRadius.circular(8),

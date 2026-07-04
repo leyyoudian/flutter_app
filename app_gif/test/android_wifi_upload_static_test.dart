@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('Android Wi-Fi upload reuses the badge AP connection', () {
+  test('Android Wi-Fi upload reuses LAN or badge AP connection', () {
     final source = File(
       'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
     ).readAsStringSync();
@@ -13,14 +13,33 @@ void main() {
       isNot(contains('private fun publishKnownBadgeWifiDevice()')),
     );
     expect(source, isNot(contains('publishKnownBadgeWifiDevice()')));
-    expect(source, isNot(contains('"rssi" to 0')));
+    expect(source, contains('private fun publishLanBadgeScanResult()'));
+    expect(source, contains('"name" to "\$BADGE_DEVICE_NAME LAN"'));
+    expect(source, contains('"rssi" to 0'));
+    expect(
+      source,
+      contains('@Volatile private var activeBadgeHost = BADGE_AP_HOST'),
+    );
+    expect(
+      source,
+      contains(
+        'private fun badgeUrl(path: String, host: String = activeBadgeHost): String',
+      ),
+    );
+    expect(source, contains('private fun discoverBadgeOnLan('));
     expect(source, contains('private fun findExistingBadgeWifiNetwork('));
     expect(source, contains('private fun isBadgeWifiNetworkUsable('));
-    expect(source, contains('private fun isCachedBadgeWifiNetworkTransportUsable('));
+    expect(
+      source,
+      contains('private fun isCachedBadgeWifiNetworkTransportUsable('),
+    );
     expect(source, contains('private fun waitForBadgeStatus('));
     expect(source, contains('private fun isCachedBadgeWifiNetworkUsable('));
     expect(source, contains('private fun isStaleBadgeNetworkError('));
-    expect(source, contains('@Volatile private var badgeWifiManagedRequest = false'));
+    expect(
+      source,
+      contains('@Volatile private var badgeWifiManagedRequest = false'),
+    );
     expect(source, contains('ensureBadgeWifiNetwork(fastUpload = true)'));
     expect(source, contains('UPLOAD_NETWORK_READY_TIMEOUT_MS'));
     expect(source, contains('findExistingBadgeWifiNetwork(manager)?.let'));
@@ -53,13 +72,17 @@ void main() {
 
     expect(
       uploadSource.indexOf('acquireUploadWifiLock()'),
-      lessThan(uploadSource.indexOf('ensureBadgeWifiNetwork(fastUpload = true)')),
+      lessThan(
+        uploadSource.indexOf('ensureBadgeWifiNetwork(fastUpload = true)'),
+      ),
     );
     expect(
-      uploadSource.indexOf('uploadAssetOverHttp(network, packageInfo)'),
-      lessThan(uploadSource.indexOf('uploadAssetOverTcp(network, packageInfo)')),
+      uploadSource.indexOf('uploadAssetOverTcp(network, packageInfo)'),
+      lessThan(
+        uploadSource.indexOf('uploadAssetOverHttp(network, packageInfo)'),
+      ),
     );
-    expect(uploadSource, contains('if (isStaleBadgeNetworkError(httpError))'));
+    expect(uploadSource, contains('if (isStaleBadgeNetworkError(tcpError))'));
     expect(uploadSource, contains('if (isStaleBadgeNetworkError(error))'));
     expect(
       uploadSource,
@@ -76,9 +99,18 @@ void main() {
       contains('if (keepIfConnected && badgeWifiNetwork != null)'),
     );
     expect(source, contains('"已复用 \$BADGE_WIFI_SSID Wi-Fi"'));
-    expect(source, contains('message.contains("failed to connect", ignoreCase = true)'));
-    expect(source, contains('message.contains("timed out", ignoreCase = true)'));
-    expect(source, contains('message.contains("ENETUNREACH", ignoreCase = true)'));
+    expect(
+      source,
+      contains('message.contains("failed to connect", ignoreCase = true)'),
+    );
+    expect(
+      source,
+      contains('message.contains("timed out", ignoreCase = true)'),
+    );
+    expect(
+      source,
+      contains('message.contains("ENETUNREACH", ignoreCase = true)'),
+    );
     expect(source, isNot(contains('WebSocket')));
 
     final ensureStart = source.indexOf(
@@ -93,7 +125,9 @@ void main() {
     final ensureSource = source.substring(ensureStart, ensureEnd);
     expect(
       ensureSource,
-      contains('if (fastUpload && isCachedBadgeWifiNetworkTransportUsable(manager, network))'),
+      contains(
+        'reuseBadgeNetworkIfReachable(manager, activeNetwork, "已复用 \$BADGE_WIFI_SSID Wi-Fi")',
+      ),
     );
     expect(
       ensureSource,
@@ -101,14 +135,22 @@ void main() {
     );
     expect(
       ensureSource,
-      contains('val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)'),
+      contains(
+        'reuseBadgeNetworkIfReachable(manager, network, "已复用 \$BADGE_WIFI_SSID Wi-Fi")',
+      ),
     );
-    expect(ensureSource, contains('badgeSdAvailable = parseSdAvailable(status)'));
     expect(
       ensureSource,
-      contains('if (isCachedBadgeWifiNetworkUsable(manager, network))'),
+      contains(
+        'val status = waitForBadgeStatus(network, UPLOAD_NETWORK_READY_TIMEOUT_MS)',
+      ),
+    );
+    expect(
+      ensureSource,
+      contains('badgeSdAvailable = parseSdAvailable(status)'),
     );
     expect(ensureSource, contains('releaseBadgeWifi()'));
+    expect(ensureSource, contains('setActiveBadgeHost(BADGE_AP_HOST)'));
     expect(ensureSource, contains('badgeWifiManagedRequest = true'));
     expect(source, contains('connectedAddress = null'));
     expect(source, contains('badgeSdAvailable = false'));
@@ -126,9 +168,7 @@ void main() {
     final cachedSource = source.substring(cachedStart, cachedEnd);
     expect(
       cachedSource,
-      contains(
-        'requestBadgeText(network, BADGE_STATUS_URL, FAST_BADGE_STATUS_TIMEOUT_MS)',
-      ),
+      contains('return resolveBadgeOnNetwork(manager, network) != null'),
     );
     expect(
       cachedSource,
@@ -148,14 +188,21 @@ void main() {
       'android/app/src/main/kotlin/com/example/app_gif/UploadKeepAliveService.kt',
     );
     expect(serviceFile.existsSync(), isTrue);
-    final service = serviceFile.existsSync() ? serviceFile.readAsStringSync() : '';
-    final manifest = File('android/app/src/main/AndroidManifest.xml').readAsStringSync();
+    final service = serviceFile.existsSync()
+        ? serviceFile.readAsStringSync()
+        : '';
+    final manifest = File(
+      'android/app/src/main/AndroidManifest.xml',
+    ).readAsStringSync();
 
     expect(activity, contains('startUploadKeepAlive()'));
     expect(activity, contains('stopUploadKeepAlive()'));
     expect(activity, contains('UploadKeepAliveService::class.java'));
     expect(manifest, contains('android.permission.FOREGROUND_SERVICE'));
-    expect(manifest, contains('android.permission.FOREGROUND_SERVICE_DATA_SYNC'));
+    expect(
+      manifest,
+      contains('android.permission.FOREGROUND_SERVICE_DATA_SYNC'),
+    );
     expect(manifest, contains('android:name=".UploadKeepAliveService"'));
     expect(manifest, contains('android:foregroundServiceType="dataSync"'));
     expect(service, contains('startForeground('));
@@ -163,35 +210,49 @@ void main() {
     expect(service, contains('NotificationChannel'));
   });
 
-  test('Android TCP fallback waits for firmware READY before streaming payload', () {
-    final source = File(
-      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
-    ).readAsStringSync();
+  test(
+    'Android TCP fallback waits for firmware READY before streaming payload',
+    () {
+      final source = File(
+        'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+      ).readAsStringSync();
 
-    final tcpStart = source.indexOf('    private fun uploadAssetOverTcp');
-    final tcpEnd = source.indexOf('    private fun uploadAssetOverHttp', tcpStart);
-    expect(tcpStart, isNot(-1));
-    expect(tcpEnd, isNot(-1));
-    final tcpSource = source.substring(tcpStart, tcpEnd);
+      final tcpStart = source.indexOf('    private fun uploadAssetOverTcp');
+      final tcpEnd = source.indexOf(
+        '    private fun uploadAssetOverHttp',
+        tcpStart,
+      );
+      expect(tcpStart, isNot(-1));
+      expect(tcpEnd, isNot(-1));
+      final tcpSource = source.substring(tcpStart, tcpEnd);
 
-    expect(tcpSource, contains('UPLOAD_TCP_CONNECT_TIMEOUT_MS'));
-    expect(tcpSource, contains('UPLOAD_READY_TIMEOUT_MS'));
-    expect(tcpSource, contains('output.flush()'));
-    expect(tcpSource, contains('val ready = reader.readLine().orEmpty()'));
-    expect(tcpSource, contains('!ready.startsWith("READY")'));
-    expect(
-      tcpSource.indexOf('val ready = reader.readLine().orEmpty()'),
-      lessThan(tcpSource.indexOf('streamPackageToOutput(packageInfo, output, "TCP上传")')),
-    );
-    expect(
-      tcpSource.indexOf('active.soTimeout = UPLOAD_READY_TIMEOUT_MS'),
-      lessThan(tcpSource.indexOf('val ready = reader.readLine().orEmpty()')),
-    );
-    expect(
-      tcpSource.indexOf('active.soTimeout = HTTP_READ_TIMEOUT_MS'),
-      lessThan(tcpSource.indexOf('streamPackageToOutput(packageInfo, output, "TCP上传")')),
-    );
-  });
+      expect(tcpSource, contains('UPLOAD_TCP_CONNECT_TIMEOUT_MS'));
+      expect(tcpSource, contains('UPLOAD_READY_TIMEOUT_MS'));
+      expect(tcpSource, contains('sockOut.flush()'));
+      expect(tcpSource, contains('val ready = reader.readLine().orEmpty()'));
+      expect(tcpSource, contains('!ready.startsWith("READY")'));
+      expect(
+        tcpSource.indexOf('val ready = reader.readLine().orEmpty()'),
+        lessThan(
+          tcpSource.indexOf(
+            'streamPackageToOutput(packageInfo, sockOut, "TCP上传")',
+          ),
+        ),
+      );
+      expect(
+        tcpSource.indexOf('active.soTimeout = UPLOAD_READY_TIMEOUT_MS'),
+        lessThan(tcpSource.indexOf('val ready = reader.readLine().orEmpty()')),
+      );
+      expect(
+        tcpSource.indexOf('active.soTimeout = HTTP_READ_TIMEOUT_MS'),
+        lessThan(
+          tcpSource.indexOf(
+            'streamPackageToOutput(packageInfo, sockOut, "TCP上传")',
+          ),
+        ),
+      );
+    },
+  );
 
   test('Android upload streams packages from disk without whole-file buffers', () {
     final source = File(
@@ -218,7 +279,10 @@ void main() {
     );
     expect(source, contains('private fun streamPackageToOutput('));
     expect(source, contains('FileInputStream(packageInfo.file).use'));
-    expect(source, contains('private const val UPLOAD_IO_CHUNK_BYTES = 256 * 1024'));
+    expect(
+      source,
+      contains('private const val UPLOAD_IO_CHUNK_BYTES = 256 * 1024'),
+    );
     expect(
       source,
       contains(
@@ -235,14 +299,33 @@ void main() {
     final httpStart = source.indexOf(
       '    private fun uploadAssetOverHttp(network: Network, packageInfo: UploadPackageInfo)',
     );
-    final httpEnd = source.indexOf('    private fun streamPackageToOutput', httpStart);
+    final httpEnd = source.indexOf(
+      '    private fun streamPackageToOutput',
+      httpStart,
+    );
     expect(httpStart, isNot(-1));
     expect(httpEnd, isNot(-1));
     final httpSource = source.substring(httpStart, httpEnd);
-    expect(httpSource, contains('network.openConnection(url) as HttpURLConnection'));
-    expect(httpSource, contains('connection.setFixedLengthStreamingMode(packageInfo.size.toInt())'));
-    expect(httpSource, contains('BufferedOutputStream(connection.outputStream, UPLOAD_IO_CHUNK_BYTES)'));
-    expect(httpSource, isNot(contains('network.socketFactory.createSocket() as Socket')));
+    expect(
+      httpSource,
+      contains('network.openConnection(url) as HttpURLConnection'),
+    );
+    expect(
+      httpSource,
+      contains(
+        'connection.setFixedLengthStreamingMode(packageInfo.size.toInt())',
+      ),
+    );
+    expect(
+      httpSource,
+      contains(
+        'BufferedOutputStream(connection.outputStream, UPLOAD_IO_CHUNK_BYTES)',
+      ),
+    );
+    expect(
+      httpSource,
+      isNot(contains('network.socketFactory.createSocket() as Socket')),
+    );
     expect(httpSource, isNot(contains('"POST /upload HTTP/1.1\\r\\n"')));
   });
 

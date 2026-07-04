@@ -27,6 +27,8 @@ void main() {
     expect(source, contains('case "saveHistory"'));
     expect(source, contains('case "deleteAssetFiles"'));
     expect(source, contains('case "openUrl"'));
+    expect(source, contains('case "requestUserId"'));
+    expect(source, contains('private func requestNewUserId(result: @escaping FlutterResult)'));
     expect(source, contains('UIApplication.shared.open'));
     expect(source, contains('private func assetRootDirectory'));
     expect(source, contains('private func deleteAssetFiles'));
@@ -42,7 +44,11 @@ void main() {
     expect(source, contains('codecIndexedRepeat = 0x12'));
     expect(source, contains('videoPreviewGifSize = 192'));
     expect(source, contains('videoPreviewGifFps = 30'));
-    expect(source, contains('qualityStreamBytesPerSecond = 7 * 512 * 1024'));
+    expect(source, contains('qualityStreamBytesPerSecond = 10 * 512 * 1024'));
+    expect(source, contains('playbackStreamBytesPerSecond = 10 * 512 * 1024'));
+    expect(source, contains('uploadChunkBytes = 256 * 1024'));
+    expect(source, contains('beginBackgroundTask'));
+    expect(source, contains('endBackgroundTask'));
     expect(plist, contains('NSLocalNetworkUsageDescription'));
     expect(plist, contains('NSAppTransportSecurity'));
     expect(plist, contains('CFBundleDisplayName'));
@@ -129,8 +135,8 @@ void main() {
     final tcpSource = source.substring(tcpStart, tcpEnd);
 
     expect(
-      uploadSource.indexOf('try self.uploadAssetOverHttp(package: package)'),
-      lessThan(uploadSource.indexOf('try self.uploadAssetOverTcp(package: package)')),
+      uploadSource.indexOf('try self.uploadAssetOverTcp(package: package)'),
+      lessThan(uploadSource.indexOf('try self.uploadAssetOverHttp(package: package)')),
     );
     expect(source, contains('private struct UploadPackageInfo'));
     expect(source, contains('private func preparePackageForUpload(fileURL: URL) throws -> UploadPackageInfo'));

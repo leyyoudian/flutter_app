@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "animation_comd"
 OUT_DIR = ROOT / "animation_sd"
 
-FPS = 30
+FPS = 40
 WIDTH = 480
 HEIGHT = 480
 ZOOM = 1.1  # default scale-up factor

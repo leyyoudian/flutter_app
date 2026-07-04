@@ -2,6 +2,7 @@ import AVFoundation
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import Darwin
 import Flutter
 import ImageIO
 import Network
@@ -15,8 +16,10 @@ import UIKit
   private var pendingPickResult: FlutterResult?
   private var activeUpload: NWConnection?
   private var connectedAddress: String?
+  private var activeBadgeHost = BadgeConstants.badgeApHost
   private var sdAvailable = false
   private var isUploading = false
+  private var uploadBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
   override func application(
     _ application: UIApplication,
@@ -43,9 +46,10 @@ import UIKit
       startScan()
       result(nil)
     case "connect":
-      connect(result: result)
+      connect(address: args["address"] as? String, result: result)
     case "disconnect":
       connectedAddress = nil
+      activeBadgeHost = BadgeConstants.badgeApHost
       sdAvailable = false
       activeUpload?.cancel()
       activeUpload = nil
@@ -70,7 +74,7 @@ import UIKit
         return
       }
       let name = args["name"] as? String ?? "asset"
-      let fps = min(60, max(1, args["fps"] as? Int ?? 30))
+      let fps = min(60, max(1, args["fps"] as? Int ?? 40))
       let maxPackageBytes = max(
         args["maxPackageBytes"] as? Int ?? BadgeConstants.sdStreamBudgetBytes,
         BadgeConstants.headerSize + BadgeConstants.frameEntrySize + BadgeConstants.paletteBytes + BadgeConstants.stream240Pixels
@@ -119,6 +123,8 @@ import UIKit
           result(FlutterError(code: "open_url_failed", message: "无法打开链接", details: nil))
         }
       }
+    case "requestUserId":
+      requestNewUserId(result: result)
     case "getFactoryAnimations":
       result([
         ["id": "F001", "name": "F001", "previewAsset": "assets/factory_previews/F001.png"],
@@ -141,21 +147,26 @@ import UIKit
     sendEvent([
       "type": "scanResult",
       "device": [
-        "address": BadgeConstants.badgeHost,
+        "address": BadgeConstants.badgeApHost,
         "name": BadgeConstants.badgeDeviceName,
         "rssi": -30,
         "serviceMatch": true,
       ],
     ])
+    publishLanBadgeScanResult()
     sendEvent(["type": "scanState", "scanning": false])
   }
 
-  private func connect(result: @escaping FlutterResult) {
+  private func connect(address: String?, result: @escaping FlutterResult) {
     DispatchQueue.global(qos: .userInitiated).async {
+      if let address, self.isIpv4Address(address) {
+        self.setActiveBadgeHost(address)
+      } else {
+        self.setActiveBadgeHost(BadgeConstants.badgeApHost)
+      }
       do {
-        _ = try self.requestText(BadgeConstants.badgeStatusUrl, timeout: BadgeConstants.statusTimeout)
-        self.connectedAddress = BadgeConstants.badgeHost
-        self.sdAvailable = true
+        let status = try self.resolveBadgeStatus()
+        self.rememberDiscoveredBadge(DiscoveredBadge(host: self.activeBadgeHost, status: status))
         self.sendConnectionEvent(connected: true, connecting: false, message: "已连接")
         DispatchQueue.main.async { result(nil) }
       } catch {
@@ -185,7 +196,7 @@ import UIKit
       var message = "未连接"
       if self.connectedAddress != nil {
         do {
-          let status = try self.requestText(BadgeConstants.badgeStatusUrl, timeout: BadgeConstants.statusTimeout)
+          let status = try self.requestText(self.badgeUrl("/status"), timeout: BadgeConstants.statusTimeout)
           self.sdAvailable = self.parseSdAvailable(status)
           connected = true
           message = "已连接"
@@ -194,6 +205,10 @@ import UIKit
           self.sdAvailable = false
           message = "断开连接"
         }
+      } else if let discovered = self.discoverBadgeOnLan() {
+        self.rememberDiscoveredBadge(discovered)
+        connected = true
+        message = "已发现局域网设备"
       }
       DispatchQueue.main.async {
         result([
@@ -210,7 +225,7 @@ import UIKit
   private func setBrightness(_ value: Int, result: @escaping FlutterResult) {
     DispatchQueue.global(qos: .utility).async {
       do {
-        _ = try self.requestText("\(BadgeConstants.badgeBrightnessUrl)?value=\(value)", timeout: BadgeConstants.statusTimeout)
+        _ = try self.requestText("\(self.badgeUrl("/brightness"))?value=\(value)", timeout: BadgeConstants.statusTimeout)
         DispatchQueue.main.async { result(nil) }
       } catch {
         DispatchQueue.main.async {
@@ -218,6 +233,179 @@ import UIKit
         }
       }
     }
+  }
+
+  private func badgeUrl(_ path: String, host: String? = nil) -> String {
+    let targetHost = host ?? activeBadgeHost
+    let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+    return "http://\(targetHost)\(normalizedPath)"
+  }
+
+  private func setActiveBadgeHost(_ host: String) {
+    activeBadgeHost = isIpv4Address(host) ? host : BadgeConstants.badgeApHost
+  }
+
+  private func isIpv4Address(_ value: String) -> Bool {
+    let parts = value.split(separator: ".")
+    guard parts.count == 4 else { return false }
+    return parts.allSatisfy { part in
+      guard !part.isEmpty, part.count <= 3, let number = Int(part) else { return false }
+      return number >= 0 && number <= 255
+    }
+  }
+
+  private func isBadgeStatusText(_ status: String) -> Bool {
+    let normalized = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else { return false }
+    return (normalized.hasPrefix("idle ") || normalized.hasPrefix("upload ")) &&
+      normalized.contains("storage=") &&
+      normalized.contains("sd=") &&
+      normalized.contains("format=")
+  }
+
+  private func rememberDiscoveredBadge(_ discovered: DiscoveredBadge) {
+    setActiveBadgeHost(discovered.host)
+    sdAvailable = parseSdAvailable(discovered.status)
+    connectedAddress = activeBadgeHost
+  }
+
+  private func resolveBadgeStatus() throws -> String {
+    if let discovered = probeBadgeHost(activeBadgeHost) {
+      setActiveBadgeHost(discovered.host)
+      return discovered.status
+    }
+    if activeBadgeHost != BadgeConstants.badgeApHost,
+       let discovered = probeBadgeHost(BadgeConstants.badgeApHost) {
+      setActiveBadgeHost(discovered.host)
+      return discovered.status
+    }
+    if let discovered = discoverBadgeOnLan() {
+      setActiveBadgeHost(discovered.host)
+      return discovered.status
+    }
+    throw BadgeError.message("请先连接 ESP-BAJI Wi-Fi，或让手机和设备在同一 Wi-Fi 下")
+  }
+
+  private func publishLanBadgeScanResult() {
+    DispatchQueue.global(qos: .utility).async {
+      guard let discovered = self.discoverBadgeOnLan() else { return }
+      self.setActiveBadgeHost(discovered.host)
+      self.sdAvailable = self.parseSdAvailable(discovered.status)
+      self.sendEvent([
+        "type": "scanResult",
+        "device": [
+          "address": discovered.host,
+          "name": "\(BadgeConstants.badgeDeviceName) LAN",
+          "rssi": 0,
+          "serviceMatch": true,
+        ],
+      ])
+      self.sendEvent(["type": "status", "message": "已发现局域网设备 \(discovered.host)"])
+    }
+  }
+
+  private func discoverBadgeOnLan() -> DiscoveredBadge? {
+    let candidates = lanScanCandidates()
+    guard !candidates.isEmpty else { return nil }
+
+    let queue = OperationQueue()
+    queue.maxConcurrentOperationCount = BadgeConstants.lanDiscoveryConcurrency
+    let lock = NSLock()
+    var found: DiscoveredBadge?
+
+    for host in candidates.prefix(BadgeConstants.lanDiscoveryMaxCandidates) {
+      queue.addOperation {
+        lock.lock()
+        let alreadyFound = found != nil
+        lock.unlock()
+        if alreadyFound || queue.isSuspended { return }
+
+        if let discovered = self.probeBadgeHost(host) {
+          lock.lock()
+          if found == nil {
+            found = discovered
+            queue.cancelAllOperations()
+          }
+          lock.unlock()
+        }
+      }
+    }
+    queue.waitUntilAllOperationsAreFinished()
+    return found
+  }
+
+  private func probeBadgeHost(_ host: String) -> DiscoveredBadge? {
+    guard isIpv4Address(host) else { return nil }
+    guard
+      let status = try? requestText(
+        badgeUrl("/status", host: host),
+        timeout: BadgeConstants.lanDiscoveryProbeTimeout,
+        timeoutGrace: BadgeConstants.lanDiscoveryTimeoutGrace
+      ),
+      isBadgeStatusText(status)
+    else {
+      return nil
+    }
+    return DiscoveredBadge(host: host, status: status)
+  }
+
+  private func lanScanCandidates() -> [String] {
+    var candidates: [String] = []
+    var seen = Set<String>()
+
+    func add(_ host: String) {
+      guard isIpv4Address(host), !seen.contains(host) else { return }
+      seen.insert(host)
+      candidates.append(host)
+    }
+
+    add(activeBadgeHost)
+    add(BadgeConstants.badgeApHost)
+
+    let localAddresses = localIPv4Addresses()
+    for address in localAddresses {
+      let parts = address.split(separator: ".")
+      guard parts.count == 4 else { continue }
+      let prefix = parts.prefix(3).joined(separator: ".")
+      for last in 1...254 {
+        let host = "\(prefix).\(last)"
+        if host != address {
+          add(host)
+        }
+      }
+    }
+    return candidates
+  }
+
+  private func localIPv4Addresses() -> [String] {
+    var output: [String] = []
+    var interfaces: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&interfaces) == 0, let first = interfaces else { return output }
+    defer { freeifaddrs(first) }
+
+    var cursor: UnsafeMutablePointer<ifaddrs>? = first
+    while let item = cursor {
+      defer { cursor = item.pointee.ifa_next }
+      guard let address = item.pointee.ifa_addr else { continue }
+      let family = address.pointee.sa_family
+      let flags = Int32(item.pointee.ifa_flags)
+      guard family == UInt8(AF_INET), (flags & IFF_LOOPBACK) == 0 else { continue }
+
+      var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+      let result = getnameinfo(
+        address,
+        socklen_t(MemoryLayout<sockaddr_in>.size),
+        &host,
+        socklen_t(host.count),
+        nil,
+        0,
+        NI_NUMERICHOST
+      )
+      if result == 0 {
+        output.append(String(cString: host))
+      }
+    }
+    return output
   }
 
   private func pickMedia(result: @escaping FlutterResult) {
@@ -452,8 +640,12 @@ import UIKit
 
   private func uploadAsset(assetPath: String, result: @escaping FlutterResult) {
     DispatchQueue.global(qos: .userInitiated).async {
+      self.beginUploadBackgroundTask()
       self.isUploading = true
-      defer { self.isUploading = false }
+      defer {
+        self.isUploading = false
+        self.endUploadBackgroundTask()
+      }
       do {
         let package = try self.preparePackageForUpload(fileURL: URL(fileURLWithPath: assetPath))
         var assignedId: String?
@@ -471,6 +663,32 @@ import UIKit
           result(FlutterError(code: "upload_failed", message: error.localizedDescription, details: nil))
         }
       }
+    }
+  }
+
+  private func beginUploadBackgroundTask() {
+    performOnMainSync {
+      guard uploadBackgroundTask == .invalid else { return }
+      uploadBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "ESP BAJI Upload") { [weak self] in
+        self?.endUploadBackgroundTask()
+      }
+    }
+  }
+
+  private func endUploadBackgroundTask() {
+    performOnMainSync {
+      guard uploadBackgroundTask != .invalid else { return }
+      let task = uploadBackgroundTask
+      uploadBackgroundTask = .invalid
+      UIApplication.shared.endBackgroundTask(task)
+    }
+  }
+
+  private func performOnMainSync(_ block: () -> Void) {
+    if Thread.isMainThread {
+      block()
+    } else {
+      DispatchQueue.main.sync(execute: block)
     }
   }
 
@@ -500,12 +718,32 @@ import UIKit
     }
   }
 
+  private func requestNewUserId(result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let response = try self.sendSwitchCommand(id: "NEWID")
+        if response.hasPrefix("OK ") {
+          let newId = response
+            .dropFirst(3)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+          DispatchQueue.main.async { result(newId) }
+        } else {
+          throw BadgeError.message(response.isEmpty ? "获取素材 ID 失败" : response)
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "id_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
   private func sendSwitchCommand(id: String) throws -> String {
     let semaphore = DispatchSemaphore(value: 0)
     var responseData = Data()
     var failure: Error?
     let connection = NWConnection(
-      host: NWEndpoint.Host(BadgeConstants.badgeHost),
+      host: NWEndpoint.Host(activeBadgeHost),
       port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
       using: .tcp
     )
@@ -551,7 +789,7 @@ import UIKit
     var failure: Error?
     var assignedId: String?
     let connection = NWConnection(
-      host: NWEndpoint.Host(BadgeConstants.badgeHost),
+      host: NWEndpoint.Host(activeBadgeHost),
       port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
       using: .tcp
     )
@@ -624,7 +862,7 @@ import UIKit
   }
 
   private func uploadAssetOverHttp(package: UploadPackageInfo) throws {
-    var request = URLRequest(url: URL(string: BadgeConstants.badgeUploadUrl)!)
+    var request = URLRequest(url: URL(string: badgeUrl("/upload"))!)
     request.httpMethod = "POST"
     request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
     request.setValue(String(format: "%08x", package.crc), forHTTPHeaderField: "X-EBAJ-CRC32")
@@ -707,14 +945,18 @@ import UIKit
     sendNextChunk()
   }
 
-  private func requestText(_ urlText: String, timeout: TimeInterval) throws -> String {
+  private func requestText(
+    _ urlText: String,
+    timeout: TimeInterval,
+    timeoutGrace: TimeInterval = 2
+  ) throws -> String {
     guard let url = URL(string: urlText) else { throw BadgeError.message("URL错误") }
     var request = URLRequest(url: url)
     request.timeoutInterval = timeout
     let semaphore = DispatchSemaphore(value: 0)
     var output = ""
     var failure: Error?
-    URLSession.shared.dataTask(with: request) { data, response, error in
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
       if let error = error {
         failure = error
       } else if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
@@ -723,8 +965,10 @@ import UIKit
         output = String(data: data, encoding: .utf8) ?? ""
       }
       semaphore.signal()
-    }.resume()
-    if semaphore.wait(timeout: .now() + timeout + 2) == .timedOut {
+    }
+    task.resume()
+    if semaphore.wait(timeout: .now() + timeout + timeoutGrace) == .timedOut {
+      task.cancel()
       throw BadgeError.message("请求超时")
     }
     if let failure = failure { throw failure }
@@ -1561,16 +1805,17 @@ private final class EbajEncoder {
 
 private enum BadgeConstants {
   static let channel = "esp_baji/native"
-  static let badgeDeviceName = "ESP-BAJI"
-  static let badgeHost = "192.168.4.1"
+  static let badgeDeviceName = "ESP-DotLoop"
+  static let badgeApHost = "192.168.4.1"
   static let badgeUploadTcpPort = 3333
   static let badgeTcpUploadMagic: UInt32 = 0x31505542
-  static let badgeUploadUrl = "http://192.168.4.1/upload"
-  static let badgeStatusUrl = "http://192.168.4.1/status"
-  static let badgeBrightnessUrl = "http://192.168.4.1/brightness"
   static let statusTimeout: TimeInterval = 2.5
+  static let lanDiscoveryProbeTimeout: TimeInterval = 0.45
+  static let lanDiscoveryTimeoutGrace: TimeInterval = 0.15
+  static let lanDiscoveryConcurrency = 32
+  static let lanDiscoveryMaxCandidates = 260
   static let uploadTimeoutSeconds = 180
-  static let uploadChunkBytes = 64 * 1024
+  static let uploadChunkBytes = 256 * 1024
   static let uploadProgressStepBytes = 512 * 1024
   static let sdStreamBudgetBytes = 512 * 1024 * 1024
   static let assetTooLargeMessage = "转换后的设备包超过当前素材存储空间，请换短一点的素材。"
@@ -1579,8 +1824,8 @@ private enum BadgeConstants {
   static let width = 480
   static let height = 480
   static let minDeviceFps = 25
-  static let deviceFps = 25
-  static let maxDeviceFps = 30
+  static let deviceFps = 40
+  static let maxDeviceFps = 40
   static let previewSize = 320
   static let videoPreviewGifSize = 192
   static let videoPreviewGifFps = 30
@@ -1629,6 +1874,11 @@ private struct UploadPackageInfo {
   let fileURL: URL
   let size: Int
   let crc: UInt32
+}
+
+private struct DiscoveredBadge {
+  let host: String
+  let status: String
 }
 
 private struct StreamEstimate {

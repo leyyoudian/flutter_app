@@ -1,0 +1,9 @@
+{
+    "esp32s3":  {
+                    "hardware":  "esp32s3",
+                    "version":  "0.1.4",
+                    "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.4.bin",
+                    "sha256":  "0f55a8cb27d241307b8df64cfcf5f2e859024b0cf758fc42e5d5c394b30565a0",
+                    "notes":  "固件版本 0.1.4，公网 80 端口 OTA"
+                }
+}

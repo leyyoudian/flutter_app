@@ -142,5 +142,21 @@
     "firstVideo": "assets/factory_previews/F018_first.mp4",
     "secondVideo": "assets/factory_previews/F018_second.mp4",
     "transitions": {}
+  },
+  {
+    "id": "F019",
+    "name": "F019",
+    "previewAsset": "assets/factory_previews/F019.png",
+    "firstVideo": "assets/factory_previews/F019_first.mp4",
+    "secondVideo": "assets/factory_previews/F019_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F020",
+    "name": "F020",
+    "previewAsset": "assets/factory_previews/F020.png",
+    "firstVideo": "assets/factory_previews/F020_first.mp4",
+    "secondVideo": "assets/factory_previews/F020_second.mp4",
+    "transitions": {}
   }
 ]

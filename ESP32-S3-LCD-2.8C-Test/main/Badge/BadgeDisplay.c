@@ -26,10 +26,10 @@
 #define BADGE_STOPPED_BIT BIT1
 #define BADGE_PAUSE_BIT BIT2
 #define BADGE_PLAYER_STACK 10240u
-#define BADGE_PLAYER_PRIORITY 4u
+#define BADGE_PLAYER_PRIORITY 6u
 #define BADGE_STATUS_PERIOD_MS 250u
 #define BADGE_FB_COUNT 3u
-#define BADGE_STREAM_PREFILL_FRAMES 16u
+#define BADGE_STREAM_PREFILL_FRAMES 8u
 #define BADGE_FPS_OVERLAY_ENABLED 0u
 #define BADGE_STATIC_LCD_TEST 0u
 #define BADGE_FRAME_FLAG_LZ4 0x80u
@@ -500,10 +500,8 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
     /* Second-half: notify anim mgr to trigger pending switch */
     if (entry_mode == BADGE_PLAY_MODE_SECOND_HALF) {
         ESP_LOGI(TAG, "second_half finished, notifying anim mgr");
-        xEventGroupClearBits(s_events, BADGE_RELOAD_BIT);
         badge_anim_mgr_notify_finished();
-        /* If notify didn't queue a new animation, freeze.
-           Otherwise RELOAD_BIT was set and player will play the new asset. */
+        /* If notify didn't queue a new animation AND no interrupt switch occurred, freeze. */
         if ((xEventGroupGetBits(s_events) & BADGE_RELOAD_BIT) == 0) {
             ESP_LOGI(TAG, "second_half finished, no pending switch, freezing");
             xEventGroupSetBits(s_events, BADGE_STOPPED_BIT);
@@ -597,7 +595,7 @@ void badge_display_request_reload(void)
     }
 }
 
-esp_err_t badge_display_enter_upload_mode(TickType_t timeout_ticks)
+static esp_err_t pause_player_task(TickType_t timeout_ticks)
 {
     if (s_events == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -607,6 +605,16 @@ esp_err_t badge_display_enter_upload_mode(TickType_t timeout_ticks)
     EventBits_t bits = xEventGroupWaitBits(s_events, BADGE_STOPPED_BIT, pdFALSE, pdTRUE, timeout_ticks);
     if ((bits & BADGE_STOPPED_BIT) == 0) {
         return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t badge_display_enter_upload_mode(TickType_t timeout_ticks)
+{
+    esp_err_t ret = pause_player_task(timeout_ticks);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     show_upload_screen();
@@ -628,6 +636,16 @@ esp_err_t badge_display_pause_for_upload(TickType_t timeout_ticks)
 }
 
 void badge_display_resume_after_upload(void)
+{
+    badge_display_exit_upload_mode();
+}
+
+esp_err_t badge_display_pause_for_ota(TickType_t timeout_ticks)
+{
+    return pause_player_task(timeout_ticks);
+}
+
+void badge_display_resume_after_ota(void)
 {
     badge_display_exit_upload_mode();
 }

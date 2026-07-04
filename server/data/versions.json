@@ -1,0 +1,18 @@
+{
+    "android":  {
+                    "platform":  "android",
+                    "latestVersion":  "1.0.5",
+                    "minimumVersion":  "1.0.0",
+                    "force":  false,
+                    "storeUrl":  "http://60.205.122.153/downloads/apk/app_gif_1.0.5.apk",
+                    "notes":  "公网 80 端口版本 1.0.5"
+                },
+    "ios":  {
+                "platform":  "ios",
+                "latestVersion":  "1.0.0",
+                "minimumVersion":  "1.0.0",
+                "force":  false,
+                "storeUrl":  "https://apps.apple.com/app/id0000000000",
+                "notes":  "首个远程更新配置。"
+            }
+}

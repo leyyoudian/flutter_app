@@ -414,6 +414,17 @@ esp_err_t badge_anim_mgr_switch_to(const char *new_id)
         s_current_entry->type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
 
         const badge_anim_entry_t *second = find_by_id(s_current_id, BADGE_ANIM_TYPE_FACTORY_SECOND);
+        /* F006->F007: skip exit, go directly to target first_half */
+        if (strcmp(s_current_id, "F006") == 0 && strcmp(new_id, "F007") == 0) {
+            strncpy(s_current_id, new_id, sizeof(s_current_id) - 1);
+            s_current_entry = new_entry;
+            s_play_mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
+            save_last_anim_id(new_id);
+            ESP_LOGI(TAG, "F006->F007: skipping exit, direct switch");
+            xSemaphoreGive(s_lock);
+            esp_err_t ret = badge_display_play_asset_file(new_entry->file_path, BADGE_PLAY_MODE_FIRST_HALF_FREEZE);
+            return ret;
+        }
         /* Check for directional third_half transition: <source>_<dest>.eb4 */
         char third_path[80];
         snprintf(third_path, sizeof(third_path), "/sdcard/third_half/%s_%s.eb4", s_current_id, new_id);
