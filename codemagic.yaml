@@ -17,13 +17,10 @@ workflows:
           flutter packages pub get
       - name: Install pods
         script: |
-          find . -name "Podfile" -execdir pod install \;
-      - name: Fix sandbox sync
-        script: |
           cd ios
-          pod install
+          pod deintegrate
+          pod install --repo-update
           cd ..
-          xcodebuild -resolvePackageDependencies -workspace ios/Runner.xcworkspace -scheme Runner
       - name: Set up App Store code signing
         script: |
           xcode-project use-profiles
