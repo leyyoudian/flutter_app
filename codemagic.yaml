@@ -4,6 +4,8 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
     working_directory: app_gif
+    integrations:
+      app_store_connect: Codemagic CI
     environment:
       flutter: stable
       xcode: latest
