@@ -21,11 +21,17 @@ workflows:
           pod deintegrate
           pod install --repo-update
           cd ..
+          rm -f ios/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
       - name: Set up App Store code signing
         script: |
           xcode-project use-profiles
       - name: Build app-store-ipa
         script: |
+          flutter clean
+          flutter pub get
+          cd ios
+          pod install
+          cd ..
           flutter build ipa --release --export-options-plist=$HOME/export_options.plist
     artifacts:
       - build/ios/ipa/*.ipa
