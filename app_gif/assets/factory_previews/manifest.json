@@ -45,7 +45,9 @@
     "previewAsset": "assets/factory_previews/F006.png",
     "firstVideo": "assets/factory_previews/F006_first.mp4",
     "secondVideo": "assets/factory_previews/F006_second.mp4",
-    "transitions": {}
+    "transitions": {
+      "F007": "assets/factory_previews/F007_third.mp4"
+    }
   },
   {
     "id": "F007",
@@ -53,7 +55,9 @@
     "previewAsset": "assets/factory_previews/F007.png",
     "firstVideo": "assets/factory_previews/F007_first.mp4",
     "secondVideo": "assets/factory_previews/F007_second.mp4",
-    "transitions": {}
+    "transitions": {
+      "F006": "assets/factory_previews/F006_third.mp4"
+    }
   },
   {
     "id": "F008",
@@ -157,6 +161,14 @@
     "previewAsset": "assets/factory_previews/F020.png",
     "firstVideo": "assets/factory_previews/F020_first.mp4",
     "secondVideo": "assets/factory_previews/F020_second.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "F021",
+    "name": "F021",
+    "previewAsset": "assets/factory_previews/F021.png",
+    "firstVideo": "assets/factory_previews/F021_first.mp4",
+    "secondVideo": "assets/factory_previews/F021_second.mp4",
     "transitions": {}
   }
 ]

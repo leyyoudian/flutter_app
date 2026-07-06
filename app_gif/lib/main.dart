@@ -295,11 +295,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _selectedFactoryId = anim.id;
       _asset = null;
     });
-    // Build video sequence: exit + entrance (skip exit for F006->F007, third_half replaces both)
+    // Build video sequence: current exit/third_half + target entrance.
     final queue = <String>[];
     bool isThirdHalf = false;
-    bool skipExit = _activeFactoryId == 'F006' && anim.id == 'F007';
-    if (_activeFactoryId != null && _activeFactoryId != anim.id && !skipExit) {
+    if (_activeFactoryId != null && _activeFactoryId != anim.id) {
       final current = _factoryAnims.cast<FactoryAnimation?>().firstWhere(
         (a) => a?.id == _activeFactoryId,
         orElse: () => null,
