@@ -40,7 +40,7 @@ void main() {
       source,
       contains('@Volatile private var badgeWifiManagedRequest = false'),
     );
-    expect(source, contains('ensureBadgeWifiNetwork(fastUpload = true)'));
+    expect(source, contains('activeBadgeNetworkForRequest(fastUpload = true)'));
     expect(source, contains('UPLOAD_NETWORK_READY_TIMEOUT_MS'));
     expect(source, contains('findExistingBadgeWifiNetwork(manager)?.let'));
     expect(
@@ -73,7 +73,7 @@ void main() {
     expect(
       uploadSource.indexOf('acquireUploadWifiLock()'),
       lessThan(
-        uploadSource.indexOf('ensureBadgeWifiNetwork(fastUpload = true)'),
+        uploadSource.indexOf('activeBadgeNetworkForRequest(fastUpload = true)'),
       ),
     );
     expect(
@@ -83,7 +83,7 @@ void main() {
       ),
     );
     expect(uploadSource, contains('if (isStaleBadgeNetworkError(tcpError))'));
-    expect(uploadSource, contains('if (isStaleBadgeNetworkError(error))'));
+    expect(uploadSource, contains('if (isStaleBadgeNetworkError(error) && !badgeDirectIpMode)'));
     expect(
       uploadSource,
       contains('releaseUploadWifiLock(keepIfConnected = true)'),
@@ -96,7 +96,7 @@ void main() {
     expect(source, contains('releaseUploadWifiLock(keepIfConnected = false)'));
     expect(
       source,
-      contains('if (keepIfConnected && badgeWifiNetwork != null)'),
+      contains('if (keepIfConnected && (badgeWifiNetwork != null || badgeDirectIpMode))'),
     );
     expect(source, contains('"已复用 \$BADGE_WIFI_SSID Wi-Fi"'));
     expect(
@@ -254,6 +254,125 @@ void main() {
     },
   );
 
+  test('Android switch commands tolerate transient TCP connect stalls', () {
+    final source = File(
+      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+    ).readAsStringSync();
+
+    final constantsStart = source.indexOf('    companion object');
+    expect(constantsStart, isNot(-1));
+    final constantsSource = source.substring(constantsStart);
+    expect(
+      constantsSource,
+      contains('private const val UPLOAD_TCP_CONNECT_TIMEOUT_MS = 6000'),
+    );
+    expect(
+      constantsSource,
+      contains('private const val SWITCH_TCP_ATTEMPTS = 6'),
+    );
+    expect(
+      constantsSource,
+      contains('private const val SWITCH_TCP_RETRY_DELAY_MS = 1000L'),
+    );
+
+    final switchStart = source.indexOf('    private fun switchToAsset');
+    final switchEnd = source.indexOf(
+      '    private fun requestNewUserId',
+      switchStart,
+    );
+    expect(switchStart, isNot(-1));
+    expect(switchEnd, isNot(-1));
+    final switchSource = source.substring(switchStart, switchEnd);
+
+    expect(switchSource, contains('sendSwitchCommandWithRetry(network, id)'));
+    expect(switchSource, isNot(contains(', 2500)')));
+
+    final requestIdStart = source.indexOf('    private fun requestNewUserId');
+    final requestIdEnd = source.indexOf(
+      '    private fun buildFactoryAnimationList',
+      requestIdStart,
+    );
+    expect(requestIdStart, isNot(-1));
+    expect(requestIdEnd, isNot(-1));
+    final requestIdSource = source.substring(requestIdStart, requestIdEnd);
+    expect(
+      requestIdSource,
+      contains('sendSwitchCommandWithRetry(network, "NEWID")'),
+    );
+
+    final retryStart = source.indexOf('    private fun sendSwitchCommandWithRetry');
+    final retryEnd = source.indexOf('    private fun sendSwitchCommand', retryStart + 1);
+    expect(retryStart, isNot(-1));
+    expect(retryEnd, isNot(-1));
+    final retrySource = source.substring(retryStart, retryEnd);
+    expect(retrySource, contains('repeat(SWITCH_TCP_ATTEMPTS)'));
+    expect(retrySource, contains('Thread.sleep(SWITCH_TCP_RETRY_DELAY_MS)'));
+  });
+
+  test('Android connects discovered LAN IPs without opening the system Wi-Fi picker', () {
+    final source = File(
+      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+    ).readAsStringSync();
+
+    final connectStart = source.indexOf('    private fun connect(address: String)');
+    final connectEnd = source.indexOf('    @SuppressLint("MissingPermission")\n    private fun disconnect()', connectStart);
+    expect(connectStart, isNot(-1));
+    expect(connectEnd, isNot(-1));
+    final connectSource = source.substring(connectStart, connectEnd);
+
+    expect(connectSource, contains('waitForDirectBadge(address)'));
+    expect(connectSource, contains('return@Thread'));
+
+    final ipv4Branch = connectSource.substring(
+      connectSource.indexOf('if (isIpv4Address(address))'),
+      connectSource.indexOf('val network = ensureBadgeWifiNetwork()'),
+    );
+    expect(ipv4Branch, isNot(contains('ensureBadgeWifiNetwork')));
+    expect(ipv4Branch, contains('badgeDirectIpMode = true'));
+    expect(ipv4Branch, contains('rememberDiscoveredBadge(direct, directIpMode = true)'));
+
+    expect(
+      source,
+      contains('private fun waitForDirectBadge(host: String): DiscoveredBadge'),
+    );
+    final directStart = source.indexOf('    private fun waitForDirectBadge');
+    final directEnd = source.indexOf('    private fun probeBadgeHost', directStart);
+    expect(directStart, isNot(-1));
+    expect(directEnd, isNot(-1));
+    final directSource = source.substring(directStart, directEnd);
+    expect(directSource, contains('requestBadgeText(null, badgeUrl("/status", host), FAST_BADGE_STATUS_TIMEOUT_MS)'));
+    expect(directSource, contains('DIRECT_BADGE_CONNECT_TIMEOUT_MS'));
+    expect(directSource, isNot(contains('ensureBadgeWifiNetwork')));
+    expect(directSource, isNot(contains('requestNetwork')));
+  });
+
+  test('Android connection state keeps LAN session through short status misses', () {
+    final source = File(
+      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+    ).readAsStringSync();
+
+    expect(source, contains('@Volatile private var connectionStatusMisses = 0'));
+    expect(source, contains('private const val CONNECTION_STATUS_MISS_LIMIT = 3'));
+
+    final readStart = source.indexOf('    private fun readConnectionState');
+    final readEnd = source.indexOf(
+      '    private fun sendConnectionEvent',
+      readStart,
+    );
+    expect(readStart, isNot(-1));
+    expect(readEnd, isNot(-1));
+    final readSource = source.substring(readStart, readEnd);
+
+    expect(readSource, contains('connectionStatusMisses = 0'));
+    expect(readSource, contains('connectionStatusMisses += 1'));
+    expect(readSource, contains('if (connectionStatusMisses < CONNECTION_STATUS_MISS_LIMIT)'));
+    expect(readSource, contains('"连接检查重试中"'));
+    expect(
+      readSource.indexOf('if (connectionStatusMisses < CONNECTION_STATUS_MISS_LIMIT)'),
+      lessThan(readSource.indexOf('connectedAddress = null')),
+    );
+  });
+
   test('Android upload streams packages from disk without whole-file buffers', () {
     final source = File(
       'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
@@ -286,18 +405,18 @@ void main() {
     expect(
       source,
       contains(
-        'private fun uploadAssetOverTcp(network: Network, packageInfo: UploadPackageInfo)',
+        'private fun uploadAssetOverTcp(network: Network?, packageInfo: UploadPackageInfo)',
       ),
     );
     expect(source, contains('writeLe32(header, 4, packageInfo.size.toLong())'));
     expect(
       source,
       contains(
-        'private fun uploadAssetOverHttp(network: Network, packageInfo: UploadPackageInfo)',
+        'private fun uploadAssetOverHttp(network: Network?, packageInfo: UploadPackageInfo)',
       ),
     );
     final httpStart = source.indexOf(
-      '    private fun uploadAssetOverHttp(network: Network, packageInfo: UploadPackageInfo)',
+      '    private fun uploadAssetOverHttp(network: Network?, packageInfo: UploadPackageInfo)',
     );
     final httpEnd = source.indexOf(
       '    private fun streamPackageToOutput',
@@ -308,7 +427,7 @@ void main() {
     final httpSource = source.substring(httpStart, httpEnd);
     expect(
       httpSource,
-      contains('network.openConnection(url) as HttpURLConnection'),
+      contains('(network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection'),
     );
     expect(
       httpSource,

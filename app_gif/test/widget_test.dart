@@ -21,6 +21,9 @@ void main() {
     await tester.pumpWidget(const BadgeApp());
     await tester.pumpAndSettle();
 
+    await tester.tap(find.byIcon(Icons.wifi_find));
+    await tester.pumpAndSettle();
+
     final status = tester.widget<Text>(find.text('未连接'));
     expect(status.style?.color, const Color(0xffff5b5b));
     expect(find.byType(AnimatedSwitcher), findsNothing);

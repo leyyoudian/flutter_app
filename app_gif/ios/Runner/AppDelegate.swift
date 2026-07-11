@@ -154,7 +154,10 @@ import UIKit
       ],
     ])
     publishLanBadgeScanResult()
-    sendEvent(["type": "scanState", "scanning": false])
+    publishHotspotBadgeScanResult()
+    DispatchQueue.main.asyncAfter(deadline: .now() + BadgeConstants.discoveryListenTimeout) {
+      self.sendEvent(["type": "scanState", "scanning": false])
+    }
   }
 
   private func connect(address: String?, result: @escaping FlutterResult) {
@@ -302,6 +305,75 @@ import UIKit
       ])
       self.sendEvent(["type": "status", "message": "已发现局域网设备 \(discovered.host)"])
     }
+  }
+
+  private func publishHotspotBadgeScanResult() {
+    DispatchQueue.global(qos: .utility).async {
+      guard let discovered = self.listenForBadgeHello() else { return }
+      self.rememberDiscoveredBadge(discovered)
+      self.sendEvent([
+        "type": "scanResult",
+        "device": [
+          "address": discovered.host,
+          "name": "\(BadgeConstants.badgeDeviceName) Hotspot",
+          "rssi": 0,
+          "serviceMatch": true,
+        ],
+      ])
+      self.sendEvent(["type": "status", "message": "已发现手机热点设备 \(discovered.host)"])
+    }
+  }
+
+  private func listenForBadgeHello() -> DiscoveredBadge? {
+    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+
+    var reuse: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+    var timeout = timeval(tv_sec: 0, tv_usec: 500_000)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(BadgeConstants.discoveryUdpPort).bigEndian
+    address.sin_addr = in_addr(s_addr: INADDR_ANY)
+    let bindResult = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+        Darwin.bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bindResult == 0 else { return nil }
+
+    let deadline = Date().addingTimeInterval(BadgeConstants.discoveryListenTimeout)
+    var buffer = [UInt8](repeating: 0, count: BadgeConstants.discoveryPacketBytes)
+    while Date() < deadline {
+      var sender = sockaddr_in()
+      var senderLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+      let count = buffer.withUnsafeMutableBytes { rawBuffer in
+        withUnsafeMutablePointer(to: &sender) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+            Darwin.recvfrom(fd, rawBuffer.baseAddress, rawBuffer.count, 0, sockaddrPointer, &senderLength)
+          }
+        }
+      }
+      guard count > 0 else { continue }
+      let payload = String(bytes: buffer.prefix(count), encoding: .utf8) ?? ""
+      guard payload.contains("espbaji_hello") else { continue }
+
+      var senderAddress = sender.sin_addr
+      var hostBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+      let converted = hostBuffer.withUnsafeMutableBufferPointer { hostPointer in
+        inet_ntop(AF_INET, &senderAddress, hostPointer.baseAddress, socklen_t(INET_ADDRSTRLEN))
+      }
+      guard converted != nil else { continue }
+      let host = String(cString: hostBuffer)
+      if let discovered = probeBadgeHost(host) {
+        return discovered
+      }
+    }
+    return nil
   }
 
   private func discoverBadgeOnLan() -> DiscoveredBadge? {
@@ -1805,12 +1877,15 @@ private enum BadgeConstants {
   static let badgeDeviceName = "ESP-DotLoop"
   static let badgeApHost = "192.168.4.1"
   static let badgeUploadTcpPort = 3333
+  static let discoveryUdpPort: UInt16 = 3334
   static let badgeTcpUploadMagic: UInt32 = 0x31505542
   static let statusTimeout: TimeInterval = 2.5
   static let lanDiscoveryProbeTimeout: TimeInterval = 0.45
   static let lanDiscoveryTimeoutGrace: TimeInterval = 0.15
   static let lanDiscoveryConcurrency = 32
   static let lanDiscoveryMaxCandidates = 260
+  static let discoveryListenTimeout: TimeInterval = 6.5
+  static let discoveryPacketBytes = 512
   static let uploadTimeoutSeconds = 180
   static let uploadChunkBytes = 256 * 1024
   static let uploadProgressStepBytes = 512 * 1024

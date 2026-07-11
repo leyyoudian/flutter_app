@@ -70,7 +70,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: 'http://60.205.122.153',
   );
-  static const _appVersion = '1.0.8';
+  static const _appVersion = '1.0.14';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];

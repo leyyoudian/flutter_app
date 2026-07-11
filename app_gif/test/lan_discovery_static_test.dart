@@ -24,7 +24,7 @@ void main() {
       expect(
         source,
         contains(
-          'private fun probeBadgeHost(network: Network, host: String): DiscoveredBadge?',
+          'private fun probeBadgeHost(network: Network?, host: String): DiscoveredBadge?',
         ),
       );
       expect(
@@ -32,6 +32,13 @@ void main() {
         contains('private fun isBadgeStatusText(status: String): Boolean'),
       );
       expect(source, contains('private fun publishLanBadgeScanResult()'));
+      expect(source, contains('private fun publishHotspotBadgeScanResult()'));
+      expect(source, contains('private fun listenForBadgeHello()'));
+      expect(source, contains('DatagramSocket(null).use'));
+      expect(source, contains('BADGE_DISCOVERY_UDP_PORT'));
+      expect(source, contains('badgeDirectIpMode'));
+      expect(source, contains('probeBadgeHost(null, host)'));
+      expect(source, contains('activeBadgeNetworkForRequest'));
       expect(source, contains('private data class DiscoveredBadge'));
       expect(source, contains('setActiveBadgeHost(discovered.host)'));
       expect(source, contains('connectedAddress = activeBadgeHost'));
@@ -99,6 +106,10 @@ void main() {
         contains('private func isBadgeStatusText(_ status: String) -> Bool'),
       );
       expect(source, contains('private func publishLanBadgeScanResult()'));
+      expect(source, contains('private func publishHotspotBadgeScanResult()'));
+      expect(source, contains('private func listenForBadgeHello() -> DiscoveredBadge?'));
+      expect(source, contains('BadgeConstants.discoveryUdpPort'));
+      expect(source, contains('espbaji_hello'));
       expect(source, contains('private struct DiscoveredBadge'));
       expect(source, contains('setActiveBadgeHost(discovered.host)'));
       expect(source, contains('connectedAddress = activeBadgeHost'));

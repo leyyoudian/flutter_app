@@ -44,8 +44,19 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.8';"));
-    expect(pubspec, contains('version: 1.0.8+8'));
+    expect(source, contains("static const _appVersion = '1.0.14';"));
+    expect(pubspec, contains('version: 1.0.14+16'));
+  });
+
+  test('firmware project version is aligned with OTA release version', () {
+    final cmake = File('../ESP32-S3-LCD-2.8C-Test/CMakeLists.txt').readAsStringSync();
+    final mainCmake = File('../ESP32-S3-LCD-2.8C-Test/main/CMakeLists.txt').readAsStringSync();
+
+    expect(cmake, contains('set(PROJECT_VER "0.1.33")'));
+    expect(
+      mainCmake,
+      contains(r'target_compile_definitions(${COMPONENT_LIB} PRIVATE BADGE_FW_VERSION=\"${PROJECT_VER}\")'),
+    );
   });
 
   test('maker save submits review before storing history and shows policy hint', () {
@@ -78,6 +89,9 @@ void main() {
 
   test('asset history persists review metadata', () {
     final source = File('lib/main.dart').readAsStringSync();
+    final androidNative = File(
+      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+    ).readAsStringSync();
 
     expect(source, contains('final String? reviewId;'));
     expect(source, contains('final String reviewStatus;'));
@@ -87,6 +101,24 @@ void main() {
       source,
       contains("reviewStatus: (map['reviewStatus'] as String?) ?? 'local'"),
     );
+    expect(androidNative, contains('"reviewId" to item.optString("reviewId", null)'));
+    expect(androidNative, contains('"reviewStatus" to item.optString("reviewStatus", "local")'));
+    expect(androidNative, contains('item.put("reviewId", reviewId)'));
+    expect(androidNative, contains('item.put("reviewStatus", reviewStatus ?: "local")'));
+  });
+
+  test('firmware holds single-frame assets instead of loop-rendering them', () {
+    final display = File('../ESP32-S3-LCD-2.8C-Test/main/Badge/BadgeDisplay.c').readAsStringSync();
+
+    expect(display, contains('BADGE_PLAYER_YIELD_EVERY_FRAMES'));
+    expect(display, contains('BADGE_STATIC_FRAME_HOLD_POLL_MS'));
+    expect(display, contains('badge_player_yield_if_needed'));
+    expect(display, contains('vTaskDelay(pdMS_TO_TICKS(1))'));
+    expect(display, contains('asset->header.frame_count == 1'));
+    expect(display, contains('single-frame asset rendered once; holding framebuffer'));
+    expect(display, isNot(contains('esp_freertos_hooks.h')));
+    expect(display, isNot(contains('esp_register_freertos_idle_hook')));
+    expect(display, isNot(contains('static_hold_prevent_waiti')));
   });
 
   test('history grid visually distinguishes unreviewed and rejected assets', () {
