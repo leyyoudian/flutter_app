@@ -25,6 +25,7 @@ static const char *TAG = "BadgeAnimMgr";
 #define BADGE_ANIM_FOLDER_FIRST  "/sdcard/first_half"
 #define BADGE_ANIM_FOLDER_SECOND "/sdcard/second_half"
 #define BADGE_ANIM_FOLDER_THIRD  "/sdcard/third_half"
+#define BADGE_ANIM_FOLDER_FACTORY_LOOP "/sdcard/factory_loop"
 #define BADGE_ANIM_FOLDER_USER   "/sdcard/user"
 
 static badge_anim_entry_t s_entries[BADGE_ANIM_MAX_COUNT];
@@ -38,6 +39,7 @@ static const badge_anim_entry_t *s_current_entry;
 
 static char s_pending_id[BADGE_ANIM_ID_LEN];
 static bool s_switch_pending;
+static bool s_transition_lands_on_current;
 static SemaphoreHandle_t s_lock;
 
 /* Save / load last animation ID to NVS for persistence across reboots */
@@ -81,6 +83,7 @@ static badge_anim_type_t folder_to_type(const char *folder)
 {
     if (strstr(folder, "first_half"))  return BADGE_ANIM_TYPE_FACTORY_FIRST;
     if (strstr(folder, "second_half")) return BADGE_ANIM_TYPE_FACTORY_SECOND;
+    if (strstr(folder, "factory_loop")) return BADGE_ANIM_TYPE_FACTORY_LOOP;
     return BADGE_ANIM_TYPE_USER;
 }
 
@@ -89,6 +92,20 @@ static uint8_t folder_to_halves(const char *folder)
     if (strstr(folder, "first_half"))  return 1;
     if (strstr(folder, "second_half")) return 2;
     return 0;
+}
+
+static badge_play_mode_t entry_default_mode(const badge_anim_entry_t *entry)
+{
+    if (entry == NULL) {
+        return BADGE_PLAY_MODE_LOOP;
+    }
+    if (entry->type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
+        return BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
+    }
+    if (entry->type == BADGE_ANIM_TYPE_FACTORY_LOOP) {
+        return BADGE_PLAY_MODE_LOOP;
+    }
+    return BADGE_PLAY_MODE_LOOP;
 }
 
 static void read_header_from_path(const char *path, badge_anim_entry_t *entry)
@@ -138,7 +155,8 @@ static esp_err_t scan_folder(const char *folder_path, const char *folder_name)
 
         if (anim->type == BADGE_ANIM_TYPE_USER) {
             s_user_count++;
-        } else {
+        } else if (anim->type == BADGE_ANIM_TYPE_FACTORY_FIRST ||
+                   anim->type == BADGE_ANIM_TYPE_FACTORY_LOOP) {
             s_factory_count++;
         }
         s_entry_count++;
@@ -166,8 +184,13 @@ static const badge_anim_entry_t *find_any(const char *id)
     }
     return NULL;
 }
+static bool is_factory_six_seven_pair(const char *source_id, const char *target_id)
+{
+    return (strcmp(source_id, "F006") == 0 && strcmp(target_id, "F007") == 0) ||
+           (strcmp(source_id, "F007") == 0 && strcmp(target_id, "F006") == 0);
+}
 
-/* ©¤©¤ Public API ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤ */
+/* ï¿½ï¿½ï¿½ï¿½ Public API ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 
 esp_err_t badge_anim_mgr_init(void)
 {
@@ -185,6 +208,7 @@ esp_err_t badge_anim_mgr_init(void)
     memset(s_pending_id, 0, sizeof(s_pending_id));
     s_current_entry = NULL;
     s_switch_pending = false;
+    s_transition_lands_on_current = false;
     s_play_mode = BADGE_PLAY_MODE_LOOP;
 
     /* Create folders if they don't exist */
@@ -201,6 +225,10 @@ esp_err_t badge_anim_mgr_init(void)
     if (mkdir_ret != 0 && errno != EEXIST) {
         ESP_LOGW(TAG, "mkdir %s failed: errno=%d", BADGE_ANIM_FOLDER_THIRD, errno);
     }
+    mkdir_ret = mkdir(BADGE_ANIM_FOLDER_FACTORY_LOOP, 0755);
+    if (mkdir_ret != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG, "mkdir %s failed: errno=%d", BADGE_ANIM_FOLDER_FACTORY_LOOP, errno);
+    }
     mkdir_ret = mkdir(BADGE_ANIM_FOLDER_USER, 0755);
     if (mkdir_ret != 0 && errno != EEXIST) {
         ESP_LOGW(TAG, "mkdir %s failed: errno=%d", BADGE_ANIM_FOLDER_USER, errno);
@@ -208,6 +236,7 @@ esp_err_t badge_anim_mgr_init(void)
 
     scan_folder(BADGE_ANIM_FOLDER_FIRST, "first_half");
     scan_folder(BADGE_ANIM_FOLDER_SECOND, "second_half");
+    scan_folder(BADGE_ANIM_FOLDER_FACTORY_LOOP, "factory_loop");
     scan_folder(BADGE_ANIM_FOLDER_USER, "user");
 
     ESP_LOGI(TAG, "scanned %u animations: %u factory, %u user",
@@ -225,7 +254,7 @@ esp_err_t badge_anim_mgr_init(void)
             FILE *f = fopen(user_path, "rb");
             if (f != NULL) {
                 fclose(f);
-                /* File exists – we'll play it by path below */
+                /* File exists ï¿½ we'll play it by path below */
             }
         }
     }
@@ -233,9 +262,7 @@ esp_err_t badge_anim_mgr_init(void)
     if (resume_entry != NULL) {
         strncpy(s_current_id, resume_entry->id, sizeof(s_current_id) - 1);
         s_current_entry = resume_entry;
-        s_play_mode = (resume_entry->type == BADGE_ANIM_TYPE_FACTORY_FIRST)
-                          ? BADGE_PLAY_MODE_FIRST_HALF_FREEZE
-                          : BADGE_PLAY_MODE_LOOP;
+        s_play_mode = entry_default_mode(resume_entry);
         ESP_LOGI(TAG, "resuming last animation: %s", resume_entry->id);
     } else if (last_id[0] == 'U') {
         /* User file not in scanned entries */
@@ -246,10 +273,11 @@ esp_err_t badge_anim_mgr_init(void)
     } else if (s_factory_count > 0) {
         /* Default: play first factory animation */
         for (uint8_t i = 0; i < s_entry_count; ++i) {
-            if (s_entries[i].type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
+            if (s_entries[i].type == BADGE_ANIM_TYPE_FACTORY_FIRST ||
+                s_entries[i].type == BADGE_ANIM_TYPE_FACTORY_LOOP) {
                 strncpy(s_current_id, s_entries[i].id, sizeof(s_current_id) - 1);
                 s_current_entry = &s_entries[i];
-                s_play_mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
+                s_play_mode = entry_default_mode(&s_entries[i]);
                 break;
             }
         }
@@ -283,7 +311,7 @@ esp_err_t badge_anim_mgr_init(void)
 
 uint8_t badge_anim_mgr_factory_count(void)
 {
-    return s_factory_count / 2;  // Pairs count
+    return s_factory_count;
 }
 
 uint8_t badge_anim_mgr_user_count(void)
@@ -300,7 +328,8 @@ const badge_anim_entry_t *badge_anim_mgr_get_factory(uint8_t index)
 {
     uint8_t count = 0;
     for (uint8_t i = 0; i < s_entry_count; ++i) {
-        if (s_entries[i].type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
+        if (s_entries[i].type == BADGE_ANIM_TYPE_FACTORY_FIRST ||
+            s_entries[i].type == BADGE_ANIM_TYPE_FACTORY_LOOP) {
             if (count == index) return &s_entries[i];
             count++;
         }
@@ -380,6 +409,7 @@ esp_err_t badge_anim_mgr_play(const char *id, badge_play_mode_t mode)
     strncpy(s_current_id, id, sizeof(s_current_id) - 1);
     s_current_entry = entry;
     s_play_mode = mode;
+    s_transition_lands_on_current = false;
 
     ESP_LOGI(TAG, "play: %s from %s mode=%d", id, entry->file_path, mode);
     save_last_anim_id(id);
@@ -404,6 +434,23 @@ esp_err_t badge_anim_mgr_switch_to(const char *new_id)
     ESP_LOGI(TAG, "switch requested: %s (current=%s mode=%d)",
              new_id, s_current_id, s_play_mode);
 
+    if (!s_switch_pending && strcmp(new_id, s_current_id) == 0) {
+        ESP_LOGI(TAG, "already showing requested animation: %s", new_id);
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    }
+
+    if (s_switch_pending || s_play_mode == BADGE_PLAY_MODE_SECOND_HALF) {
+        if (strcmp(s_pending_id, new_id) != 0) {
+            strncpy(s_pending_id, new_id, sizeof(s_pending_id) - 1);
+            s_pending_id[sizeof(s_pending_id) - 1] = '\0';
+        }
+        s_switch_pending = true;
+        ESP_LOGI(TAG, "coalesced switch while transition playing: pending=%s", s_pending_id);
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    }
+
     /* Play second_half exit animation only when leaving a factory animation.
        User content switches directly without exit animation. */
     bool current_is_factory = (s_current_entry != NULL &&
@@ -414,37 +461,32 @@ esp_err_t badge_anim_mgr_switch_to(const char *new_id)
         s_current_entry->type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
 
         const badge_anim_entry_t *second = find_by_id(s_current_id, BADGE_ANIM_TYPE_FACTORY_SECOND);
-        /* F006->F007: skip exit, go directly to target first_half */
-        if (strcmp(s_current_id, "F006") == 0 && strcmp(new_id, "F007") == 0) {
-            strncpy(s_current_id, new_id, sizeof(s_current_id) - 1);
-            s_current_entry = new_entry;
-            s_play_mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
-            save_last_anim_id(new_id);
-            ESP_LOGI(TAG, "F006->F007: skipping exit, direct switch");
-            xSemaphoreGive(s_lock);
-            esp_err_t ret = badge_display_play_asset_file(new_entry->file_path, BADGE_PLAY_MODE_FIRST_HALF_FREEZE);
-            return ret;
-        }
-        /* Check for directional third_half transition: <source>_<dest>.eb4 */
-        char third_path[80];
-        snprintf(third_path, sizeof(third_path), "/sdcard/third_half/%s_%s.eb4", s_current_id, new_id);
-        FILE *tf = fopen(third_path, "rb");
-        if (tf != NULL) {
-            fclose(tf);
-            /* Update state to reflect the target animation */
-            const char *old_id = s_current_id;
-            strncpy(s_current_id, new_id, sizeof(s_current_id) - 1);
-            s_current_entry = new_entry;
-            s_play_mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
-            save_last_anim_id(new_id);
-            ESP_LOGI(TAG, "playing third_half %s->%s (skip target first_half)", old_id, new_id);
-            esp_err_t ret = badge_display_play_asset_file(third_path, BADGE_PLAY_MODE_SECOND_HALF);
-            xSemaphoreGive(s_lock);
-            return ret;
+        if (is_factory_six_seven_pair(s_current_id, new_id)) {
+            char third_path[80];
+            snprintf(third_path, sizeof(third_path), BADGE_ANIM_FOLDER_THIRD "/%s.eb4", new_id);
+            FILE *tf = fopen(third_path, "rb");
+            if (tf != NULL) {
+                fclose(tf);
+                char old_id[BADGE_ANIM_ID_LEN];
+                snprintf(old_id, sizeof(old_id), "%s", s_current_id);
+                snprintf(s_current_id, sizeof(s_current_id), "%s", new_id);
+                s_current_entry = new_entry;
+                s_play_mode = BADGE_PLAY_MODE_SECOND_HALF;
+                s_transition_lands_on_current = true;
+                save_last_anim_id(new_id);
+                ESP_LOGI(TAG, "playing F006/F007 third_half %s->%s: %s", old_id, new_id, third_path);
+                esp_err_t ret = badge_display_play_asset_file(third_path, BADGE_PLAY_MODE_SECOND_HALF);
+                xSemaphoreGive(s_lock);
+                return ret;
+            }
+            ESP_LOGW(TAG, "F006/F007 third_half missing for %s->%s: %s", s_current_id, new_id, third_path);
         }
         if (second != NULL) {
             strncpy(s_pending_id, new_id, sizeof(s_pending_id) - 1);
+            s_pending_id[sizeof(s_pending_id) - 1] = '\0';
             s_switch_pending = true;
+            s_play_mode = BADGE_PLAY_MODE_SECOND_HALF;
+            s_transition_lands_on_current = false;
             ESP_LOGI(TAG, "playing second_half of %s before switch to %s", s_current_id, new_id);
             esp_err_t ret = badge_display_play_asset_file(second->file_path, BADGE_PLAY_MODE_SECOND_HALF);
             xSemaphoreGive(s_lock);
@@ -458,22 +500,19 @@ esp_err_t badge_anim_mgr_switch_to(const char *new_id)
         snprintf(user_path, sizeof(user_path), "/sdcard/user/%s.eb4", new_id);
         strncpy(s_current_id, new_id, sizeof(s_current_id) - 1);
         s_play_mode = BADGE_PLAY_MODE_LOOP;
+        s_transition_lands_on_current = false;
         save_last_anim_id(new_id);
         xSemaphoreGive(s_lock);
         ESP_LOGI(TAG, "switch to user file: %s", user_path);
         return badge_display_play_asset_file(user_path, BADGE_PLAY_MODE_LOOP);
     }
 
-    badge_play_mode_t mode;
-    if (new_entry->type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
-        mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
-    } else {
-        mode = BADGE_PLAY_MODE_LOOP;
-    }
+    badge_play_mode_t mode = entry_default_mode(new_entry);
 
     strncpy(s_current_id, new_id, sizeof(s_current_id) - 1);
     s_current_entry = new_entry;
     s_play_mode = mode;
+    s_transition_lands_on_current = false;
     save_last_anim_id(new_id);
     xSemaphoreGive(s_lock);
 
@@ -487,6 +526,9 @@ void badge_anim_mgr_notify_finished(void)
 
     ESP_LOGI(TAG, "animation finished, pending=%d", s_switch_pending);
 
+    bool transition_landed_on_current = (s_play_mode == BADGE_PLAY_MODE_SECOND_HALF &&
+                                         s_transition_lands_on_current);
+
     if (s_switch_pending) {
         /* Second_half finished, now play the pending new animation */
         char next_id[BADGE_ANIM_ID_LEN];
@@ -494,24 +536,37 @@ void badge_anim_mgr_notify_finished(void)
         memset(s_pending_id, 0, sizeof(s_pending_id));
         s_switch_pending = false;
 
+        if (transition_landed_on_current) {
+            s_transition_lands_on_current = false;
+            s_play_mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
+            ESP_LOGI(TAG, "transition landed on %s; processing pending switch to %s",
+                     s_current_id, next_id);
+            xSemaphoreGive(s_lock);
+            badge_anim_mgr_switch_to(next_id);
+            return;
+        }
+
+        s_transition_lands_on_current = false;
+
         /* Release lock before calling play() which re-acquires it */
         xSemaphoreGive(s_lock);
 
         const badge_anim_entry_t *next = find_any(next_id);
-        badge_play_mode_t mode = BADGE_PLAY_MODE_LOOP;
-        if (next != NULL && next->type == BADGE_ANIM_TYPE_FACTORY_FIRST) {
-            mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
-        }
+        badge_play_mode_t mode = entry_default_mode(next);
 
         ESP_LOGI(TAG, "switching to %s mode=%d", next_id, mode);
         badge_anim_mgr_play(next_id, mode);
         return;
     }
 
-    if (s_play_mode == BADGE_PLAY_MODE_FIRST_HALF_FREEZE) {
+    if (s_play_mode == BADGE_PLAY_MODE_SECOND_HALF) {
+        s_transition_lands_on_current = false;
+        s_play_mode = BADGE_PLAY_MODE_FIRST_HALF_FREEZE;
+        ESP_LOGI(TAG, "transition finished, frozen at last frame");
+    } else if (s_play_mode == BADGE_PLAY_MODE_FIRST_HALF_FREEZE) {
         /* First_half finished, freeze. Don't loop. */
         ESP_LOGI(TAG, "first_half done, frozen at last frame");
-        /* Already frozen – badge_display handles this */
+        /* Already frozen - badge_display handles this */
     }
 
     xSemaphoreGive(s_lock);

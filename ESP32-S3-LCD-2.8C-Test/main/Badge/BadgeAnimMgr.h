@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,6 +13,7 @@
 typedef enum {
     BADGE_ANIM_TYPE_FACTORY_FIRST = 0,
     BADGE_ANIM_TYPE_FACTORY_SECOND,
+    BADGE_ANIM_TYPE_FACTORY_LOOP,
     BADGE_ANIM_TYPE_USER,
 } badge_anim_type_t;
 
@@ -83,7 +84,7 @@ esp_err_t badge_anim_mgr_play(const char *id, badge_play_mode_t mode);
 
 /**
  * @brief Request switch to a new animation.
- * Handles the transition: current second_half ¡ú new first_half.
+ * Handles the transition: current second_half â†’ new first_half.
  */
 esp_err_t badge_anim_mgr_switch_to(const char *new_id);
 
@@ -112,3 +113,4 @@ const char *badge_anim_mgr_current_id(void);
  * @brief Get current playing animation entry.
  */
 const badge_anim_entry_t *badge_anim_mgr_current_entry(void);
+
