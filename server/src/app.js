@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const zlib = require('node:zlib');
 
 const defaultVersions = {
   android: {
@@ -34,6 +35,17 @@ const defaultOta = {
 const defaultAppVersionHistory = [];
 const defaultFirmwareVersionHistory = [];
 const adminTokenHeader = 'X-Admin-Token';
+const factorySchemaVersion = 1;
+const protectedFactoryMax = 21;
+const factoryZipMaxBytes = 256 * 1024 * 1024;
+
+const crcTable = Array.from({ length: 256 }, (_, index) => {
+  let crc = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return crc >>> 0;
+});
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -41,7 +53,7 @@ function ensureDir(dir) {
 
 function loadJson(file, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
   } catch (error) {
     if (error.code !== 'ENOENT') {
       throw error;
@@ -55,6 +67,13 @@ function loadJson(file, fallback) {
 function saveJson(file, data) {
   ensureDir(path.dirname(file));
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function writeFileAtomicSync(file, data) {
+  ensureDir(path.dirname(file));
+  const tmpPath = `${file}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, data);
+  fs.renameSync(tmpPath, file);
 }
 
 function sendJson(res, status, data) {
@@ -137,6 +156,33 @@ function publicAsset(item) {
   };
 }
 
+function duplicateAssetMatches(asset, packageSha256, crc32, packageSize) {
+  return asset.packageSha256 === packageSha256 ||
+    (!asset.packageSha256 && asset.crc32 === crc32 && Number(asset.packageSize || 0) === packageSize);
+}
+
+function duplicateStatusPriority(status) {
+  if (status === 'approved') return 0;
+  if (status === 'rejected') return 1;
+  return 2;
+}
+
+function findDuplicateAsset(items, packageSha256, crc32, packageSize) {
+  let best = null;
+  let bestPriority = Number.MAX_SAFE_INTEGER;
+  for (const asset of items) {
+    if (!duplicateAssetMatches(asset, packageSha256, crc32, packageSize)) {
+      continue;
+    }
+    const priority = duplicateStatusPriority(asset.status);
+    if (!best || priority < bestPriority) {
+      best = asset;
+      bestPriority = priority;
+    }
+  }
+  return best;
+}
+
 function extractVersionFromFilename(filename) {
   const match = String(filename).match(/(\d+\.\d+\.\d+)/);
   return match ? match[1] : null;
@@ -161,6 +207,361 @@ function computeBufferSha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
+function computeBufferCrc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function normalizeZipPath(name) {
+  const normalized = String(name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!normalized || normalized.endsWith('/')) return null;
+  if (path.posix.isAbsolute(normalized) || normalized.split('/').includes('..')) {
+    throw Object.assign(new Error('invalid zip path'), { status: 400 });
+  }
+  if (!(normalized === 'import.json' || normalized.startsWith('items/'))) {
+    throw Object.assign(new Error('unknown zip path'), { status: 400 });
+  }
+  return normalized;
+}
+
+function parseZipEntries(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0 || buffer.length > factoryZipMaxBytes) {
+    throw Object.assign(new Error('invalid zip'), { status: 400 });
+  }
+  const entries = new Map();
+  let offset = 0;
+  while (offset + 30 <= buffer.length) {
+    const signature = buffer.readUInt32LE(offset);
+    if (signature === 0x02014b50 || signature === 0x06054b50) break;
+    if (signature !== 0x04034b50) {
+      throw Object.assign(new Error('invalid zip header'), { status: 400 });
+    }
+    const flags = buffer.readUInt16LE(offset + 6);
+    const method = buffer.readUInt16LE(offset + 8);
+    const expectedCrc = buffer.readUInt32LE(offset + 14);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const nameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    if ((flags & 0x08) !== 0) {
+      throw Object.assign(new Error('unsupported zip data descriptor'), { status: 400 });
+    }
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > buffer.length) {
+      throw Object.assign(new Error('truncated zip entry'), { status: 400 });
+    }
+    const entryName = normalizeZipPath(buffer.slice(nameStart, nameStart + nameLength).toString('utf8'));
+    const compressed = buffer.slice(dataStart, dataEnd);
+    let data;
+    if (method === 0) {
+      data = compressed;
+    } else if (method === 8) {
+      data = zlib.inflateRawSync(compressed);
+    } else {
+      throw Object.assign(new Error('unsupported zip compression'), { status: 400 });
+    }
+    if (entryName) {
+      if (entries.has(entryName)) {
+        throw Object.assign(new Error('duplicate zip path'), { status: 400 });
+      }
+      if (expectedCrc && computeBufferCrc32(data) !== expectedCrc) {
+        throw Object.assign(new Error('zip crc mismatch'), { status: 400 });
+      }
+      entries.set(entryName, data);
+    }
+    offset = dataEnd;
+  }
+  if (!entries.has('import.json')) {
+    throw Object.assign(new Error('missing import.json'), { status: 400 });
+  }
+  return entries;
+}
+
+function normalizeFactoryItemId(id) {
+  const match = String(id || '').trim().toUpperCase().match(/^F?(\d{1,3})$/);
+  if (!match) {
+    throw Object.assign(new Error('invalid factory id'), { status: 400 });
+  }
+  return `F${Number(match[1]).toString().padStart(3, '0')}`;
+}
+
+function factoryNumber(id) {
+  const match = String(id || '').match(/^F(\d{3})$/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+function isProtectedFactoryId(id) {
+  const number = factoryNumber(id);
+  return number >= 1 && number <= protectedFactoryMax;
+}
+
+function makeProtectedBaselineItem(index) {
+  const id = `F${index.toString().padStart(3, '0')}`;
+  return {
+    id,
+    title: id,
+    type: 'split',
+    protected: true,
+    revision: 0,
+    appFiles: {},
+    deviceFiles: [],
+    history: [],
+  };
+}
+
+function withProtectedBaseline(catalog) {
+  const next = catalog && Array.isArray(catalog.items) ? JSON.parse(JSON.stringify(catalog)) : {
+    schemaVersion: factorySchemaVersion,
+    catalogRevision: 0,
+    publishedAt: new Date(0).toISOString(),
+    items: [],
+  };
+  next.schemaVersion = factorySchemaVersion;
+  for (let i = 1; i <= protectedFactoryMax; i += 1) {
+    const id = `F${i.toString().padStart(3, '0')}`;
+    const existing = next.items.find((item) => item.id === id);
+    if (existing) {
+      existing.protected = true;
+      if (!existing.type) existing.type = 'split';
+      if (!Number.isFinite(existing.revision)) existing.revision = 0;
+      if (!existing.appFiles) existing.appFiles = {};
+      if (!Array.isArray(existing.deviceFiles)) existing.deviceFiles = [];
+      if (!Array.isArray(existing.history)) existing.history = [];
+    } else {
+      next.items.push(makeProtectedBaselineItem(i));
+    }
+  }
+  next.items.sort((a, b) => factoryNumber(a.id) - factoryNumber(b.id));
+  return next;
+}
+
+function loadFactoryCatalog(factoryCatalogFile) {
+  const catalog = loadJson(factoryCatalogFile, {
+    schemaVersion: factorySchemaVersion,
+    catalogRevision: 0,
+    publishedAt: new Date(0).toISOString(),
+    items: [],
+  });
+  const withBaseline = withProtectedBaseline(catalog);
+  saveFactoryCatalogAtomic(factoryCatalogFile, withBaseline);
+  return withBaseline;
+}
+
+function saveFactoryCatalogAtomic(factoryCatalogFile, catalog) {
+  writeFileAtomicSync(factoryCatalogFile, JSON.stringify(withProtectedBaseline(catalog), null, 2));
+}
+
+function publicFactoryCatalog(catalog) {
+  return {
+    schemaVersion: factorySchemaVersion,
+    catalogRevision: catalog.catalogRevision || 0,
+    publishedAt: catalog.publishedAt || new Date(0).toISOString(),
+    items: catalog.items.map((item) => ({
+      id: item.id,
+      title: item.title || item.id,
+      type: item.type || 'split',
+      protected: !!item.protected,
+      revision: item.revision || 0,
+      minFirmwareVersion: item.minFirmwareVersion || '',
+      appFiles: item.appFiles || {},
+      deviceFiles: item.deviceFiles || [],
+    })),
+  };
+}
+
+function validateFactoryTargetPath(targetPath) {
+  const value = String(targetPath || '').replace(/\\/g, '/');
+  const patterns = [
+    /^first_half\/F\d{3}\.eb4$/,
+    /^second_half\/F\d{3}\.eb4$/,
+    /^third_half\/F\d{3}(?:_F\d{3})?\.eb4$/,
+    /^factory_loop\/F\d{3}\.eb4$/,
+  ];
+  if (!patterns.some((pattern) => pattern.test(value))) {
+    throw Object.assign(new Error('invalid device file path'), { status: 400 });
+  }
+  return value;
+}
+
+function safeStagePath(stageDir, relativePath) {
+  const root = path.resolve(stageDir);
+  const target = path.resolve(stageDir, relativePath);
+  if (!target.startsWith(root + path.sep)) {
+    throw Object.assign(new Error('invalid stage path'), { status: 400 });
+  }
+  return target;
+}
+
+function stageFactoryImport(zipBuffer, factoryImportsDir) {
+  const entries = parseZipEntries(zipBuffer);
+  const importJson = JSON.parse(entries.get('import.json').toString('utf8'));
+  const manifestPaths = Array.isArray(importJson.items) ? importJson.items : [];
+  if (manifestPaths.length === 0 || manifestPaths.length > 100) {
+    throw Object.assign(new Error('invalid import manifest'), { status: 400 });
+  }
+  const importId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const stageDir = path.join(factoryImportsDir, importId);
+  ensureDir(stageDir);
+  const candidates = [];
+
+  for (const manifestPath of manifestPaths) {
+    const normalizedManifestPath = normalizeZipPath(manifestPath);
+    if (!normalizedManifestPath || !entries.has(normalizedManifestPath)) {
+      throw Object.assign(new Error('candidate manifest not found'), { status: 400 });
+    }
+    const itemRootMatch = normalizedManifestPath.match(/^items\/([^/]+)\/manifest\.json$/);
+    if (!itemRootMatch) {
+      throw Object.assign(new Error('invalid candidate manifest path'), { status: 400 });
+    }
+    const itemRoot = `items/${itemRootMatch[1]}`;
+    const manifest = JSON.parse(entries.get(normalizedManifestPath).toString('utf8'));
+    const id = normalizeFactoryItemId(manifest.id);
+    const type = String(manifest.type || '').toLowerCase();
+    if (!['split', 'loop', 'transition'].includes(type)) {
+      throw Object.assign(new Error('invalid factory type'), { status: 400 });
+    }
+
+    const appFiles = {};
+    for (const [key, rel] of Object.entries(manifest.appFiles || {})) {
+      const candidateRel = String(rel || '').replace(/\\/g, '/');
+      const zipRel = `${itemRoot}/${candidateRel}`;
+      if (!entries.has(zipRel)) {
+        throw Object.assign(new Error('missing app file'), { status: 400 });
+      }
+      const outRel = `${id}/${candidateRel}`;
+      const outPath = safeStagePath(stageDir, outRel);
+      ensureDir(path.dirname(outPath));
+      fs.writeFileSync(outPath, entries.get(zipRel));
+      appFiles[key] = outRel;
+    }
+
+    const deviceFiles = [];
+    for (const deviceFile of manifest.deviceFiles || []) {
+      const targetPath = validateFactoryTargetPath(deviceFile.path);
+      const sourceRel = String(deviceFile.source || '').replace(/\\/g, '/');
+      const zipRel = `${itemRoot}/${sourceRel}`;
+      if (!entries.has(zipRel)) {
+        throw Object.assign(new Error('missing device file'), { status: 400 });
+      }
+      const outRel = `${id}/${sourceRel}`;
+      const outPath = safeStagePath(stageDir, outRel);
+      ensureDir(path.dirname(outPath));
+      fs.writeFileSync(outPath, entries.get(zipRel));
+      deviceFiles.push({ path: targetPath, source: outRel });
+    }
+
+    candidates.push({
+      id,
+      title: String(manifest.title || id),
+      type,
+      protected: isProtectedFactoryId(id),
+      minFirmwareVersion: String(manifest.minFirmwareVersion || ''),
+      appFiles,
+      deviceFiles,
+    });
+  }
+
+  saveJson(path.join(stageDir, 'staged.json'), { importId, stagedAt: new Date().toISOString(), candidates });
+  return { importId, candidates };
+}
+
+function publishFactoryCandidates({ factoryCatalogFile, factoryImportsDir, factoryDownloadsDir, importId, itemIds }) {
+  const stageDir = path.join(factoryImportsDir, path.basename(String(importId || '')));
+  const staged = loadJson(path.join(stageDir, 'staged.json'), null);
+  const selected = new Set((Array.isArray(itemIds) ? itemIds : []).map(normalizeFactoryItemId));
+  const catalog = loadFactoryCatalog(factoryCatalogFile);
+  const now = new Date().toISOString();
+
+  for (const candidate of staged.candidates.filter((item) => selected.has(item.id))) {
+    const existing = catalog.items.find((item) => item.id === candidate.id);
+    const revision = (existing?.revision || 0) + 1;
+    const itemDir = path.join(factoryDownloadsDir, candidate.id, String(revision));
+    ensureDir(itemDir);
+
+    const appFiles = {};
+    for (const [key, rel] of Object.entries(candidate.appFiles || {})) {
+      const source = safeStagePath(stageDir, rel);
+      const filename = path.basename(rel);
+      const destination = path.join(itemDir, filename);
+      fs.copyFileSync(source, destination);
+      const stat = fs.statSync(destination);
+      appFiles[key] = {
+        url: `/downloads/factory/${candidate.id}/${revision}/${encodeURIComponent(filename)}`,
+        size: stat.size,
+        sha256: computeBufferSha256(fs.readFileSync(destination)),
+      };
+    }
+
+    const deviceFiles = [];
+    for (const deviceFile of candidate.deviceFiles || []) {
+      const source = safeStagePath(stageDir, deviceFile.source);
+      const destination = path.join(itemDir, 'device', deviceFile.path);
+      ensureDir(path.dirname(destination));
+      fs.copyFileSync(source, destination);
+      const stat = fs.statSync(destination);
+      deviceFiles.push({
+        path: deviceFile.path,
+        url: `/downloads/factory/${candidate.id}/${revision}/device/${deviceFile.path}`,
+        size: stat.size,
+        sha256: computeBufferSha256(fs.readFileSync(destination)),
+      });
+    }
+
+    const nextItem = {
+      id: candidate.id,
+      title: candidate.title,
+      type: candidate.type,
+      protected: isProtectedFactoryId(candidate.id),
+      revision,
+      minFirmwareVersion: candidate.minFirmwareVersion,
+      publishedAt: now,
+      appFiles,
+      deviceFiles,
+      history: [
+        ...(existing?.history || []),
+        ...(existing ? [{
+          revision: existing.revision || 0,
+          publishedAt: existing.publishedAt || '',
+          appFiles: existing.appFiles || {},
+          deviceFiles: existing.deviceFiles || [],
+        }] : []),
+      ].filter((entry) => entry.revision > 0).slice(-10),
+    };
+
+    if (existing) {
+      Object.assign(existing, nextItem);
+    } else {
+      catalog.items.push(nextItem);
+    }
+  }
+
+  catalog.catalogRevision = (catalog.catalogRevision || 0) + 1;
+  catalog.publishedAt = now;
+  saveFactoryCatalogAtomic(factoryCatalogFile, catalog);
+  return publicFactoryCatalog(loadFactoryCatalog(factoryCatalogFile));
+}
+
+function deleteFactoryItem(factoryCatalogFile, id) {
+  const itemId = normalizeFactoryItemId(id);
+  if (isProtectedFactoryId(itemId)) {
+    throw Object.assign(new Error('protected factory item cannot be deleted'), { status: 409 });
+  }
+  const catalog = loadFactoryCatalog(factoryCatalogFile);
+  const before = catalog.items.length;
+  catalog.items = catalog.items.filter((item) => item.id !== itemId);
+  if (catalog.items.length === before) {
+    throw Object.assign(new Error('factory item not found'), { status: 404 });
+  }
+  catalog.catalogRevision = (catalog.catalogRevision || 0) + 1;
+  catalog.publishedAt = new Date().toISOString();
+  saveFactoryCatalogAtomic(factoryCatalogFile, catalog);
+  return publicFactoryCatalog(loadFactoryCatalog(factoryCatalogFile));
+}
+
 function sanitizePreviewMime(mime) {
   const value = String(mime || '').toLowerCase();
   if ([
@@ -173,6 +574,18 @@ function sanitizePreviewMime(mime) {
     return value;
   }
   return 'application/octet-stream';
+}
+
+function previewMimeRank(mime) {
+  const value = sanitizePreviewMime(mime);
+  if (value.startsWith('video/')) return 3;
+  if (value === 'image/gif') return 2;
+  if (value.startsWith('image/')) return 1;
+  return 0;
+}
+
+function shouldReplacePreview(existingMime, nextMime) {
+  return previewMimeRank(nextMime) > previewMimeRank(existingMime);
 }
 
 function removeRelativeFile(dataDir, relativePath) {
@@ -407,6 +820,10 @@ table tr:hover td{background:rgba(22,93,255,.02)}
         <svg class="icon-md" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
         固件管理
       </div>
+      <div class="nav-item" data-page="factory" onclick="switchPage('factory')">
+        <svg class="icon-md" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        Official Animations
+      </div>
     </nav>
   </aside>
   <div class="main">
@@ -492,6 +909,29 @@ table tr:hover td{background:rgba(22,93,255,.02)}
         </div>
       </div>
 
+      <div class="page" id="page-factory">
+        <div class="card">
+          <div class="info-bar" id="factoryInfo">Loading catalog...</div>
+          <div class="drop-zone" id="factoryDropZone">
+            <div class="hint">
+              <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Drop factory-import.zip here or click to select
+            </div>
+            <div class="filename" id="factoryFilename"></div>
+            <input type="file" accept=".zip" id="factoryFileInput" onchange="onFactoryZipSelected(this)">
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" id="factoryUploadBtn" onclick="uploadFactoryZip()" disabled>Upload ZIP</button>
+            <button class="btn" id="factoryPublishBtn" onclick="publishFactorySelection()" disabled>Publish Selected</button>
+            <span class="status-msg" id="factoryStatus"></span>
+          </div>
+          <div class="history-title">Staged Candidates</div>
+          <div id="factoryCandidates"><div class="empty-msg">No staged import</div></div>
+          <div class="history-title">Published Catalog</div>
+          <div id="factoryCatalog"><div class="empty-msg">Loading...</div></div>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
@@ -500,7 +940,9 @@ table tr:hover td{background:rgba(22,93,255,.02)}
 let adminToken = localStorage.getItem('esp_baji_token') || '';
 let apkFile = null;
 let fwFile = null;
-const pageTitles = { assets: '素材审核', apk: 'App 版本管理', firmware: '固件管理' };
+let factoryZipFile = null;
+let factoryImportId = '';
+const pageTitles = { assets: '素材审核', apk: 'App 版本管理', firmware: '固件管理', factory: 'Official Animations' };
 
 function switchPage(name) {
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.page === name));
@@ -509,6 +951,7 @@ function switchPage(name) {
   if (name === 'apk') refreshStatus();
   if (name === 'firmware') refreshStatus();
   if (name === 'assets') loadAssets();
+  if (name === 'factory') loadFactoryCatalog();
 }
 
 function api(method, path, body) {
@@ -596,7 +1039,7 @@ function onFwSelected(input) {
   if (v) document.getElementById('fwVersion').value = v;
 }
 
-['apkDropZone', 'fwDropZone'].forEach(id => {
+['apkDropZone', 'fwDropZone', 'factoryDropZone'].forEach(id => {
   const zone = document.getElementById(id);
   if (!zone) return;
   const fileInput = zone.querySelector('input[type=file]');
@@ -776,6 +1219,158 @@ async function loadFirmwareHistory() {
   }
 }
 
+function renderFactoryPreview(item) {
+  const thumb = item.appFiles && item.appFiles.thumbnail ? item.appFiles.thumbnail.url : '';
+  const loopVideo = item.appFiles && item.appFiles.loopVideo ? item.appFiles.loopVideo.url : '';
+  if (loopVideo) {
+    return '<video class="asset-thumb" controls muted preload="metadata" src="' + escapeHtml(loopVideo) + '"></video>';
+  }
+  if (thumb) {
+    return '<a href="' + escapeHtml(thumb) + '" target="_blank"><img class="asset-thumb" src="' + escapeHtml(thumb) + '" alt="thumbnail"></a>';
+  }
+  return '<span class="asset-meta">No preview</span>';
+}
+
+function renderFactoryCandidates(candidates) {
+  const list = document.getElementById('factoryCandidates');
+  const publishBtn = document.getElementById('factoryPublishBtn');
+  if (!list) return;
+  if (!candidates || candidates.length === 0) {
+    list.innerHTML = '<div class="empty-msg">No staged import</div>';
+    if (publishBtn) publishBtn.disabled = true;
+    return;
+  }
+  let html = '<table><thead><tr><th></th><th>Preview</th><th>ID</th><th>Type</th><th>Firmware</th><th>Files</th></tr></thead><tbody>';
+  for (const item of candidates) {
+    const preview = renderFactoryPreview(item);
+    const fileCount = (item.appFiles ? Object.keys(item.appFiles).length : 0) + (item.deviceFiles ? item.deviceFiles.length : 0);
+    html += '<tr>' +
+      '<td><input type="checkbox" class="factoryCandidateCheck" value="' + escapeHtml(item.id) + '" checked></td>' +
+      '<td>' + preview + '</td>' +
+      '<td><span class="mono">' + escapeHtml(item.id) + '</span></td>' +
+      '<td>' + escapeHtml(item.type || '-') + '</td>' +
+      '<td>' + escapeHtml(item.minFirmwareVersion || '-') + '</td>' +
+      '<td>' + fileCount + '</td>' +
+      '</tr>';
+  }
+  html += '</tbody></table>';
+  list.innerHTML = html;
+  if (publishBtn) publishBtn.disabled = false;
+}
+
+function renderFactoryCatalog(catalog) {
+  const list = document.getElementById('factoryCatalog');
+  const info = document.getElementById('factoryInfo');
+  if (!list) return;
+  if (info) {
+    info.innerHTML = '<span><strong>Revision</strong> ' + (catalog.catalogRevision || 0) + '</span>' +
+      '<span><strong>Published</strong> ' + escapeHtml(String(catalog.publishedAt || '-').slice(0, 19).replace('T', ' ')) + '</span>' +
+      '<span><strong>Items</strong> ' + (catalog.items ? catalog.items.length : 0) + '</span>';
+  }
+  if (!catalog.items || catalog.items.length === 0) {
+    list.innerHTML = '<div class="empty-msg">No published items</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>Preview</th><th>ID</th><th>Type</th><th>Protected</th><th>Revision</th><th>Files</th><th>Actions</th></tr></thead><tbody>';
+  for (const item of catalog.items) {
+    const files = []
+      .concat(Object.values(item.appFiles || {}).map((entry) => entry.size || 0))
+      .concat((item.deviceFiles || []).map((entry) => entry.size || 0))
+      .reduce((sum, size) => sum + Number(size || 0), 0);
+    const actions = [
+      '<button class="btn btn-sm btn-danger" onclick="deleteFactoryItem(\\'' + item.id + '\\')">Delete</button>',
+    ].join(' ');
+    html += '<tr>' +
+      '<td>' + renderFactoryPreview(item) + '</td>' +
+      '<td><span class="mono">' + escapeHtml(item.id) + '</span></td>' +
+      '<td>' + escapeHtml(item.type || '-') + '</td>' +
+      '<td>' + (item.protected ? '<span class="tag tag-green">yes</span>' : '<span class="tag tag-orange">no</span>') + '</td>' +
+      '<td>' + escapeHtml(String(item.revision || 0)) + '</td>' +
+      '<td>' + formatSize(files) + '</td>' +
+      '<td><div class="version-actions">' + actions + '</div></td>' +
+      '</tr>';
+  }
+  html += '</tbody></table>';
+  list.innerHTML = html;
+}
+
+async function loadFactoryCatalog() {
+  try {
+    const data = await api('GET', '/api/admin/factory');
+    renderFactoryCatalog(data);
+  } catch (e) {
+    const list = document.getElementById('factoryCatalog');
+    if (list) list.innerHTML = '<div class="empty-msg">Load failed</div>';
+  }
+}
+
+function onFactoryZipSelected(input) {
+  factoryZipFile = input.files[0] || null;
+  const filename = document.getElementById('factoryFilename');
+  const uploadBtn = document.getElementById('factoryUploadBtn');
+  if (!factoryZipFile) return;
+  filename.textContent = factoryZipFile.name + ' (' + formatSize(factoryZipFile.size) + ')';
+  document.getElementById('factoryDropZone').classList.add('has-file');
+  uploadBtn.disabled = false;
+}
+
+async function uploadFactoryZip() {
+  if (!factoryZipFile) return;
+  const status = document.getElementById('factoryStatus');
+  const btn = document.getElementById('factoryUploadBtn');
+  btn.disabled = true;
+  status.textContent = 'Uploading...';
+  try {
+    const form = new FormData();
+    form.append('file', factoryZipFile);
+    const r = await fetch('/api/admin/factory/import', {
+      method: 'POST',
+      headers: { 'X-Admin-Token': adminToken },
+      body: form,
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'upload failed');
+    factoryImportId = data.importId || '';
+    renderFactoryCandidates(data.candidates || []);
+    status.textContent = 'Import staged';
+    status.className = 'status-msg ok';
+    await loadFactoryCatalog();
+  } catch (e) {
+    status.textContent = 'Failed: ' + e.message;
+    status.className = 'status-msg err';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function publishFactorySelection() {
+  const status = document.getElementById('factoryStatus');
+  const selected = Array.from(document.querySelectorAll('.factoryCandidateCheck:checked')).map((el) => el.value);
+  if (!factoryImportId || selected.length === 0) return;
+  try {
+    const data = await api('POST', '/api/admin/factory/publish', {
+      importId: factoryImportId,
+      itemIds: selected,
+    });
+    renderFactoryCatalog(data);
+    status.textContent = 'Published';
+    status.className = 'status-msg ok';
+  } catch (e) {
+    status.textContent = 'Failed: ' + e.message;
+    status.className = 'status-msg err';
+  }
+}
+
+async function deleteFactoryItem(id) {
+  if (!confirm('Delete factory item ' + id + '?')) return;
+  try {
+    const data = await api('DELETE', '/api/admin/factory/' + encodeURIComponent(id), null);
+    renderFactoryCatalog(data);
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
 async function deleteAppVersion(platform, version) {
   if (!confirm('确定删除 App 版本 ' + version + ' 吗？')) return;
   try {
@@ -895,21 +1490,32 @@ function createApp(options = {}) {
   const downloadsDir = path.join(dataDir, 'downloads');
   const apkDir = path.join(downloadsDir, 'apk');
   const firmwareDir = path.join(downloadsDir, 'firmware');
+  const factoryCatalogFile = path.join(dataDir, 'factory_catalog.json');
+  const factoryImportsDir = path.join(dataDir, 'factory_imports');
+  const factoryDownloadsDir = path.join(downloadsDir, 'factory');
 
   ensureDir(packagesDir);
   ensureDir(previewsDir);
   ensureDir(apkDir);
   ensureDir(firmwareDir);
+  ensureDir(factoryImportsDir);
+  ensureDir(factoryDownloadsDir);
   loadJson(versionsFile, defaultVersions);
   loadJson(otaFile, defaultOta);
   loadJson(appVersionsFile, defaultAppVersionHistory);
   loadJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
   loadJson(metadataFile, []);
+  loadFactoryCatalog(factoryCatalogFile);
 
   function getServerBaseUrl(req) {
     const host = req.headers.host || 'localhost:8787';
     const proto = req.headers['x-forwarded-proto'] || 'http';
     return `${proto}://${host}`;
+  }
+
+  function getFirmwareBaseUrl(req) {
+    const host = req.headers.host || 'localhost:8787';
+    return `http://${host}`;
   }
 
   return async function app(req, res) {
@@ -950,6 +1556,65 @@ function createApp(options = {}) {
         const hardware = (url.searchParams.get('hardware') || 'esp32s3').toLowerCase();
         const manifests = loadJson(otaFile, defaultOta);
         sendJson(res, manifests[hardware] ? 200 : 404, manifests[hardware] || { error: 'unknown hardware' });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/factory-catalog') {
+        const catalog = loadFactoryCatalog(factoryCatalogFile);
+        sendJson(res, 200, publicFactoryCatalog(catalog));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/admin/factory') {
+        if (!requireAdmin(req, adminToken)) {
+          sendJson(res, 401, { error: 'unauthorized' });
+          return;
+        }
+        sendJson(res, 200, publicFactoryCatalog(loadFactoryCatalog(factoryCatalogFile)));
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/admin/factory/import') {
+        if (!requireAdmin(req, adminToken)) {
+          sendJson(res, 401, { error: 'unauthorized' });
+          return;
+        }
+        const parts = await readMultipart(req);
+        const filePart = parts.find((part) => part.name === 'file' && part.filename);
+        if (!filePart) {
+          sendJson(res, 400, { error: 'missing file' });
+          return;
+        }
+        const staged = stageFactoryImport(filePart.data, factoryImportsDir);
+        sendJson(res, 201, staged);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/admin/factory/publish') {
+        if (!requireAdmin(req, adminToken)) {
+          sendJson(res, 401, { error: 'unauthorized' });
+          return;
+        }
+        const body = await readJsonBody(req);
+        const published = publishFactoryCandidates({
+          factoryCatalogFile,
+          factoryImportsDir,
+          factoryDownloadsDir,
+          importId: body.importId,
+          itemIds: body.itemIds,
+        });
+        sendJson(res, 200, published);
+        return;
+      }
+
+      const deleteFactoryMatch = url.pathname.match(/^\/api\/admin\/factory\/([^/]+)$/);
+      if (req.method === 'DELETE' && deleteFactoryMatch) {
+        if (!requireAdmin(req, adminToken)) {
+          sendJson(res, 401, { error: 'unauthorized' });
+          return;
+        }
+        const deleted = deleteFactoryItem(factoryCatalogFile, decodeURIComponent(deleteFactoryMatch[1]));
+        sendJson(res, 200, deleted);
         return;
       }
 
@@ -1050,7 +1715,7 @@ function createApp(options = {}) {
         version = sanitizeVersion(version, extractVersionFromFilename(filePart.filename) || '1.0.0');
         const apkName = `app_gif_${version}.apk`;
         const apkPath = path.join(apkDir, apkName);
-        fs.writeFileSync(apkPath, filePart.data);
+        writeFileAtomicSync(apkPath, filePart.data);
 
         const baseUrl = getServerBaseUrl(req);
         const storeUrl = `${baseUrl}/downloads/apk/${encodeURIComponent(apkName)}`;
@@ -1097,10 +1762,10 @@ function createApp(options = {}) {
         version = sanitizeVersion(version, extractVersionFromFilename(filePart.filename) || '0.1.0');
         const fwName = `esp-baji-esp32s3-${version}.bin`;
         const fwPath = path.join(firmwareDir, fwName);
-        fs.writeFileSync(fwPath, filePart.data);
+        writeFileAtomicSync(fwPath, filePart.data);
 
         const sha256 = await computeSha256(fwPath);
-        const baseUrl = getServerBaseUrl(req);
+        const baseUrl = getFirmwareBaseUrl(req);
         const fwUrl = `${baseUrl}/downloads/firmware/${encodeURIComponent(fwName)}`;
 
         let history = loadJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
@@ -1167,6 +1832,36 @@ function createApp(options = {}) {
         return;
       }
 
+      const factoryDownloadMatch = url.pathname.match(/^\/downloads\/factory\/([^/]+)\/(\d+)\/(.+)$/);
+      if ((req.method === 'GET' || req.method === 'HEAD') && factoryDownloadMatch) {
+        const itemId = normalizeFactoryItemId(decodeURIComponent(factoryDownloadMatch[1]));
+        const revision = path.basename(factoryDownloadMatch[2]);
+        const relative = factoryDownloadMatch[3].replace(/\\/g, '/');
+        const filePath = path.join(factoryDownloadsDir, itemId, revision, relative);
+        const root = path.resolve(factoryDownloadsDir);
+        if (!path.resolve(filePath).startsWith(root + path.sep) || !fs.existsSync(filePath)) {
+          sendJson(res, 404, { error: 'factory file not found' });
+          return;
+        }
+        const stat = fs.statSync(filePath);
+        const ext = path.extname(filePath).toLowerCase();
+        const contentType = ext === '.png' ? 'image/png'
+          : ext === '.mp4' ? 'video/mp4'
+          : ext === '.eb4' ? 'application/octet-stream'
+          : 'application/octet-stream';
+        res.writeHead(200, {
+          'content-type': contentType,
+          'content-length': stat.size,
+          'cache-control': 'public, max-age=31536000, immutable',
+        });
+        if (req.method === 'HEAD') {
+          res.end();
+          return;
+        }
+        fs.createReadStream(filePath).pipe(res);
+        return;
+      }
+
       if (req.method === 'POST' && url.pathname === '/api/assets') {
         const body = await readJsonBody(req);
         const name = sanitizeName(body.name);
@@ -1175,16 +1870,19 @@ function createApp(options = {}) {
         const packageSize = Number(body.packageSize) || packageBytes.length;
         const crc32 = String(body.crc32 || '');
         const items = loadJson(metadataFile, []);
-        const duplicate = items.find((asset) =>
-          asset.packageSha256 === packageSha256 ||
-          (!asset.packageSha256 && asset.crc32 === crc32 && Number(asset.packageSize || 0) === packageSize)
-        );
+        const duplicate = findDuplicateAsset(items, packageSha256, crc32, packageSize);
         if (duplicate) {
-          if (!duplicate.previewPath && typeof body.previewBase64 === 'string' && body.previewBase64.length > 0) {
+          const nextPreviewMime = sanitizePreviewMime(body.previewMime);
+          const hasIncomingPreview = typeof body.previewBase64 === 'string' && body.previewBase64.length > 0;
+          const existingPreviewMissing = !duplicate.previewPath ||
+            !fs.existsSync(path.join(dataDir, duplicate.previewPath));
+          if (hasIncomingPreview &&
+              (existingPreviewMissing || shouldReplacePreview(duplicate.previewMime, nextPreviewMime))) {
+            removeRelativeFile(dataDir, duplicate.previewPath);
             const previewPath = path.join(previewsDir, `${duplicate.id}.bin`);
             fs.writeFileSync(previewPath, Buffer.from(body.previewBase64, 'base64'));
             duplicate.previewPath = path.relative(dataDir, previewPath);
-            duplicate.previewMime = sanitizePreviewMime(body.previewMime);
+            duplicate.previewMime = nextPreviewMime;
             saveJson(metadataFile, items);
           }
           sendJson(res, 200, publicAsset(duplicate));

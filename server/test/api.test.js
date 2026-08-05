@@ -8,6 +8,94 @@ const vm = require('node:vm');
 
 const { createApp } = require('../src/app');
 
+const crcTable = Array.from({ length: 256 }, (_, index) => {
+  let crc = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return crc >>> 0;
+});
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function u16(value) {
+  const buffer = Buffer.alloc(2);
+  buffer.writeUInt16LE(value);
+  return buffer;
+}
+
+function u32(value) {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32LE(value >>> 0);
+  return buffer;
+}
+
+function makeZip(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name.replace(/\\/g, '/'));
+    const data = Buffer.from(entry.data);
+    const checksum = crc32(data);
+    const local = Buffer.concat([
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(checksum), u32(data.length), u32(data.length), u16(name.length), u16(0),
+      name, data,
+    ]);
+    const central = Buffer.concat([
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(checksum), u32(data.length), u32(data.length), u16(name.length), u16(0), u16(0),
+      u16(0), u16(0), u32(0), u32(offset), name,
+    ]);
+    localParts.push(local);
+    centralParts.push(central);
+    offset += local.length;
+  }
+
+  const centralDir = Buffer.concat(centralParts);
+  return Buffer.concat([
+    ...localParts,
+    centralDir,
+    u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length),
+    u32(centralDir.length), u32(offset), u16(0),
+  ]);
+}
+
+function makeFactoryImportZip(id, files = {}) {
+  const manifest = {
+    id,
+    title: id,
+    type: 'loop',
+    protected: false,
+    minFirmwareVersion: '0.1.44',
+    appFiles: {
+      thumbnail: `app/${id}.png`,
+      loopVideo: `app/${id}_loop.mp4`,
+    },
+    deviceFiles: [
+      {
+        path: `factory_loop/${id}.eb4`,
+        source: `device/factory_loop/${id}.eb4`,
+      },
+    ],
+  };
+  return makeZip([
+    { name: 'import.json', data: JSON.stringify({ items: [`items/${id}/manifest.json`] }) },
+    { name: `items/${id}/manifest.json`, data: JSON.stringify(manifest) },
+    { name: `items/${id}/app/${id}.png`, data: files.thumbnail || 'png' },
+    { name: `items/${id}/app/${id}_loop.mp4`, data: files.loopVideo || 'mp4' },
+    { name: `items/${id}/device/factory_loop/${id}.eb4`, data: files.eb4 || 'eb4' },
+  ]);
+}
+
 function request(baseUrl, method, pathname, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = body ? Buffer.from(JSON.stringify(body)) : null;
@@ -236,6 +324,58 @@ test('asset review deduplicates packages, serves previews, and deletes old asset
   });
 });
 
+test('duplicate asset submissions prefer already approved records', async () => {
+  await withServer(async (baseUrl, dataDir) => {
+    const created = await request(baseUrl, 'POST', '/api/assets', {
+      userId: 'u1',
+      name: 'approved.eb4',
+      packageBase64: Buffer.from('legacy-duplicate-package').toString('base64'),
+      previewBase64: Buffer.from('approved-preview').toString('base64'),
+      previewMime: 'image/png',
+      crc32: '44444444',
+      packageSize: 24,
+      frameCount: 3,
+      fps: 40,
+    });
+    assert.equal(created.status, 201);
+
+    const approved = await request(
+      baseUrl,
+      'POST',
+      `/api/admin/assets/${created.json.id}/approve`,
+      { reviewer: 'admin' },
+      { 'X-Admin-Token': 'test-token' },
+    );
+    assert.equal(approved.status, 200);
+    assert.equal(approved.json.status, 'approved');
+
+    const metadataPath = path.join(dataDir, 'assets', 'metadata.json');
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    metadata.unshift({
+      ...metadata[0],
+      id: 'pending-legacy-duplicate',
+      status: 'pending',
+      submittedAt: new Date().toISOString(),
+    });
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+
+    const duplicate = await request(baseUrl, 'POST', '/api/assets', {
+      userId: 'u1',
+      name: 'same-again.eb4',
+      packageBase64: Buffer.from('legacy-duplicate-package').toString('base64'),
+      previewBase64: Buffer.from('new-preview').toString('base64'),
+      previewMime: 'image/png',
+      crc32: '44444444',
+      packageSize: 24,
+      frameCount: 3,
+      fps: 40,
+    });
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.json.id, created.json.id);
+    assert.equal(duplicate.json.status, 'approved');
+  });
+});
+
 test('admin page renders playable video previews', async () => {
   await withServer(async (baseUrl) => {
     const created = await request(baseUrl, 'POST', '/api/assets', {
@@ -274,6 +414,58 @@ test('admin page renders playable video previews', async () => {
     assert.equal(adminPage.status, 200);
     assert.match(adminPage.text, /function buildPreviewHtml/);
     assert.match(adminPage.text, /<video class="asset-thumb" controls/);
+  });
+});
+
+test('admin page exposes official factory animation management', async () => {
+  await withServer(async (baseUrl) => {
+    const adminPage = await request(baseUrl, 'GET', '/');
+    assert.equal(adminPage.status, 200);
+    assert.match(adminPage.text, /page-factory/);
+    assert.match(adminPage.text, /function uploadFactoryZip/);
+    assert.match(adminPage.text, /function loadFactoryCatalog/);
+  });
+});
+
+test('duplicate asset submissions can upgrade static previews to animated previews', async () => {
+  await withServer(async (baseUrl) => {
+    const first = await request(baseUrl, 'POST', '/api/assets', {
+      userId: 'u1',
+      name: 'movie.eb4',
+      packageBase64: Buffer.from('same-video-package').toString('base64'),
+      previewBase64: Buffer.from('static-preview').toString('base64'),
+      previewMime: 'image/png',
+      crc32: '33333333',
+      packageSize: 18,
+      frameCount: 5,
+      fps: 40,
+    });
+    assert.equal(first.status, 201);
+    assert.equal(first.json.previewMime, 'image/png');
+
+    const duplicate = await request(baseUrl, 'POST', '/api/assets', {
+      userId: 'u1',
+      name: 'movie-again.eb4',
+      packageBase64: Buffer.from('same-video-package').toString('base64'),
+      previewBase64: Buffer.from('animated-preview').toString('base64'),
+      previewMime: 'image/gif',
+      crc32: '33333333',
+      packageSize: 18,
+      frameCount: 5,
+      fps: 40,
+    });
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.json.id, first.json.id);
+    assert.equal(duplicate.json.previewMime, 'image/gif');
+
+    const preview = await request(
+      baseUrl,
+      'GET',
+      `/api/admin/assets/${first.json.id}/preview?token=test-token`,
+    );
+    assert.equal(preview.status, 200);
+    assert.equal(preview.headers['content-type'], 'image/gif');
+    assert.equal(preview.text, 'animated-preview');
   });
 });
 
@@ -322,6 +514,125 @@ test('ota manifest endpoint returns firmware metadata', async () => {
   });
 });
 
+test('factory catalog starts with protected baseline and rejects protected deletion', async () => {
+  await withServer(async (baseUrl) => {
+    const admin = { 'X-Admin-Token': 'test-token' };
+    const catalog = await request(baseUrl, 'GET', '/api/factory-catalog');
+    assert.equal(catalog.status, 200);
+    assert.equal(catalog.json.schemaVersion, 1);
+    assert.equal(catalog.json.items.find((item) => item.id === 'F001').protected, true);
+
+    const deleted = await request(baseUrl, 'DELETE', '/api/admin/factory/F001', null, admin);
+    assert.equal(deleted.status, 409);
+  });
+});
+
+test('factory import publishes replaces and deletes server managed loop animations', async () => {
+  await withServer(async (baseUrl) => {
+    const admin = { 'X-Admin-Token': 'test-token' };
+    const staged = await multipartRequest(
+      baseUrl,
+      '/api/admin/factory/import',
+      {},
+      { name: 'file', filename: 'factory-import.zip', content: makeFactoryImportZip('F022') },
+      admin,
+    );
+    assert.equal(staged.status, 201);
+    assert.equal(staged.json.candidates[0].id, 'F022');
+
+    const published = await request(
+      baseUrl,
+      'POST',
+      '/api/admin/factory/publish',
+      { importId: staged.json.importId, itemIds: ['F022'] },
+      admin,
+    );
+    assert.equal(published.status, 200);
+    let f022 = published.json.items.find((item) => item.id === 'F022');
+    assert.equal(f022.revision, 1);
+    assert.equal(f022.type, 'loop');
+    assert.ok(f022.appFiles.thumbnail.sha256);
+    assert.match(f022.deviceFiles[0].url, /\/downloads\/factory\/F022\/1\/device\/factory_loop\/F022\.eb4$/);
+
+    const stagedReplace = await multipartRequest(
+      baseUrl,
+      '/api/admin/factory/import',
+      {},
+      { name: 'file', filename: 'factory-import.zip', content: makeFactoryImportZip('F022', { eb4: 'new-eb4' }) },
+      admin,
+    );
+    assert.equal(stagedReplace.status, 201);
+    const replaced = await request(
+      baseUrl,
+      'POST',
+      '/api/admin/factory/publish',
+      { importId: stagedReplace.json.importId, itemIds: ['F022'] },
+      admin,
+    );
+    f022 = replaced.json.items.find((item) => item.id === 'F022');
+    assert.equal(f022.revision, 2);
+
+    const removed = await request(baseUrl, 'DELETE', '/api/admin/factory/F022', null, admin);
+    assert.equal(removed.status, 200);
+    assert.equal(removed.json.items.some((item) => item.id === 'F022'), false);
+  });
+});
+
+test('factory import rejects zip traversal entries', async () => {
+  await withServer(async (baseUrl) => {
+    const rejected = await multipartRequest(
+      baseUrl,
+      '/api/admin/factory/import',
+      {},
+      { name: 'file', filename: 'bad.zip', content: makeZip([{ name: '../escape.txt', data: 'bad' }]) },
+      { 'X-Admin-Token': 'test-token' },
+    );
+    assert.equal(rejected.status, 400);
+  });
+});
+
+test('server accepts JSON data files saved with a UTF-8 BOM', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'esp-baji-server-'));
+  try {
+    fs.writeFileSync(
+      path.join(dataDir, 'ota.json'),
+      '\ufeff' +
+        JSON.stringify({
+          esp32s3: {
+            hardware: 'esp32s3',
+            version: '0.1.42',
+            url: 'http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.42.bin',
+            sha256: 'x'.repeat(64),
+            notes: 'bom test',
+          },
+        }),
+    );
+
+    assert.doesNotThrow(() => createApp({ dataDir, adminToken: 'test-token' }));
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('firmware uploads publish HTTP OTA URLs even behind HTTPS proxy', async () => {
+  await withServer(async (baseUrl) => {
+    const uploaded = await multipartRequest(
+      baseUrl,
+      '/api/admin/upload-firmware',
+      { version: '0.1.43', notes: 'firmware 0.1.43' },
+      { name: 'file', filename: 'esp-baji-esp32s3-0.1.43.bin', content: Buffer.from('fw043') },
+      {
+        'X-Admin-Token': 'test-token',
+        'X-Forwarded-Proto': 'https',
+        Host: '60.205.122.153',
+      },
+    );
+
+    assert.equal(uploaded.status, 200);
+    assert.equal(uploaded.json.esp32s3.url, 'http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.43.bin');
+  });
+});
+
 test('download endpoints support header probes', async () => {
   await withServer(async (baseUrl, dataDir) => {
     const apkDir = path.join(dataDir, 'downloads', 'apk');
@@ -341,6 +652,14 @@ test('download endpoints support header probes', async () => {
     assert.equal(firmware.headers['content-length'], '2');
     assert.equal(firmware.text, '');
   });
+});
+
+test('binary release uploads are published atomically', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'app.js'), 'utf8');
+  assert.match(source, /function writeFileAtomicSync/);
+  assert.match(source, /fs\.renameSync\(tmpPath, file\)/);
+  assert.doesNotMatch(source, /fs\.writeFileSync\(apkPath, filePart\.data\)/);
+  assert.doesNotMatch(source, /fs\.writeFileSync\(fwPath, filePart\.data\)/);
 });
 
 test('admin uploads maintain app and firmware version history', async () => {
