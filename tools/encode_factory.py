@@ -3,9 +3,11 @@
 """Factory Animation Encoder - MP4 to EBAJ4 for ESP32 badge."""
 
 import os
+import json
 import subprocess
 import struct
 import sys
+import zipfile
 import zlib
 from pathlib import Path
 
@@ -19,14 +21,23 @@ HEIGHT = 480
 ZOOM = 1.1  # default scale-up factor
 
 def get_zoom(pid):
-    """F008-F017 need 1.3x zoom, others 1.1x."""
+    """3/6/7/18 no zoom(1.0), F008-F017 1.3x, others 1.1x."""
     try:
-        n = int(pid[1:])  # "F008" -> 8
+        n = int(pid[1:])  # "F003" -> 3
+        if n in (3, 6, 7, 18):
+            return 1.0
         if 8 <= n <= 17:
             return 1.3
     except ValueError:
         pass
     return ZOOM  # default 1.1
+
+
+def get_third_zoom(eid):
+    """Special transition materials are already pre-scaled."""
+    return 1.0
+
+
 PALETTE_ENTRIES = 256
 PALETTE_BYTES = PALETTE_ENTRIES * 2
 HEADER_SIZE = 44
@@ -60,8 +71,19 @@ def make_dial_mp4(mp4, out_mp4, size=480, fps=30, zoom=1.0):
 def natural_key(name):
     """Extract leading number for natural sort (2 < 10)."""
     import re
-    m = re.match(r'(\d+)', Path(name).name)
+    m = re.match(r'F?(\d+)', Path(name).stem, re.IGNORECASE)
     return int(m.group(1)) if m else 0
+
+
+def normalize_factory_loop_id(stem):
+    """Normalize loop source stems like 22 or F023 to F022/F023."""
+    name = str(stem).upper()
+    if name.startswith("F"):
+        name = name[1:]
+    number = int(name)
+    if number <= 0:
+        raise ValueError(f"invalid factory loop id: {stem}")
+    return f"F{number:03d}"
 
 
 def find_pairs():
@@ -85,6 +107,82 @@ def find_third():
         eid = mp4.stem  # "F007"
         result.append((eid, mp4))
     return result
+
+
+def discover_factory_loop_sources(src_dir=SRC_DIR):
+    """Scan factory_loop folder for full-loop official animations."""
+    loop_dir = Path(src_dir) / "factory_loop"
+    if not loop_dir.is_dir():
+        return []
+    result = []
+    for mp4 in sorted(loop_dir.glob("*.mp4"), key=natural_key):
+        result.append((normalize_factory_loop_id(mp4.stem), mp4))
+    return result
+
+
+def write_factory_import_zip(items, zip_path):
+    """Write a server import ZIP with one or more complete factory candidates."""
+    zip_path = Path(zip_path)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_paths = []
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in sorted(items, key=lambda entry: entry["id"]):
+            item_id = item["id"]
+            base = f"items/{item_id}"
+            manifest_rel = f"{base}/manifest.json"
+            manifest_paths.append(manifest_rel)
+
+            thumbnail_name = Path(item["thumbnail"]).name
+            loop_video_name = Path(item["loopVideo"]).name
+            app_thumbnail = f"app/{thumbnail_name}"
+            app_loop_video = f"app/{loop_video_name}"
+            zf.write(item["thumbnail"], f"{base}/{app_thumbnail}")
+            zf.write(item["loopVideo"], f"{base}/{app_loop_video}")
+
+            device_files = []
+            for device_file in item.get("deviceFiles", []):
+                target_path = device_file["path"].replace("\\", "/")
+                source = Path(device_file["source"])
+                archive_path = f"{base}/device/{target_path}"
+                zf.write(source, archive_path)
+                device_files.append({
+                    "path": target_path,
+                    "source": f"device/{target_path}",
+                })
+
+            candidate_manifest = {
+                "id": item_id,
+                "title": item.get("title", item_id),
+                "type": item.get("type", "loop"),
+                "protected": bool(item.get("protected", False)),
+                "minFirmwareVersion": item.get("minFirmwareVersion", "0.1.44"),
+                "appFiles": {
+                    "thumbnail": app_thumbnail,
+                    "loopVideo": app_loop_video,
+                },
+                "deviceFiles": device_files,
+            }
+            zf.writestr(
+                manifest_rel,
+                json.dumps(candidate_manifest, indent=2, sort_keys=True),
+            )
+        zf.writestr(
+            "import.json",
+            json.dumps({"items": manifest_paths}, indent=2, sort_keys=True),
+        )
+    return zip_path
+
+
+def third_transition_pairs(eid):
+    """Return (source, target) pairs represented by a third_half file stem."""
+    parts = eid.split('_')
+    if len(parts) == 2 and all(parts):
+        return [(parts[0], parts[1])]
+    if eid == "F006":
+        return [("F007", "F006")]
+    if eid == "F007":
+        return [("F006", "F007")]
+    return []
 
 
 def mp4_to_frames(mp4_path, tmp_dir):
@@ -337,23 +435,26 @@ def main():
         z = get_zoom(pid)
         process(f1, OUT_DIR/"first_half"/f"{pid}.eb4", zoom=z)
         if f2: process(f2, OUT_DIR/"second_half"/f"{pid}.eb4", zoom=z)
+    loops = discover_factory_loop_sources()
+    if loops:
+        print(f"\nFactory loop animations ({len(loops)}):")
+        for pid, mp4 in loops:
+            process(mp4, OUT_DIR/"factory_loop"/f"{pid}.eb4", zoom=1.0)
     # Special transition animations (third_half)
     third = find_third()
     if third:
         print(f"\nSpecial transitions ({len(third)}):")
         for eid, mp4 in third:
-            # Use source animation's zoom for third_half
-            z = get_zoom(eid)
+            z = get_third_zoom(eid)
             process(mp4, OUT_DIR/"third_half"/f"{eid}.eb4", zoom=z)
     print("\nPreviews...")
     pd=ROOT/"app_gif"/"assets"/"factory_previews"; pd.mkdir(parents=True,exist_ok=True)
     # Build transition map from third_half files
     third_map = {}  # { "F007": {"F006": "assets/.../F007_F006_third.mp4"} }
     for eid, mp4 in third:
-        parts = eid.split('_')  # "F007_F006" -> ["F007", "F006"]
-        if len(parts) == 2:
-            src, dst = parts[0], parts[1]
-            z = get_zoom(src)
+        transition_pairs = third_transition_pairs(eid)
+        for src, dst in transition_pairs:
+            z = get_third_zoom(eid)
             out_name = f"{eid}_third.mp4"
             make_dial_mp4(mp4, pd/out_name, zoom=z)
             print(f"  {pd/out_name} (third_half {src}->{dst})")
@@ -378,11 +479,43 @@ def main():
         else:
             entry["transitions"] = {}
         manifest.append(entry)
+    import_items = []
+    for pid, mp4 in loops:
+        preview_path = pd/f"{pid}.png"
+        loop_video_path = pd/f"{pid}_loop.mp4"
+        preview(mp4, preview_path, zoom=1.0)
+        make_dial_mp4(mp4, loop_video_path, zoom=1.0)
+        print(f"  {pid}: grid PNG + loop MP4")
+        manifest.append({
+            "id": pid,
+            "name": pid,
+            "type": "loop",
+            "previewAsset": f"assets/factory_previews/{pid}.png",
+            "loopVideo": f"assets/factory_previews/{pid}_loop.mp4",
+            "transitions": {},
+        })
+        import_items.append({
+            "id": pid,
+            "title": pid,
+            "type": "loop",
+            "protected": False,
+            "minFirmwareVersion": "0.1.44",
+            "thumbnail": preview_path,
+            "loopVideo": loop_video_path,
+            "deviceFiles": [
+                {
+                    "path": f"factory_loop/{pid}.eb4",
+                    "source": OUT_DIR/"factory_loop"/f"{pid}.eb4",
+                },
+            ],
+        })
     # Write manifest
-    import json
     manifest_path = pd / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"  {manifest_path} ({len(manifest)} entries)")
+    if import_items:
+        zip_path = write_factory_import_zip(import_items, OUT_DIR / "factory-import.zip")
+        print(f"  {zip_path} ({len(import_items)} import candidate(s))")
     print(f"\nDone! Output: {OUT_DIR}\nCopy to SD card.")
 
 
