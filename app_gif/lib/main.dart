@@ -9,6 +9,8 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
+import 'factory_catalog_sync.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const BadgeApp());
@@ -104,11 +106,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
 
   bool get _previewActive => _appActive && !_preparing;
   bool get _hasPendingReviewStatuses => _history.any(
-        (entry) =>
-            entry.reviewId != null &&
-            entry.reviewStatus != 'approved' &&
-            entry.reviewStatus != 'rejected',
-      );
+    (entry) =>
+        entry.reviewId != null &&
+        entry.reviewStatus != 'approved' &&
+        entry.reviewStatus != 'rejected',
+  );
 
   @override
   void initState() {
@@ -274,19 +276,40 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _loadFactoryAnimations() async {
+    final builtIn = <Map<String, dynamic>>[];
     try {
       final jsonStr = await DefaultAssetBundle.of(
         context,
       ).loadString('assets/factory_previews/manifest.json');
       final list = json.decode(jsonStr) as List<dynamic>;
+      builtIn.addAll(list.map((item) => _asStringMap(item)));
       if (!mounted) return;
       setState(() {
-        _factoryAnims = list
+        _factoryAnims = builtIn
             .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
             .toList();
       });
     } catch (_) {
       // Fallback: manifest not found, leave empty
+    }
+    try {
+      final cacheRoot = await _invokeNative<String>('factoryCacheRoot');
+      if (cacheRoot == null || cacheRoot.isEmpty) {
+        return;
+      }
+      final synced = await FactoryCatalogSync.syncOnce(
+        backendBase: Uri.parse(_backendBaseUrl),
+        cacheRoot: Directory(cacheRoot),
+        builtIn: builtIn,
+      );
+      if (!mounted) return;
+      setState(() {
+        _factoryAnims = synced
+            .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
+            .toList();
+      });
+    } catch (_) {
+      // Network/cache failures should not block built-in factory animations.
     }
   }
 
@@ -298,17 +321,24 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     // Build video sequence: current exit/third_half + target entrance.
     final queue = <String>[];
     bool isThirdHalf = false;
+    final targetIsLoop = anim.isLoop;
     if (_activeFactoryId != null && _activeFactoryId != anim.id) {
       final current = _factoryAnims.cast<FactoryAnimation?>().firstWhere(
         (a) => a?.id == _activeFactoryId,
         orElse: () => null,
       );
-      isThirdHalf = current?.transitions.containsKey(anim.id) ?? false;
-      final exitVid = current?.exitVideo(anim.id);
-      if (exitVid != null) queue.add(exitVid);
+      if (current?.isLoop != true && !targetIsLoop) {
+        isThirdHalf = current?.transitions.containsKey(anim.id) ?? false;
+        final exitVid = current?.exitVideo(anim.id);
+        if (exitVid != null) queue.add(exitVid);
+      }
     }
     // Third_half replaces both exit and entrance — skip target first_half
-    if (!isThirdHalf && anim.firstVideo != null) queue.add(anim.firstVideo!);
+    if (targetIsLoop) {
+      if (anim.loopVideo != null) queue.add(anim.loopVideo!);
+    } else if (!isThirdHalf && anim.firstVideo != null) {
+      queue.add(anim.firstVideo!);
+    }
     setState(() {
       _videoQueue = queue;
       _videoIndex = 0;
@@ -568,7 +598,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       final rawAsset = PreparedAsset.fromMap(_asStringMap(prepared));
       var asset = rawAsset.copyWith(cropTransform: _cropTransform);
       var saveMessage = '素材已保存，已提交审核';
-      if (_isVideoMime(asset.mime) && !_hasPreviewPath(asset.animatedPreviewPath)) {
+      if (_isVideoMime(asset.mime) &&
+          !_hasPreviewPath(asset.animatedPreviewPath)) {
         setState(() => _status = '生成审核预览');
         asset = await _withReviewPreviewReady(asset);
         if (!mounted) {
@@ -802,7 +833,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<PreparedAsset> _withReviewPreviewReady(PreparedAsset asset) async {
-    if (!_isVideoMime(asset.mime) || _hasPreviewPath(asset.animatedPreviewPath)) {
+    if (!_isVideoMime(asset.mime) ||
+        _hasPreviewPath(asset.animatedPreviewPath)) {
       return asset;
     }
     if (asset.assetPath.isEmpty) {
@@ -817,10 +849,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     final previewPath = await waiter.future
         .timeout(const Duration(seconds: 6), onTimeout: () => null)
         .whenComplete(() {
-      if (identical(_assetPreviewWaiters[asset.assetPath], waiter)) {
-        _assetPreviewWaiters.remove(asset.assetPath);
-      }
-    });
+          if (identical(_assetPreviewWaiters[asset.assetPath], waiter)) {
+            _assetPreviewWaiters.remove(asset.assetPath);
+          }
+        });
     if (_hasPreviewPath(previewPath)) {
       return asset.copyWith(animatedPreviewPath: previewPath);
     }
@@ -1961,8 +1993,7 @@ class _HistoryGridTile extends StatelessWidget {
                         previewPath: previewPath,
                         transform: entry.cropTransform,
                       ),
-                      if (overlayColor != null)
-                        ColoredBox(color: overlayColor),
+                      if (overlayColor != null) ColoredBox(color: overlayColor),
                       if (reviewLabel != null)
                         Center(
                           child: DecoratedBox(
@@ -2593,7 +2624,7 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
     _preloaded?.dispose();
     _preloaded = null;
     _preloadedPath = null;
-    final c = VideoPlayerController.asset(nv);
+    final c = _factoryVideoController(nv);
     _preloaded = c;
     _preloadedPath = nv;
     c
@@ -2645,7 +2676,7 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
 
   Future<void> _activate(String path) async {
     // Load new controller while keeping _active displayed
-    final c = VideoPlayerController.asset(path);
+    final c = _factoryVideoController(path);
     try {
       await c.initialize();
       await c.setLooping(false);
@@ -3265,10 +3296,36 @@ bool _hasPreviewPath(String? path) =>
 
 bool _previewFileExists(String path) {
   try {
-    return File(path).existsSync();
+    return _fileFromPath(path).existsSync();
   } on FileSystemException {
     return false;
+  } on FormatException {
+    return false;
   }
+}
+
+bool _isLocalFilePath(String path) {
+  if (path.startsWith('file://')) {
+    return true;
+  }
+  if (path.startsWith('/')) {
+    return true;
+  }
+  return RegExp(r'^[A-Za-z]:[\\/]').hasMatch(path);
+}
+
+File _fileFromPath(String path) {
+  if (path.startsWith('file://')) {
+    return File(Uri.parse(path).toFilePath());
+  }
+  return File(path);
+}
+
+VideoPlayerController _factoryVideoController(String path) {
+  if (_isLocalFilePath(path)) {
+    return VideoPlayerController.file(_fileFromPath(path));
+  }
+  return VideoPlayerController.asset(path);
 }
 
 Widget _blackPreviewFallback(
@@ -3299,25 +3356,36 @@ class FactoryAnimation {
     required this.id,
     required this.name,
     required this.previewAsset,
+    this.type = 'split',
     this.firstVideo,
     this.secondVideo,
+    this.loopVideo,
+    this.protected = false,
     this.transitions = const {},
   });
 
   final String id;
   final String name;
   final String previewAsset;
+  final String type;
   final String? firstVideo;
   final String? secondVideo;
+  final String? loopVideo;
+  final bool protected;
   final Map<String, String> transitions;
+
+  bool get isLoop => type == 'loop';
 
   factory FactoryAnimation.fromMap(Map<String, dynamic> map) {
     return FactoryAnimation(
       id: (map['id'] as String?) ?? '',
       name: (map['name'] as String?) ?? '',
       previewAsset: (map['previewAsset'] as String?) ?? '',
+      type: (map['type'] as String?) ?? 'split',
       firstVideo: _readNullableString(map['firstVideo']),
       secondVideo: _readNullableString(map['secondVideo']),
+      loopVideo: _readNullableString(map['loopVideo']),
+      protected: map['protected'] == true,
       transitions: _asStringMap(
         map['transitions'],
       ).map((k, v) => MapEntry(k, v.toString())),
@@ -3372,12 +3440,19 @@ class _FactoryGridTile extends StatelessWidget {
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(5),
                 child: SizedBox.expand(
-                  child: Image.asset(
-                    anim.previewAsset,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) =>
-                        const ColoredBox(color: Color(0xff1a1a1a)),
-                  ),
+                  child: _isLocalFilePath(anim.previewAsset)
+                      ? Image.file(
+                          _fileFromPath(anim.previewAsset),
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) =>
+                              const ColoredBox(color: Color(0xff1a1a1a)),
+                        )
+                      : Image.asset(
+                          anim.previewAsset,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) =>
+                              const ColoredBox(color: Color(0xff1a1a1a)),
+                        ),
                 ),
               ),
             ),

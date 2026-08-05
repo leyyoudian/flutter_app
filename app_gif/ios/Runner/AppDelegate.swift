@@ -131,6 +131,12 @@ import UIKit
         ["id": "F002", "name": "F002", "previewAsset": "assets/factory_previews/F002.png"],
         ["id": "F003", "name": "F003", "previewAsset": "assets/factory_previews/F003.png"],
       ])
+    case "factoryCacheRoot":
+      do {
+        result(try cacheDirectory("factory_catalog").path)
+      } catch {
+        result(FlutterError(code: "factory_cache_failed", message: error.localizedDescription, details: nil))
+      }
     case "switchToAsset":
       guard let id = args["id"] as? String, !id.isEmpty else {
         result(FlutterError(code: "bad_id", message: "素材ID为空", details: nil))

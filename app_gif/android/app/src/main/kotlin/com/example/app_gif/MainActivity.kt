@@ -300,6 +300,9 @@ class MainActivity : FlutterActivity() {
                 }
                 openExternalUrl(url, result)
             }
+            "factoryCacheRoot" -> {
+                result.success(persistentAssetDirectory("factory_catalog").absolutePath)
+            }
             "switchToAsset" -> {
                 val id = call.argument<String>("id")
                 if (id.isNullOrBlank()) {
