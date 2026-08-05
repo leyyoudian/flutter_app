@@ -86,6 +86,14 @@ def normalize_factory_loop_id(stem):
     return f"F{number:03d}"
 
 
+def is_factory_loop_third_half_stem(stem):
+    """F022+ files in third_half are full-loop official animations, not transitions."""
+    try:
+        return int(normalize_factory_loop_id(stem)[1:]) >= 22
+    except (TypeError, ValueError):
+        return False
+
+
 def find_pairs():
     first = sorted((SRC_DIR / "first_half").glob("*.mp4"), key=natural_key)
     second = sorted((SRC_DIR / "second_half").glob("*.mp4"), key=natural_key)
@@ -105,19 +113,26 @@ def find_third():
     for mp4 in sorted(third_dir.glob("*.mp4")):
         # Name convention: <source_id>.mp4 e.g. F007.mp4 = transition FROM F007
         eid = mp4.stem  # "F007"
+        if is_factory_loop_third_half_stem(eid):
+            continue
         result.append((eid, mp4))
     return result
 
 
-def discover_factory_loop_sources(src_dir=SRC_DIR):
-    """Scan factory_loop folder for full-loop official animations."""
-    loop_dir = Path(src_dir) / "factory_loop"
-    if not loop_dir.is_dir():
-        return []
-    result = []
-    for mp4 in sorted(loop_dir.glob("*.mp4"), key=natural_key):
-        result.append((normalize_factory_loop_id(mp4.stem), mp4))
-    return result
+def discover_factory_loop_sources(src_dir=None):
+    """Scan factory_loop and F022+ third_half files for full-loop official animations."""
+    src_dir = SRC_DIR if src_dir is None else Path(src_dir)
+    result_by_id = {}
+    loop_dir = src_dir / "factory_loop"
+    if loop_dir.is_dir():
+        for mp4 in sorted(loop_dir.glob("*.mp4"), key=natural_key):
+            result_by_id[normalize_factory_loop_id(mp4.stem)] = mp4
+    third_dir = src_dir / "third_half"
+    if third_dir.is_dir():
+        for mp4 in sorted(third_dir.glob("*.mp4"), key=natural_key):
+            if is_factory_loop_third_half_stem(mp4.stem):
+                result_by_id.setdefault(normalize_factory_loop_id(mp4.stem), mp4)
+    return sorted(result_by_id.items(), key=lambda item: natural_key(item[0]))
 
 
 def write_factory_import_zip(items, zip_path):

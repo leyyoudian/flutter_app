@@ -43,6 +43,7 @@ class ThirdHalfTransitionTests(unittest.TestCase):
                  patch.object(encode_factory, "find_third", return_value=[
                      ("F006", Path("F006.mp4")),
                  ]), \
+                 patch.object(encode_factory, "discover_factory_loop_sources", return_value=[]), \
                  patch.object(encode_factory, "process"), \
                  patch.object(encode_factory, "preview"), \
                  patch.object(encode_factory, "make_dial_mp4"):
@@ -67,6 +68,24 @@ class ThirdHalfTransitionTests(unittest.TestCase):
                 [(item_id, path.name) for item_id, path in found],
                 [("F022", "22.mp4"), ("F023", "F023.mp4")],
             )
+
+    def test_f022_plus_third_half_sources_are_factory_loops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            third_dir = root / "third_half"
+            third_dir.mkdir()
+            (third_dir / "F022.mp4").write_bytes(b"fake")
+            (third_dir / "F023.mp4").write_bytes(b"fake")
+            (third_dir / "F007.mp4").write_bytes(b"fake")
+
+            found = encode_factory.discover_factory_loop_sources(root)
+
+            self.assertEqual(
+                [(item_id, path.name) for item_id, path in found],
+                [("F022", "F022.mp4"), ("F023", "F023.mp4")],
+            )
+            with patch.object(encode_factory, "SRC_DIR", root):
+                self.assertEqual(encode_factory.find_third(), [("F007", third_dir / "F007.mp4")])
 
     def test_factory_import_zip_contains_loop_candidate_manifests(self):
         with tempfile.TemporaryDirectory() as tmp:
