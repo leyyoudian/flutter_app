@@ -36,6 +36,11 @@ typedef struct {
 esp_err_t badge_anim_mgr_init(void);
 
 /**
+ * @brief Rescan SD card animation folders after managed files change.
+ */
+esp_err_t badge_anim_mgr_rescan(void);
+
+/**
  * @brief Get the number of factory animations (pairs count as one).
  */
 uint8_t badge_anim_mgr_factory_count(void);

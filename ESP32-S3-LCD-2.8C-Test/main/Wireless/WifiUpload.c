@@ -11,6 +11,7 @@
 
 #include "BadgeAnimMgr.h"
 #include "BadgeDisplay.h"
+#include "BadgeFactorySync.h"
 #include "BadgeStorage.h"
 #include "ST7701S.h"
 
@@ -47,16 +48,27 @@
 #define BADGE_WIFI_CHANNEL 6
 #define BADGE_WIFI_MAX_STA 1
 #define BADGE_WIFI_INACTIVE_TIME_SEC 600u
-#define BADGE_WIFI_RECONNECT_DELAY_MS 5000u
+#define BADGE_WIFI_RECONNECT_MIN_DELAY_MS 3000u
+#define BADGE_WIFI_RECONNECT_MAX_DELAY_MS 120000u
+#define BADGE_PROVISIONING_FALLBACK_DELAY_MS 100u
+#define BADGE_PROVISIONING_AUTH_FALLBACK_RETRIES 3u
+#define BADGE_PROVISIONING_RESTART_DELAY_MS 5000u
+#define BADGE_PROVISIONING_CONNECT_START_DELAY_MS 500u
 #define BADGE_WIFI_NVS_NAMESPACE "wifi_cfg"
 #define BADGE_WIFI_NVS_SSID "ssid"
 #define BADGE_WIFI_NVS_PASS "pass"
 #define BADGE_PROVISIONING_SUCCESS_AP_HOLD_MS 30000u
+#define BADGE_PROVISIONING_FALLBACK_AP_HOLD_MS 2000u
 #define BADGE_CAPTIVE_DNS_PORT 53
 #define BADGE_DNS_TASK_STACK 4096u
-#define BADGE_CAPTIVE_DNS_CAPTURE_ALL_MS 90000u
+#define BADGE_CAPTIVE_DNS_CAPTURE_ALL_MS 180000u
+#define BADGE_CAPTIVE_HTTP_LOG_BUDGET 24u
 #define BADGE_CAPTIVE_PORTAL_URL "http://192.168.4.1/"
+#define BADGE_CAPTIVE_PORTAL_API_URL "http://192.168.4.1/captive-portal/api"
 #define BADGE_UPLOAD_TCP_PORT 3333
+#define BADGE_DISCOVERY_UDP_PORT 3334
+#define BADGE_DISCOVERY_TASK_STACK 3072u
+#define BADGE_DISCOVERY_INTERVAL_MS 1500u
 #define BADGE_TCP_UPLOAD_MAGIC 0x31505542u
 #define BADGE_HTTP_UPLOAD_BUF (64u * 1024u)
 #define BADGE_TCP_UPLOAD_BUF (64u * 1024u)
@@ -71,11 +83,16 @@
 #define BADGE_HTTP_CRC_HEADER "X-EBAJ-CRC32"
 #define BADGE_TCP_TASK_STACK 6144u
 #define BADGE_TCP_TASK_PRIORITY 7u
-#define BADGE_OTA_TASK_STACK 8192u
+#define BADGE_OTA_TASK_STACK 12288u
 #define BADGE_OTA_URL_MAX 512u
 #define BADGE_OTA_MANIFEST_MAX 2048u
-#define BADGE_OTA_CHECK_DELAY_MS 5000u
+#define BADGE_OTA_CHECK_DELAY_MS 15000u
+#define BADGE_OTA_WIFI_STABLE_MS 10000u
+#define BADGE_OTA_LOCAL_IDLE_MS 30000u
+#define BADGE_OTA_MANIFEST_TIMEOUT_MS 5000u
 #define BADGE_OTA_DISPLAY_STOP_TIMEOUT_MS 1500u
+#define BADGE_OTA_HTTP_TIMEOUT_MS 30000u
+#define BADGE_OTA_HTTP_BUFFER_SIZE 8192u
 #ifndef BADGE_FW_VERSION
 #define BADGE_FW_VERSION "0.0.0"
 #endif
@@ -84,9 +101,22 @@
 #endif
 
 static const char *TAG = "WifiUpload";
+static const char BADGE_CAPTIVE_PROBE_HTML[] =
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<meta http-equiv=\"refresh\" content=\"0;url=" BADGE_CAPTIVE_PORTAL_URL "\">"
+    "<title>ESP BAJI Setup</title></head><body>"
+    "<a href=\"" BADGE_CAPTIVE_PORTAL_URL "\">Open Wi-Fi setup</a>"
+    "<script>location.replace('" BADGE_CAPTIVE_PORTAL_URL "');</script>"
+    "</body></html>";
+static const char BADGE_CAPTIVE_API_JSON[] =
+    "{\"captive\":true,"
+    "\"user-portal-url\":\"" BADGE_CAPTIVE_PORTAL_URL "\","
+    "\"venue-info-url\":\"" BADGE_CAPTIVE_PORTAL_URL "\"}";
 static httpd_handle_t s_httpd;
 static TaskHandle_t s_tcp_upload_task;
 static TaskHandle_t s_dns_task;
+static TaskHandle_t s_discovery_task;
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static bool s_wifi_started;
@@ -94,14 +124,37 @@ static bool s_sta_connected;
 static bool s_sta_connecting;
 static bool s_provisioning_active;
 static bool s_reconnect_pending;
+static bool s_provisioning_fallback_pending;
 static bool s_ap_shutdown_pending;
 static bool s_auto_ota_check_running;
+static bool s_auto_ota_check_done;
+static bool s_restart_after_provisioning_success;
+static bool s_provisioning_restart_pending;
+static bool s_provisioning_started_by_fallback;
+static bool s_config_connect_pending;
+static bool s_sta_reconfiguring;
+static bool s_lcd_resync_after_sta_success;
+static bool s_lcd_resync_pending;
+static uint8_t s_ap_client_count;
+static uint8_t s_sta_retry_count;
 static uint8_t s_last_disconnect_reason;
+static uint32_t s_next_reconnect_delay_ms;
 static char s_saved_ssid[33];
 static char s_saved_pass[65];
 static char s_sta_ip_text[16];
+static char s_sta_connecting_ssid[33];
+static char s_sta_connected_ssid[33];
+static uint32_t s_sta_ip_addr;
+static uint32_t s_sta_netmask_addr;
+static uint32_t s_sta_gateway_addr;
+static int8_t s_last_disconnect_rssi;
+static int64_t s_sta_got_ip_us;
+static int64_t s_last_local_activity_us;
 static int64_t s_captive_capture_all_until_us;
 static uint32_t s_captive_dns_log_budget;
+static uint32_t s_captive_http_log_budget;
+
+static esp_err_t captive_probe_send_response(httpd_req_t *req);
 
 typedef struct {
     char url[BADGE_OTA_URL_MAX];
@@ -165,6 +218,11 @@ static esp_err_t save_wifi_credentials(const char *ssid, const char *password)
     ESP_GOTO_ON_ERROR(nvs_commit(handle), cleanup, TAG, "commit wifi credentials failed");
     snprintf(s_saved_ssid, sizeof(s_saved_ssid), "%s", ssid);
     snprintf(s_saved_pass, sizeof(s_saved_pass), "%s", password != NULL ? password : "");
+    s_sta_retry_count = 0;
+    s_next_reconnect_delay_ms = 0;
+    s_reconnect_pending = false;
+    s_provisioning_fallback_pending = false;
+    s_last_local_activity_us = esp_timer_get_time();
 
 cleanup:
     nvs_close(handle);
@@ -201,8 +259,27 @@ static esp_err_t clear_saved_wifi_credentials(void)
         s_sta_connected = false;
         s_sta_connecting = false;
         s_reconnect_pending = false;
+        s_provisioning_fallback_pending = false;
+        s_restart_after_provisioning_success = false;
+        s_provisioning_restart_pending = false;
+        s_provisioning_started_by_fallback = false;
+        s_config_connect_pending = false;
+        s_sta_reconfiguring = false;
+        s_lcd_resync_after_sta_success = false;
+        s_lcd_resync_pending = false;
+        s_ap_client_count = 0;
+        s_sta_retry_count = 0;
+        s_next_reconnect_delay_ms = 0;
         s_last_disconnect_reason = 0;
+        s_last_disconnect_rssi = 0;
+        s_sta_got_ip_us = 0;
+        s_last_local_activity_us = 0;
         s_sta_ip_text[0] = '\0';
+        s_sta_connecting_ssid[0] = '\0';
+        s_sta_connected_ssid[0] = '\0';
+        s_sta_ip_addr = 0;
+        s_sta_netmask_addr = 0;
+        s_sta_gateway_addr = 0;
         ESP_LOGI(TAG, "saved Wi-Fi credentials cleared from web");
     }
     return ret;
@@ -211,12 +288,238 @@ static esp_err_t clear_saved_wifi_credentials(void)
 static esp_err_t start_sta_connect(void);
 static esp_err_t start_provisioning_ap(bool with_sta);
 static void start_auto_ota_check(void);
+static void start_discovery_announce_task(void);
+static void schedule_provisioning_restart_if_connected(void);
+static void schedule_disable_provisioning_ap(uint32_t delay_ms);
+static void schedule_sta_connect_after_config(void);
+static void schedule_lcd_resync_after_wireless(void);
+static void safe_restart_after_releasing_lcd_cs(void);
+
+static bool sta_ssid_matches(const char *left, const char *right)
+{
+    return left != NULL && right != NULL && left[0] != '\0' && strcmp(left, right) == 0;
+}
+
+static const char *wifi_disconnect_reason_name(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_UNSPECIFIED:
+        return "UNSPECIFIED";
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:
+        return "AUTH_LEAVE";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:
+        return "DISASSOC_DUE_TO_INACTIVITY";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "ASSOC_TOOMANY";
+    case WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA:
+        return "CLASS2_FRAME_FROM_NONAUTH_STA";
+    case WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA:
+        return "CLASS3_FRAME_FROM_NONASSOC_STA";
+    case WIFI_REASON_ASSOC_LEAVE:
+        return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+        return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_DISASSOC_PWRCAP_BAD:
+        return "DISASSOC_PWRCAP_BAD";
+    case WIFI_REASON_DISASSOC_SUPCHAN_BAD:
+        return "DISASSOC_SUPCHAN_BAD";
+    case WIFI_REASON_BSS_TRANSITION_DISASSOC:
+        return "BSS_TRANSITION_DISASSOC";
+    case WIFI_REASON_IE_INVALID:
+        return "IE_INVALID";
+    case WIFI_REASON_MIC_FAILURE:
+        return "MIC_FAILURE";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+        return "GROUP_KEY_UPDATE_TIMEOUT";
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+        return "IE_IN_4WAY_DIFFERS";
+    case WIFI_REASON_GROUP_CIPHER_INVALID:
+        return "GROUP_CIPHER_INVALID";
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID:
+        return "PAIRWISE_CIPHER_INVALID";
+    case WIFI_REASON_AKMP_INVALID:
+        return "AKMP_INVALID";
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+        return "UNSUPP_RSN_IE_VERSION";
+    case WIFI_REASON_INVALID_RSN_IE_CAP:
+        return "INVALID_RSN_IE_CAP";
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+        return "802_1X_AUTH_FAILED";
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:
+        return "CIPHER_SUITE_REJECTED";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "BEACON_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:
+        return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "CONNECTION_FAIL";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        return "NO_AP_FOUND_W_COMPATIBLE_SECURITY";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "NO_AP_FOUND_IN_AUTHMODE_THRESHOLD";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *wifi_disconnect_reason_hint(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "AP authentication timed out; check password, WPA2/WPA3 mode, MAC filtering, and RSSI";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "Authentication failed; re-enter Wi-Fi password and use WPA2-PSK/AES";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "SSID not found; check 2.4GHz SSID name and signal";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "Security mode incompatible; use 2.4GHz WPA2-PSK/AES or WPA2/WPA3 transition";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "Router has too many connected clients";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "Signal lost after connection; move device closer or reduce interference";
+    default:
+        return "See ESP-IDF Wi-Fi reason code";
+    }
+}
+
+static bool is_missing_or_bad_saved_wifi_reason(uint8_t reason)
+{
+    return reason == WIFI_REASON_NO_AP_FOUND ||
+           reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+           reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD;
+}
+
+static bool is_auth_retry_saved_wifi_reason(uint8_t reason)
+{
+    return reason == WIFI_REASON_AUTH_EXPIRE ||
+           reason == WIFI_REASON_AUTH_FAIL ||
+           reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+           reason == WIFI_REASON_HANDSHAKE_TIMEOUT;
+}
+
+static bool should_start_provisioning_fallback(uint8_t reason)
+{
+    if (is_missing_or_bad_saved_wifi_reason(reason)) {
+        return true;
+    }
+    return is_auth_retry_saved_wifi_reason(reason) &&
+           s_sta_retry_count >= BADGE_PROVISIONING_AUTH_FALLBACK_RETRIES;
+}
+
+static uint32_t wifi_reconnect_delay_ms(void)
+{
+    uint32_t delay_ms = BADGE_WIFI_RECONNECT_MIN_DELAY_MS;
+    uint8_t shift = s_sta_retry_count;
+    if (shift > 3) {
+        shift = 3;
+    }
+    delay_ms <<= shift;
+    if (delay_ms > BADGE_WIFI_RECONNECT_MAX_DELAY_MS) {
+        delay_ms = BADGE_WIFI_RECONNECT_MAX_DELAY_MS;
+    }
+    return delay_ms;
+}
+
+static void send_discovery_hello(int sock, uint32_t ip_addr, const char *payload)
+{
+    if (ip_addr == 0 || payload == NULL || payload[0] == '\0') {
+        return;
+    }
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(BADGE_DISCOVERY_UDP_PORT),
+        .sin_addr.s_addr = ip_addr,
+    };
+    (void)sendto(sock,
+                 payload,
+                 strlen(payload),
+                 0,
+                 (const struct sockaddr *)&dest,
+                 sizeof(dest));
+}
+
+static void discovery_announce_task(void *arg)
+{
+    (void)arg;
+    bool logged = false;
+
+    while (true) {
+        if (!s_sta_connected || s_sta_ip_addr == 0) {
+            vTaskDelay(pdMS_TO_TICKS(BADGE_DISCOVERY_INTERVAL_MS));
+            continue;
+        }
+
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            vTaskDelay(pdMS_TO_TICKS(BADGE_DISCOVERY_INTERVAL_MS));
+            continue;
+        }
+
+        int yes = 1;
+        (void)setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+
+        char payload[192];
+        snprintf(payload,
+                 sizeof(payload),
+                 "{\"type\":\"espbaji_hello\",\"name\":\"%s\",\"ip\":\"%s\",\"tcp\":%u,\"fw\":\"%s\"}",
+                 BADGE_WIFI_SSID,
+                 s_sta_ip_text,
+                 (unsigned)BADGE_UPLOAD_TCP_PORT,
+                 BADGE_FW_VERSION);
+
+        uint32_t broadcast_addr = INADDR_BROADCAST;
+        if (s_sta_netmask_addr != 0) {
+            broadcast_addr = s_sta_ip_addr | ~s_sta_netmask_addr;
+        }
+        send_discovery_hello(sock, s_sta_gateway_addr, payload);
+        send_discovery_hello(sock, broadcast_addr, payload);
+        send_discovery_hello(sock, INADDR_BROADCAST, payload);
+        close(sock);
+
+        if (!logged) {
+            ESP_LOGI(TAG, "discovery hello on udp/%u", (unsigned)BADGE_DISCOVERY_UDP_PORT);
+            logged = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(BADGE_DISCOVERY_INTERVAL_MS));
+    }
+}
+
+static void start_discovery_announce_task(void)
+{
+    if (s_discovery_task != NULL) {
+        return;
+    }
+    if (xTaskCreate(discovery_announce_task,
+                    "badge_discovery",
+                    BADGE_DISCOVERY_TASK_STACK,
+                    NULL,
+                    3,
+                    &s_discovery_task) != pdPASS) {
+        s_discovery_task = NULL;
+        ESP_LOGW(TAG, "create discovery announce task failed");
+    }
+}
 
 static void refresh_captive_dns_capture_window(const char *reason)
 {
     s_captive_capture_all_until_us =
         esp_timer_get_time() + ((int64_t)BADGE_CAPTIVE_DNS_CAPTURE_ALL_MS * 1000);
     s_captive_dns_log_budget = 24;
+    s_captive_http_log_budget = BADGE_CAPTIVE_HTTP_LOG_BUDGET;
     ESP_LOGI(TAG, "captive DNS capture-all enabled for %ums (%s)",
              (unsigned)BADGE_CAPTIVE_DNS_CAPTURE_ALL_MS,
              reason != NULL ? reason : "provisioning");
@@ -233,30 +536,226 @@ static void stop_captive_dns_capture_window(const char *reason)
              reason != NULL ? reason : "portal active");
 }
 
-static void delayed_disable_provisioning_ap(void *arg)
+static void mark_local_activity(void)
+{
+    s_last_local_activity_us = esp_timer_get_time();
+}
+
+static bool ota_wifi_stable(void)
+{
+    if (!s_sta_connected || s_sta_got_ip_us <= 0) {
+        return false;
+    }
+    return (esp_timer_get_time() - s_sta_got_ip_us) >=
+           ((int64_t)BADGE_OTA_WIFI_STABLE_MS * 1000);
+}
+
+static bool ota_local_activity_recent(void)
+{
+    if (s_last_local_activity_us <= 0) {
+        return false;
+    }
+    return (esp_timer_get_time() - s_last_local_activity_us) <
+           ((int64_t)BADGE_OTA_LOCAL_IDLE_MS * 1000);
+}
+
+static void lcd_resync_after_wireless_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(BADGE_PROVISIONING_SUCCESS_AP_HOLD_MS));
+    vTaskDelay(pdMS_TO_TICKS(250));
+    esp_err_t ret = badge_display_resync_after_wireless();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD wireless resync failed: %s", esp_err_to_name(ret));
+    }
+    s_lcd_resync_pending = false;
+    vTaskDelete(NULL);
+}
+
+static void schedule_lcd_resync_after_wireless(void)
+{
+    if (s_lcd_resync_pending) {
+        return;
+    }
+    if (xTaskCreate(lcd_resync_after_wireless_task,
+                    "lcd_wifi_resync",
+                    3072,
+                    NULL,
+                    3,
+                    NULL) == pdPASS) {
+        s_lcd_resync_pending = true;
+    } else {
+        ESP_LOGW(TAG, "create LCD wireless resync task failed");
+    }
+}
+
+static void pause_fallback_ap_for_sta_retry(void)
+{
+    if (!s_provisioning_active || !s_provisioning_started_by_fallback || s_ap_client_count > 0) {
+        return;
+    }
+
+    s_provisioning_active = false;
+    s_provisioning_started_by_fallback = false;
+    s_ap_client_count = 0;
+    s_lcd_resync_after_sta_success = true;
+    stop_captive_dns_capture_window("fallback AP paused for STA retry");
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "fallback AP paused for saved STA retry to avoid AP channel adjust");
+    } else {
+        ESP_LOGW(TAG, "pause fallback AP for STA retry failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void delayed_disable_provisioning_ap(void *arg)
+{
+    uint32_t delay_ms = (uint32_t)(uintptr_t)arg;
+    if (delay_ms == 0) {
+        delay_ms = BADGE_PROVISIONING_SUCCESS_AP_HOLD_MS;
+    }
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
     if (s_sta_connected && s_provisioning_active) {
+        bool was_fallback_ap = s_provisioning_started_by_fallback;
         s_provisioning_active = false;
+        s_provisioning_started_by_fallback = false;
+        s_ap_client_count = 0;
         (void)esp_wifi_set_mode(WIFI_MODE_STA);
         ESP_LOGI(TAG, "STA got IP; provisioning AP disabled");
+        if (was_fallback_ap) {
+            schedule_lcd_resync_after_wireless();
+        }
+        start_auto_ota_check();
     }
     s_ap_shutdown_pending = false;
     vTaskDelete(NULL);
 }
 
+static void schedule_disable_provisioning_ap(uint32_t delay_ms)
+{
+    if (s_ap_shutdown_pending) {
+        return;
+    }
+    if (xTaskCreate(delayed_disable_provisioning_ap,
+                    "ap_close_delay",
+                    3072,
+                    (void *)(uintptr_t)delay_ms,
+                    4,
+                    NULL) == pdPASS) {
+        s_ap_shutdown_pending = true;
+    } else {
+        ESP_LOGE(TAG, "create AP close delay task failed");
+    }
+}
+
+static void delayed_restart_after_provisioning_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(BADGE_PROVISIONING_RESTART_DELAY_MS));
+    if (s_sta_connected && s_restart_after_provisioning_success) {
+        ESP_LOGI(TAG, "provisioning complete; restarting into STA mode");
+        safe_restart_after_releasing_lcd_cs();
+    }
+    s_restart_after_provisioning_success = false;
+    s_provisioning_restart_pending = false;
+    vTaskDelete(NULL);
+}
+
+static void safe_restart_after_releasing_lcd_cs(void)
+{
+    esp_err_t err = ST7701S_PrepareForRestart();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "release LCD CS before restart failed: %s", esp_err_to_name(err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_restart();
+}
+
+static void delayed_sta_connect_after_config_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(BADGE_PROVISIONING_CONNECT_START_DELAY_MS));
+    s_config_connect_pending = false;
+    if (s_saved_ssid[0] == '\0') {
+        s_restart_after_provisioning_success = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t ret = start_sta_connect();
+    if (ret == ESP_OK) {
+        schedule_provisioning_restart_if_connected();
+    } else {
+        s_restart_after_provisioning_success = false;
+        ESP_LOGE(TAG, "delayed STA connect after config failed: %s", esp_err_to_name(ret));
+    }
+    vTaskDelete(NULL);
+}
+
+static void schedule_sta_connect_after_config(void)
+{
+    if (s_config_connect_pending) {
+        return;
+    }
+    if (xTaskCreate(delayed_sta_connect_after_config_task,
+                    "wifi_cfg_connect",
+                    3072,
+                    NULL,
+                    4,
+                    NULL) == pdPASS) {
+        s_config_connect_pending = true;
+    } else {
+        s_restart_after_provisioning_success = false;
+        ESP_LOGE(TAG, "create delayed STA connect task failed");
+    }
+}
+
+static void schedule_provisioning_restart_if_connected(void)
+{
+    if (!s_sta_connected || !s_restart_after_provisioning_success || s_provisioning_restart_pending) {
+        return;
+    }
+    if (xTaskCreate(delayed_restart_after_provisioning_task,
+                    "wifi_cfg_reboot",
+                    3072,
+                    NULL,
+                    4,
+                    NULL) == pdPASS) {
+        s_provisioning_restart_pending = true;
+    } else {
+        ESP_LOGE(TAG, "create provisioning restart task failed");
+    }
+}
+
 static void start_saved_sta_fallback_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(BADGE_WIFI_RECONNECT_DELAY_MS));
+    uint32_t delay_ms = s_next_reconnect_delay_ms;
+    if (delay_ms == 0) {
+        delay_ms = BADGE_WIFI_RECONNECT_MIN_DELAY_MS;
+    }
+    ESP_LOGI(TAG, "saved STA retry in %ums", (unsigned)delay_ms);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
     s_reconnect_pending = false;
-    if (s_saved_ssid[0] != '\0') {
-        if (!s_sta_connected && !s_provisioning_active) {
-            ESP_LOGW(TAG, "saved STA not connected; enabling provisioning AP while STA keeps retrying");
-            (void)start_provisioning_ap(true);
-        }
+    if (s_saved_ssid[0] != '\0' && !s_sta_connected) {
+        pause_fallback_ap_for_sta_retry();
         (void)start_sta_connect();
+    }
+    vTaskDelete(NULL);
+}
+
+static void start_provisioning_fallback_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(BADGE_PROVISIONING_FALLBACK_DELAY_MS));
+    s_provisioning_fallback_pending = false;
+    if (s_saved_ssid[0] != '\0' && !s_sta_connected && !s_provisioning_active) {
+        ESP_LOGW(TAG, "saved STA unavailable; enabling provisioning AP while STA backs off");
+        s_provisioning_started_by_fallback = true;
+        esp_err_t ret = start_provisioning_ap(true);
+        if (ret != ESP_OK) {
+            s_provisioning_started_by_fallback = false;
+            ESP_LOGE(TAG, "enable provisioning AP fallback failed: %s", esp_err_to_name(ret));
+        }
     }
     vTaskDelete(NULL);
 }
@@ -278,19 +777,80 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     (void)arg;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (s_saved_ssid[0] != '\0') {
+        if (s_saved_ssid[0] != '\0' && !s_sta_connecting && !s_sta_connected && !s_reconnect_pending) {
+            s_sta_connecting = true;
             (void)esp_wifi_connect();
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        if (s_ap_client_count < UINT8_MAX) {
+            ++s_ap_client_count;
+        }
         refresh_captive_dns_capture_window("phone joined AP");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        if (s_ap_client_count > 0) {
+            --s_ap_client_count;
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *event = (const wifi_event_sta_disconnected_t *)event_data;
+        bool reconfiguring = s_sta_reconfiguring;
         s_sta_connected = false;
         s_sta_connecting = false;
+        s_sta_reconfiguring = false;
         s_sta_ip_text[0] = '\0';
+        s_sta_connecting_ssid[0] = '\0';
+        s_sta_connected_ssid[0] = '\0';
+        s_sta_ip_addr = 0;
+        s_sta_netmask_addr = 0;
+        s_sta_gateway_addr = 0;
+        s_sta_got_ip_us = 0;
         s_last_disconnect_reason = event != NULL ? event->reason : 0;
+        s_last_disconnect_rssi = event != NULL ? event->rssi : 0;
+        if (reconfiguring) {
+            ESP_LOGI(TAG, "STA disconnected for Wi-Fi reconfiguration");
+            return;
+        }
         if (s_saved_ssid[0] != '\0' && !s_reconnect_pending) {
-            ESP_LOGW(TAG, "STA disconnected; reason=%u retry scheduled", (unsigned)s_last_disconnect_reason);
+            uint32_t retry_delay_ms = wifi_reconnect_delay_ms();
+            if (s_sta_retry_count < 8) {
+                s_sta_retry_count++;
+            }
+            if (event != NULL) {
+                ESP_LOGW(TAG,
+                         "STA disconnected; reason=%u(%s) rssi=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x retry in %ums; hint=%s",
+                         (unsigned)s_last_disconnect_reason,
+                         wifi_disconnect_reason_name(s_last_disconnect_reason),
+                         (int)s_last_disconnect_rssi,
+                         event->bssid[0],
+                         event->bssid[1],
+                         event->bssid[2],
+                         event->bssid[3],
+                         event->bssid[4],
+                         event->bssid[5],
+                         (unsigned)retry_delay_ms,
+                         wifi_disconnect_reason_hint(s_last_disconnect_reason));
+            } else {
+                ESP_LOGW(TAG,
+                         "STA disconnected; reason=%u(%s) retry in %ums; hint=%s",
+                         (unsigned)s_last_disconnect_reason,
+                         wifi_disconnect_reason_name(s_last_disconnect_reason),
+                         (unsigned)retry_delay_ms,
+                         wifi_disconnect_reason_hint(s_last_disconnect_reason));
+            }
+            if (should_start_provisioning_fallback(s_last_disconnect_reason) &&
+                !s_provisioning_active &&
+                !s_provisioning_fallback_pending) {
+                if (xTaskCreate(start_provisioning_fallback_task,
+                                "wifi_ap_fallback",
+                                3072,
+                                NULL,
+                                4,
+                                NULL) == pdPASS) {
+                    s_provisioning_fallback_pending = true;
+                } else {
+                    ESP_LOGE(TAG, "create provisioning fallback task failed");
+                }
+            }
+            s_next_reconnect_delay_ms = retry_delay_ms;
             if (xTaskCreate(start_saved_sta_fallback_task, "wifi_retry", 3072, NULL, 4, NULL) == pdPASS) {
                 s_reconnect_pending = true;
             }
@@ -299,20 +859,48 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         s_sta_connected = true;
         s_sta_connecting = false;
+        s_sta_connecting_ssid[0] = '\0';
         s_reconnect_pending = false;
+        s_provisioning_fallback_pending = false;
+        s_sta_retry_count = 0;
+        s_next_reconnect_delay_ms = 0;
         s_last_disconnect_reason = 0;
+        s_last_disconnect_rssi = 0;
+        s_sta_got_ip_us = esp_timer_get_time();
         stop_captive_dns_capture_window("STA got IP");
         if (event != NULL) {
             snprintf(s_sta_ip_text, sizeof(s_sta_ip_text), IPSTR, IP2STR(&event->ip_info.ip));
+            s_sta_ip_addr = event->ip_info.ip.addr;
+            s_sta_netmask_addr = event->ip_info.netmask.addr;
+            s_sta_gateway_addr = event->ip_info.gw.addr;
         }
-        start_auto_ota_check();
+        wifi_ap_record_t ap_info = {0};
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK && ap_info.ssid[0] != '\0') {
+            snprintf(s_sta_connected_ssid, sizeof(s_sta_connected_ssid), "%s", (const char *)ap_info.ssid);
+        } else {
+            snprintf(s_sta_connected_ssid, sizeof(s_sta_connected_ssid), "%s", s_saved_ssid);
+        }
+        start_discovery_announce_task();
+        if (s_lcd_resync_after_sta_success) {
+            s_lcd_resync_after_sta_success = false;
+            schedule_lcd_resync_after_wireless();
+        }
         if (s_provisioning_active) {
-            ESP_LOGI(TAG, "STA got IP: %s; provisioning AP will close after status page can update",
-                     s_sta_ip_text);
-            if (!s_ap_shutdown_pending &&
-                xTaskCreate(delayed_disable_provisioning_ap, "ap_close_delay", 3072, NULL, 4, NULL) == pdPASS) {
-                s_ap_shutdown_pending = true;
+            if (s_restart_after_provisioning_success) {
+                ESP_LOGI(TAG, "STA got IP: %s; provisioning complete; restart scheduled",
+                         s_sta_ip_text);
+                schedule_provisioning_restart_if_connected();
+            } else {
+                uint32_t ap_hold_ms = s_provisioning_started_by_fallback
+                    ? BADGE_PROVISIONING_FALLBACK_AP_HOLD_MS
+                    : BADGE_PROVISIONING_SUCCESS_AP_HOLD_MS;
+                ESP_LOGI(TAG, "STA got IP: %s; provisioning AP will close in %ums",
+                         s_sta_ip_text,
+                         (unsigned)ap_hold_ms);
+                schedule_disable_provisioning_ap(ap_hold_ms);
             }
+        } else {
+            start_auto_ota_check();
         }
     }
 }
@@ -426,6 +1014,12 @@ static bool captive_dns_should_reply(const char *qname)
         "www.gstatic.com",
         "connect.rom.miui.com",
         "connectivitycheck.platform.hicloud.com",
+        "connectivitycheck.vivo.com.cn",
+        "vbw.vivo.com.cn",
+        "kernelapi.vivo.com",
+        "kernelapi.vivo.com.cn",
+        "wap.cmpassport.com",
+        "www.baidu.com",
         "wifi.vivo.com.cn",
         "conn1.oppomobile.com",
         "wifi.flyme.cn",
@@ -654,7 +1248,7 @@ static esp_err_t configure_provisioning_dhcp_options(void)
     ESP_RETURN_ON_ERROR(esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns),
                         TAG, "set AP DNS failed");
 
-    static char captive_uri[] = BADGE_CAPTIVE_PORTAL_URL;
+    static char captive_uri[] = BADGE_CAPTIVE_PORTAL_API_URL;
     ESP_RETURN_ON_ERROR(esp_netif_dhcps_option(s_ap_netif,
                                                ESP_NETIF_OP_SET,
                                                ESP_NETIF_CAPTIVEPORTAL_URI,
@@ -674,6 +1268,10 @@ static esp_err_t configure_provisioning_dhcp_options(void)
 
 static esp_err_t start_provisioning_ap(bool with_sta)
 {
+    if (!with_sta) {
+        s_provisioning_started_by_fallback = false;
+    }
+
     wifi_config_t wifi_config = {0};
     snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", BADGE_PROVISIONING_SSID);
     wifi_config.ap.ssid_len = strlen(BADGE_PROVISIONING_SSID);
@@ -703,6 +1301,7 @@ static esp_err_t start_provisioning_ap(bool with_sta)
 
     ESP_RETURN_ON_ERROR(configure_provisioning_dhcp_options(), TAG, "DHCP captive options failed");
     s_provisioning_active = true;
+    s_ap_client_count = 0;
     refresh_captive_dns_capture_window("provisioning AP started");
     esp_err_t dns_ret = start_captive_dns_server();
     if (dns_ret != ESP_OK) {
@@ -718,6 +1317,33 @@ static esp_err_t start_sta_connect(void)
 {
     if (s_saved_ssid[0] == '\0') {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (s_sta_connected && sta_ssid_matches(s_sta_connected_ssid, s_saved_ssid)) {
+        ESP_LOGI(TAG, "STA already connected to ssid=%s; skip reconnect", s_saved_ssid);
+        return ESP_OK;
+    }
+    if (s_sta_connecting && sta_ssid_matches(s_sta_connecting_ssid, s_saved_ssid)) {
+        ESP_LOGI(TAG, "STA connect already in progress for ssid=%s; skip duplicate connect", s_saved_ssid);
+        return ESP_OK;
+    }
+    if (s_sta_connected) {
+        ESP_LOGI(TAG, "STA switching from ssid=%s to ssid=%s",
+                 s_sta_connected_ssid[0] != '\0' ? s_sta_connected_ssid : "-",
+                 s_saved_ssid);
+        s_sta_reconfiguring = true;
+        esp_err_t disconnect_ret = esp_wifi_disconnect();
+        if (disconnect_ret != ESP_OK && disconnect_ret != ESP_ERR_WIFI_NOT_CONNECT) {
+            s_sta_reconfiguring = false;
+            return disconnect_ret;
+        }
+        int64_t deadline_us = esp_timer_get_time() + 1000000;
+        while (s_sta_reconfiguring && esp_timer_get_time() < deadline_us) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (s_sta_reconfiguring) {
+            s_sta_reconfiguring = false;
+            ESP_LOGW(TAG, "STA reconfiguration disconnect wait timed out");
+        }
     }
 
     wifi_config_t sta_config = {0};
@@ -735,8 +1361,14 @@ static esp_err_t start_sta_connect(void)
 
     s_sta_connected = false;
     s_sta_connecting = true;
+    snprintf(s_sta_connecting_ssid, sizeof(s_sta_connecting_ssid), "%s", s_saved_ssid);
+    s_sta_connected_ssid[0] = '\0';
     s_last_disconnect_reason = 0;
+    s_last_disconnect_rssi = 0;
     s_sta_ip_text[0] = '\0';
+    s_sta_ip_addr = 0;
+    s_sta_netmask_addr = 0;
+    s_sta_gateway_addr = 0;
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(s_provisioning_active ? WIFI_MODE_APSTA : WIFI_MODE_STA), TAG, "STA mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_config), TAG, "STA config failed");
     if (!s_wifi_started) {
@@ -759,7 +1391,12 @@ static esp_err_t start_wifi_service(void)
             return ESP_OK;
         }
         ESP_LOGW(TAG, "saved STA connect start failed; falling back to APSTA provisioning: %s", esp_err_to_name(ret));
-        return start_provisioning_ap(true);
+        s_provisioning_started_by_fallback = true;
+        ret = start_provisioning_ap(true);
+        if (ret != ESP_OK) {
+            s_provisioning_started_by_fallback = false;
+        }
+        return ret;
     }
 
     ESP_LOGI(TAG, "no saved STA credentials; starting AP-only provisioning");
@@ -1102,6 +1739,7 @@ static esp_err_t parse_crc_header(httpd_req_t *req, uint32_t *out_crc)
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
+    mark_local_activity();
     char status[96] = {0};
     badge_storage_get_status(status, sizeof(status));
     httpd_resp_set_type(req, "text/plain");
@@ -1152,28 +1790,97 @@ static bool request_targets_captive_host(httpd_req_t *req)
            strncmp(host, "ESP-DotLoop", strlen("ESP-DotLoop")) == 0;
 }
 
+static void log_captive_http_request(httpd_req_t *req, const char *known_host)
+{
+    if (s_captive_http_log_budget == 0) {
+        return;
+    }
+
+    char host[96] = {0};
+    if (known_host != NULL && known_host[0] != '\0') {
+        snprintf(host, sizeof(host), "%s", known_host);
+    } else {
+        (void)httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+    }
+    ESP_LOGI(TAG, "captive HTTP hit uri=%s host=%s",
+             req->uri,
+             host[0] != '\0' ? host : "-");
+    s_captive_http_log_budget--;
+}
+
+static esp_err_t send_provisioning_page(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    esp_err_t ret = httpd_resp_send(req, WIFI_PROVISIONING_HTML, HTTPD_RESP_USE_STRLEN);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "provisioning page client closed early: %s", esp_err_to_name(ret));
+    }
+    return ESP_OK;
+}
+
 static esp_err_t provisioning_root_handler(httpd_req_t *req)
 {
+    log_captive_http_request(req, NULL);
+    if (!request_targets_captive_host(req)) {
+        return captive_probe_send_response(req);
+    }
     if (request_targets_captive_host(req)) {
         stop_captive_dns_capture_window("portal page opened");
     }
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, WIFI_PROVISIONING_HTML, HTTPD_RESP_USE_STRLEN);
+    return send_provisioning_page(req);
 }
 
 static esp_err_t captive_probe_handler(httpd_req_t *req)
 {
     char host[96] = {0};
     (void)httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
-    ESP_LOGI(TAG, "captive probe uri=%s host=%s", req->uri, host[0] != '\0' ? host : "-");
-    stop_captive_dns_capture_window("captive probe served");
+    log_captive_http_request(req, host);
+    return captive_probe_send_response(req);
+}
 
+static esp_err_t captive_wildcard_get_handler(httpd_req_t *req)
+{
+    log_captive_http_request(req, NULL);
+    if (request_targets_captive_host(req)) {
+        stop_captive_dns_capture_window("portal page opened");
+        return send_provisioning_page(req);
+    }
+    return captive_probe_send_response(req);
+}
+
+static esp_err_t captive_post_handler(httpd_req_t *req)
+{
+    log_captive_http_request(req, NULL);
+    return captive_probe_send_response(req);
+}
+
+static esp_err_t captive_portal_api_handler(httpd_req_t *req)
+{
+    log_captive_http_request(req, NULL);
     httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_type(req, "application/captive+json");
+    esp_err_t ret = httpd_resp_send(req, BADGE_CAPTIVE_API_JSON, HTTPD_RESP_USE_STRLEN);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "captive API client closed early: %s", esp_err_to_name(ret));
+    }
+    return ESP_OK;
+}
+
+static esp_err_t captive_probe_send_response(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, WIFI_PROVISIONING_HTML, HTTPD_RESP_USE_STRLEN);
+    esp_err_t ret = httpd_resp_send(req, BADGE_CAPTIVE_PROBE_HTML, HTTPD_RESP_USE_STRLEN);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "captive probe client closed early: %s", esp_err_to_name(ret));
+    }
+    return ESP_OK;
 }
 
 static int hex_digit_value(char ch)
@@ -1327,18 +2034,28 @@ static esp_err_t handle_set_config(httpd_req_t *req)
 
     stop_captive_dns_capture_window("Wi-Fi config submitted");
     ret = save_wifi_credentials(ssid, password);
-    if (ret == ESP_OK) {
-        ret = start_sta_connect();
-    }
     if (ret != ESP_OK) {
+        s_restart_after_provisioning_success = false;
         ESP_LOGE(TAG, "set wifi credentials failed: %s", esp_err_to_name(ret));
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"connect start failed\"}");
         return ESP_FAIL;
     }
 
+    s_restart_after_provisioning_success = true;
+    s_provisioning_started_by_fallback = false;
+    bool already_connected = s_sta_connected && sta_ssid_matches(s_sta_connected_ssid, s_saved_ssid);
+    if (already_connected) {
+        schedule_provisioning_restart_if_connected();
+    } else {
+        schedule_sta_connect_after_config();
+    }
+
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"connect_started\"}");
+    const char *message = already_connected ? "already_connected" : "connect_started";
+    char response[64] = {0};
+    snprintf(response, sizeof(response), "{\"success\":true,\"message\":\"%s\"}", message);
+    return httpd_resp_sendstr(req, response);
 }
 
 static esp_err_t handle_clear_config(httpd_req_t *req)
@@ -1368,18 +2085,22 @@ static esp_err_t handle_clear_config(httpd_req_t *req)
 
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
-    char response[256] = {0};
+    mark_local_activity();
+    char response[512] = {0};
     char escaped_ssid[80] = {0};
     (void)append_json_escaped(escaped_ssid, sizeof(escaped_ssid), 0, s_saved_ssid);
     snprintf(response,
              sizeof(response),
-             "{\"success\":true,\"connected\":%s,\"connecting\":%s,\"provisioning\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"reason\":%u}",
+             "{\"success\":true,\"connected\":%s,\"connecting\":%s,\"provisioning\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"reason\":%u,\"reasonName\":\"%s\",\"rssi\":%d,\"hint\":\"%s\"}",
              s_sta_connected ? "true" : "false",
              (s_sta_connecting || s_reconnect_pending) ? "true" : "false",
              s_provisioning_active ? "true" : "false",
              escaped_ssid,
              s_sta_ip_text,
-             (unsigned)s_last_disconnect_reason);
+             (unsigned)s_last_disconnect_reason,
+             wifi_disconnect_reason_name(s_last_disconnect_reason),
+             (int)s_last_disconnect_rssi,
+             wifi_disconnect_reason_hint(s_last_disconnect_reason));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
@@ -1428,8 +2149,8 @@ static esp_err_t fetch_ota_manifest(char *buffer, size_t buffer_size)
 
     esp_http_client_config_t config = {
         .url = BADGE_OTA_MANIFEST_URL,
-        .timeout_ms = 10000,
-        .keep_alive_enable = true,
+        .timeout_ms = BADGE_OTA_MANIFEST_TIMEOUT_MS,
+        .keep_alive_enable = false,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -1496,6 +2217,38 @@ static bool parse_ota_manifest(const char *json_text,
     return ok;
 }
 
+static esp_err_t perform_ota_with_display_refresh(const esp_https_ota_config_t *ota_config)
+{
+    esp_https_ota_handle_t ota_handle = NULL;
+    esp_err_t ret = esp_https_ota_begin(ota_config, &ota_handle);
+    if (ret != ESP_OK) {
+        if (ota_handle != NULL) {
+            (void)esp_https_ota_abort(ota_handle);
+        }
+        return ret;
+    }
+
+    while (1) {
+        ret = esp_https_ota_perform(ota_handle);
+        if (ret != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    if (ret != ESP_OK) {
+        (void)esp_https_ota_abort(ota_handle);
+        return ret;
+    }
+    if (!esp_https_ota_is_complete_data_received(ota_handle)) {
+        (void)esp_https_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    ret = esp_https_ota_finish(ota_handle);
+    return ret;
+}
+
 static void ota_update_task(void *arg)
 {
     badge_ota_request_t *request = (badge_ota_request_t *)arg;
@@ -1512,19 +2265,22 @@ static void ota_update_task(void *arg)
 
     esp_http_client_config_t http_config = {
         .url = request->url,
-        .timeout_ms = 15000,
-        .keep_alive_enable = true,
+        .timeout_ms = BADGE_OTA_HTTP_TIMEOUT_MS,
+        .buffer_size = BADGE_OTA_HTTP_BUFFER_SIZE,
+        .keep_alive_enable = false,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_https_ota_config_t ota_config = {
         .http_config = &http_config,
+        .bulk_flash_erase = true,
+        .buffer_caps = MALLOC_CAP_INTERNAL,
     };
 
-    esp_err_t ret = esp_https_ota(&ota_config);
+    esp_err_t ret = perform_ota_with_display_refresh(&ota_config);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "OTA update complete; restarting");
         free(request);
-        esp_restart();
+        safe_restart_after_releasing_lcd_cs();
     }
 
     ESP_LOGE(TAG, "OTA update failed: %s", esp_err_to_name(ret));
@@ -1539,11 +2295,21 @@ static void auto_ota_check_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(BADGE_OTA_CHECK_DELAY_MS));
-    if (!s_sta_connected) {
+    if (!s_sta_connected || !ota_wifi_stable()) {
+        ESP_LOGI(TAG, "OTA check skipped; STA is not stable yet");
         s_auto_ota_check_running = false;
+        start_auto_ota_check();
         vTaskDelete(NULL);
         return;
     }
+    if (ota_local_activity_recent()) {
+        ESP_LOGI(TAG, "OTA check deferred; local app activity is recent");
+        s_auto_ota_check_running = false;
+        start_auto_ota_check();
+        vTaskDelete(NULL);
+        return;
+    }
+    s_auto_ota_check_done = true;
 
     char *manifest = calloc(1, BADGE_OTA_MANIFEST_MAX);
     if (manifest == NULL) {
@@ -1558,6 +2324,8 @@ static void auto_ota_check_task(void *arg)
         ESP_LOGW(TAG, "OTA manifest fetch failed: %s", esp_err_to_name(ret));
         free(manifest);
         s_auto_ota_check_running = false;
+        badge_factory_sync_start_once();
+        start_auto_ota_check();
         vTaskDelete(NULL);
         return;
     }
@@ -1568,6 +2336,8 @@ static void auto_ota_check_task(void *arg)
         ESP_LOGW(TAG, "OTA manifest parse failed");
         free(manifest);
         s_auto_ota_check_running = false;
+        badge_factory_sync_start_once();
+        start_auto_ota_check();
         vTaskDelete(NULL);
         return;
     }
@@ -1576,6 +2346,7 @@ static void auto_ota_check_task(void *arg)
     if (!ota_version_is_newer(remote_version, BADGE_FW_VERSION)) {
         ESP_LOGI(TAG, "firmware up to date: current=%s remote=%s", BADGE_FW_VERSION, remote_version);
         s_auto_ota_check_running = false;
+        badge_factory_sync_start_once();
         vTaskDelete(NULL);
         return;
     }
@@ -1595,7 +2366,7 @@ static void auto_ota_check_task(void *arg)
 
 static void start_auto_ota_check(void)
 {
-    if (s_auto_ota_check_running || BADGE_OTA_MANIFEST_URL[0] == '\0') {
+    if (s_auto_ota_check_running || s_auto_ota_check_done || BADGE_OTA_MANIFEST_URL[0] == '\0') {
         return;
     }
     if (xTaskCreate(auto_ota_check_task, "badge_ota_check", BADGE_OTA_TASK_STACK, NULL, 4, NULL) == pdPASS) {
@@ -1645,6 +2416,7 @@ static esp_err_t ota_handler(httpd_req_t *req)
 
 static esp_err_t upload_handler(httpd_req_t *req)
 {
+    mark_local_activity();
     if (req->content_len == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing body");
         return ESP_FAIL;
@@ -1801,6 +2573,7 @@ static void send_tcp_status(int sock, esp_err_t ret)
 
 static esp_err_t handle_tcp_upload(int sock)
 {
+    mark_local_activity();
     int opt = 1;
     (void)setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     int rcvbuf = BADGE_TCP_RCVBUF_BYTES;
@@ -1991,7 +2764,7 @@ static void tcp_upload_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    if (listen(listen_sock, 1) != 0) {
+    if (listen(listen_sock, 4) != 0) {
         ESP_LOGE(TAG, "TCP listen failed: errno=%d", errno);
         close(listen_sock);
         vTaskDelete(NULL);
@@ -2033,13 +2806,13 @@ static esp_err_t start_tcp_upload_server(void)
 static esp_err_t start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     config.max_open_sockets = 4;
     config.lru_purge_enable = true;
     config.server_port = 80;
     config.ctrl_port = 32768;
     config.stack_size = 12288;
-    config.task_priority = 10;
+    config.task_priority = 5;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
     config.uri_match_fn = httpd_uri_match_wildcard;
@@ -2100,14 +2873,20 @@ static esp_err_t start_http_server(void)
         .handler = ota_handler,
         .user_ctx = NULL,
     };
+    const httpd_uri_t captive_api_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_GET,
+        .handler = captive_portal_api_handler,
+        .user_ctx = NULL,
+    };
     const httpd_uri_t captive_android_uri = {
-        .uri = "/generate_204",
+        .uri = "/generate_204*",
         .method = HTTP_GET,
         .handler = captive_probe_handler,
         .user_ctx = NULL,
     };
     const httpd_uri_t captive_android_alt_uri = {
-        .uri = "/gen_204",
+        .uri = "/gen_204*",
         .method = HTTP_GET,
         .handler = captive_probe_handler,
         .user_ctx = NULL,
@@ -2139,7 +2918,13 @@ static esp_err_t start_http_server(void)
     const httpd_uri_t captive_wildcard_uri = {
         .uri = "/*",
         .method = HTTP_GET,
-        .handler = provisioning_root_handler,
+        .handler = captive_wildcard_get_handler,
+        .user_ctx = NULL,
+    };
+    const httpd_uri_t captive_wildcard_post_uri = {
+        .uri = "/*",
+        .method = HTTP_POST,
+        .handler = captive_post_handler,
         .user_ctx = NULL,
     };
 
@@ -2152,6 +2937,7 @@ static esp_err_t start_http_server(void)
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &wifi_status_uri), TAG, "wifi status uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &clear_config_uri), TAG, "clear config uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &ota_uri), TAG, "ota uri failed");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_api_uri), TAG, "captive API uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_android_uri), TAG, "android captive uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_android_alt_uri), TAG, "android captive alt uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_ios_uri), TAG, "ios captive uri failed");
@@ -2159,6 +2945,7 @@ static esp_err_t start_http_server(void)
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_windows_uri), TAG, "windows captive uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_ncsi_uri), TAG, "ncsi captive uri failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_wildcard_uri), TAG, "captive wildcard uri failed");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &captive_wildcard_post_uri), TAG, "captive wildcard post uri failed");
     return ESP_OK;
 }
 

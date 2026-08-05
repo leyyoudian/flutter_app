@@ -309,6 +309,11 @@ esp_err_t badge_anim_mgr_init(void)
     return ESP_OK;
 }
 
+esp_err_t badge_anim_mgr_rescan(void)
+{
+    return badge_anim_mgr_init();
+}
+
 uint8_t badge_anim_mgr_factory_count(void)
 {
     return s_factory_count;
