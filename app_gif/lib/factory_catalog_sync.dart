@@ -83,7 +83,11 @@ class FactoryCatalogSync {
         final id = _readString(item['id']);
         if (id.isEmpty) continue;
         remoteIds.add(id);
-        result[id] = _catalogItemToAnimationMap(item);
+        final remoteAnimation = _catalogItemToAnimationMap(item);
+        final existing = result[id];
+        result[id] = existing == null
+            ? remoteAnimation
+            : _mergeAnimationMaps(existing, remoteAnimation);
       }
       result.removeWhere((id, item) {
         final protected = item['protected'] == true || _isProtectedBaseline(id);
@@ -98,6 +102,29 @@ class FactoryCatalogSync {
       ).compareTo(_factorySortKey(_readString(b['id']))),
     );
     return items;
+  }
+
+  static Map<String, dynamic> _mergeAnimationMaps(
+    Map<String, dynamic> base,
+    Map<String, dynamic> overlay,
+  ) {
+    final merged = Map<String, dynamic>.from(base);
+    for (final entry in overlay.entries) {
+      final value = entry.value;
+      if ((entry.key == 'previewAsset' ||
+              entry.key == 'firstVideo' ||
+              entry.key == 'secondVideo' ||
+              entry.key == 'loopVideo') &&
+          value is String &&
+          value.isEmpty) {
+        continue;
+      }
+      if (entry.key == 'transitions' && value is Map && value.isEmpty) {
+        continue;
+      }
+      merged[entry.key] = value;
+    }
+    return _normalizeAnimationMap(merged);
   }
 
   static Map<String, dynamic> _catalogItemToAnimationMap(

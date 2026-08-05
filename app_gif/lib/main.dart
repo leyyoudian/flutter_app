@@ -72,7 +72,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: 'http://60.205.122.153',
   );
-  static const _appVersion = '1.0.15';
+  static const _appVersion = '1.0.16';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -1516,9 +1516,11 @@ class _DisplayLibraryPage extends StatelessWidget {
                           videoIndex + 1 < videoQueue.length
                       ? videoQueue[videoIndex + 1]
                       : null,
-                  onFactoryVideoDone: videoQueue.isNotEmpty
-                      ? onVideoDone
-                      : null,
+                  looping: selectedFactory?.isLoop == true,
+                  onFactoryVideoDone:
+                      selectedFactory?.isLoop == true || videoQueue.isEmpty
+                      ? null
+                      : onVideoDone,
                   preparing: uploading,
                   progress: uploadProgress,
                 ),
@@ -2329,6 +2331,7 @@ class _PreviewDial extends StatelessWidget {
     required this.asset,
     this.factoryVideo,
     this.nextVideo,
+    this.looping = false,
     this.onFactoryVideoDone,
     required this.preparing,
     required this.progress,
@@ -2339,6 +2342,7 @@ class _PreviewDial extends StatelessWidget {
   final PreparedAsset? asset;
   final String? factoryVideo;
   final String? nextVideo;
+  final bool looping;
   final VoidCallback? onFactoryVideoDone;
   final bool preparing;
   final double progress;
@@ -2427,6 +2431,7 @@ class _PreviewDial extends StatelessWidget {
                 currentVideo: factoryVideo!,
                 nextVideo: nextVideo,
                 active: active,
+                looping: looping,
                 onDone: onFactoryVideoDone,
               )
             else
@@ -2576,12 +2581,14 @@ class _DualVideoPlayer extends StatefulWidget {
     required this.currentVideo,
     this.nextVideo,
     required this.active,
+    this.looping = false,
     this.onDone,
   });
 
   final String currentVideo;
   final String? nextVideo;
   final bool active;
+  final bool looping;
   final VoidCallback? onDone;
 
   @override
@@ -2611,6 +2618,9 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
     }
     if (oldWidget.nextVideo != widget.nextVideo) {
       _maybePreload();
+    }
+    if (oldWidget.looping != widget.looping) {
+      unawaited(_syncLooping());
     }
     if (oldWidget.active != widget.active) {
       unawaited(_syncActive());
@@ -2661,6 +2671,7 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
       _preloadedPath = null;
       _active?.removeListener(_onUpdate);
       _active?.addListener(_onUpdate);
+      await _active!.setLooping(widget.looping);
       await _active!.seekTo(Duration.zero);
       await _active!.play();
       if (mounted) setState(() {});
@@ -2679,7 +2690,7 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
     final c = _factoryVideoController(path);
     try {
       await c.initialize();
-      await c.setLooping(false);
+      await c.setLooping(widget.looping);
       await c.setVolume(0);
       if (!mounted) {
         c.dispose();
@@ -2708,11 +2719,21 @@ class _DualVideoPlayerState extends State<_DualVideoPlayer> {
   }
 
   void _onUpdate() {
+    if (widget.looping) return;
     if (_done || _active == null || !_active!.value.isInitialized) return;
     if (_active!.value.position >=
         _active!.value.duration - const Duration(milliseconds: 100)) {
       _done = true;
       widget.onDone?.call();
+    }
+  }
+
+  Future<void> _syncLooping() async {
+    final c = _active;
+    if (c == null || !c.value.isInitialized) return;
+    await c.setLooping(widget.looping);
+    if (!widget.looping) {
+      _done = false;
     }
   }
 

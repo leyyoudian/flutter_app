@@ -66,4 +66,40 @@ void main() {
       expect(merged.any((item) => item['id'] == 'F022'), isFalse);
     },
   );
+
+  test('remote baseline without app files preserves built-in previews', () {
+    final merged = FactoryCatalogSync.mergeCatalogForTest(
+      builtIn: [
+        {
+          'id': 'F006',
+          'name': 'F006',
+          'type': 'split',
+          'previewAsset': 'assets/factory_previews/F006.png',
+          'firstVideo': 'assets/factory_previews/F006_first.mp4',
+          'secondVideo': 'assets/factory_previews/F006_second.mp4',
+          'transitions': {'F007': 'assets/factory_previews/F007_third.mp4'},
+        },
+      ],
+      remote: {
+        'items': [
+          {
+            'id': 'F006',
+            'title': 'F006',
+            'type': 'split',
+            'protected': true,
+            'appFiles': <String, dynamic>{},
+          },
+        ],
+      },
+      installed: const {},
+    );
+
+    final f006 = merged.singleWhere((item) => item['id'] == 'F006');
+    expect(f006['previewAsset'], 'assets/factory_previews/F006.png');
+    expect(f006['firstVideo'], 'assets/factory_previews/F006_first.mp4');
+    expect(f006['secondVideo'], 'assets/factory_previews/F006_second.mp4');
+    expect(f006['transitions'], {
+      'F007': 'assets/factory_previews/F007_third.mp4',
+    });
+  });
 }
