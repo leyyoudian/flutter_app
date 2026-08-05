@@ -44,15 +44,15 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.14';"));
-    expect(pubspec, contains('version: 1.0.14+16'));
+    expect(source, contains("static const _appVersion = '1.0.15';"));
+    expect(pubspec, contains('version: 1.0.15+17'));
   });
 
   test('firmware project version is aligned with OTA release version', () {
     final cmake = File('../ESP32-S3-LCD-2.8C-Test/CMakeLists.txt').readAsStringSync();
     final mainCmake = File('../ESP32-S3-LCD-2.8C-Test/main/CMakeLists.txt').readAsStringSync();
 
-    expect(cmake, contains('set(PROJECT_VER "0.1.33")'));
+    expect(cmake, contains('set(PROJECT_VER "0.1.47")'));
     expect(
       mainCmake,
       contains(r'target_compile_definitions(${COMPONENT_LIB} PRIVATE BADGE_FW_VERSION=\"${PROJECT_VER}\")'),
