@@ -1222,13 +1222,22 @@ async function loadFirmwareHistory() {
 function renderFactoryPreview(item) {
   const thumb = item.appFiles && item.appFiles.thumbnail ? item.appFiles.thumbnail.url : '';
   const loopVideo = item.appFiles && item.appFiles.loopVideo ? item.appFiles.loopVideo.url : '';
+  const fallback = factoryPreviewFallbackUrl(item);
   if (loopVideo) {
     return '<video class="asset-thumb" controls muted preload="metadata" src="' + escapeHtml(loopVideo) + '"></video>';
   }
   if (thumb) {
     return '<a href="' + escapeHtml(thumb) + '" target="_blank"><img class="asset-thumb" src="' + escapeHtml(thumb) + '" alt="thumbnail"></a>';
   }
+  if (fallback) {
+    return '<a href="' + escapeHtml(fallback) + '" target="_blank"><img class="asset-thumb" src="' + escapeHtml(fallback) + '" alt="factory preview"></a>';
+  }
   return '<span class="asset-meta">No preview</span>';
+}
+
+function factoryPreviewFallbackUrl(item) {
+  const id = String(item && item.id ? item.id : '').toUpperCase();
+  return /^F\d{3}$/.test(id) ? '/assets/factory_previews/' + encodeURIComponent(id + '.png') : '';
 }
 
 function renderFactoryCandidates(candidates) {
@@ -1363,6 +1372,7 @@ async function publishFactorySelection() {
 
 async function deleteFactoryItem(id) {
   if (!confirm('Delete factory item ' + id + '?')) return;
+  if (!confirm('Confirm again: delete ' + id + ' and remove it from future app/device sync?')) return;
   try {
     const data = await api('DELETE', '/api/admin/factory/' + encodeURIComponent(id), null);
     renderFactoryCatalog(data);
@@ -1493,6 +1503,11 @@ function createApp(options = {}) {
   const factoryCatalogFile = path.join(dataDir, 'factory_catalog.json');
   const factoryImportsDir = path.join(dataDir, 'factory_imports');
   const factoryDownloadsDir = path.join(downloadsDir, 'factory');
+  const factoryPreviewDirs = [
+    path.join(assetsDir, 'factory_previews'),
+    path.join(__dirname, '..', 'factory_previews'),
+    path.resolve(__dirname, '..', '..', 'app_gif', 'assets', 'factory_previews'),
+  ];
 
   ensureDir(packagesDir);
   ensureDir(previewsDir);
@@ -1851,6 +1866,30 @@ function createApp(options = {}) {
           : 'application/octet-stream';
         res.writeHead(200, {
           'content-type': contentType,
+          'content-length': stat.size,
+          'cache-control': 'public, max-age=31536000, immutable',
+        });
+        if (req.method === 'HEAD') {
+          res.end();
+          return;
+        }
+        fs.createReadStream(filePath).pipe(res);
+        return;
+      }
+
+      const factoryPreviewMatch = url.pathname.match(/^\/assets\/factory_previews\/(F\d{3})\.png$/i);
+      if ((req.method === 'GET' || req.method === 'HEAD') && factoryPreviewMatch) {
+        const filename = `${normalizeFactoryItemId(factoryPreviewMatch[1])}.png`;
+        const filePath = factoryPreviewDirs
+          .map((dir) => path.join(dir, filename))
+          .find((candidate) => fs.existsSync(candidate));
+        if (!filePath) {
+          sendJson(res, 404, { error: 'factory preview not found' });
+          return;
+        }
+        const stat = fs.statSync(filePath);
+        res.writeHead(200, {
+          'content-type': 'image/png',
           'content-length': stat.size,
           'cache-control': 'public, max-age=31536000, immutable',
         });

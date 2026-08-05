@@ -423,16 +423,41 @@ def process(mp4, out, ss=480, zoom=ZOOM):
         print(f"    {len(eb4)} bytes, {len(ef)} frames")
 
 
-def preview(mp4, out, zoom=1.0):
-    """Generate a static PNG preview from the middle frame."""
+def preview_frame_score(frame):
+    """Score a frame by visible non-black luminance for grid thumbnails."""
+    from PIL import Image
+    with Image.open(frame).convert("L") as img:
+        hist = img.histogram()
+    return sum(value * count for value, count in enumerate(hist))
+
+
+def choose_preview_frame(frames):
+    if not frames:
+        return None
+    return max(frames, key=preview_frame_score)
+
+
+def preview_from_sources(mp4s, out, zoom=1.0):
+    """Generate a static PNG preview from the most visible frame."""
     import tempfile
     from PIL import Image
     with tempfile.TemporaryDirectory() as tmp:
         td = Path(tmp)
-        _, frames = mp4_to_palette_frames(mp4, td, zoom=zoom)
-        if frames:
-            mid = frames[len(frames) // 2]
-            Image.open(mid).save(out, "PNG")
+        frames = []
+        for index, mp4 in enumerate(mp4s):
+            if not mp4:
+                continue
+            source_dir = td / f"s{index}"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            _, source_frames = mp4_to_palette_frames(mp4, source_dir, zoom=zoom)
+            frames.extend(source_frames)
+        selected = choose_preview_frame(frames)
+        if selected:
+            Image.open(selected).save(out, "PNG")
+
+
+def preview(mp4, out, zoom=1.0):
+    preview_from_sources([mp4], out, zoom=zoom)
 
 
 def main():
@@ -478,7 +503,7 @@ def main():
     manifest = []
     for pid,f1,f2 in pairs:
         z = get_zoom(pid)
-        preview(f1, pd/f"{pid}.png", zoom=1.0)
+        preview_from_sources([f1, f2], pd/f"{pid}.png", zoom=1.0)
         make_dial_mp4(f1, pd/f"{pid}_first.mp4", zoom=z)
         if f2: make_dial_mp4(f2, pd/f"{pid}_second.mp4", zoom=z)
         print(f"  {pid}: grid PNG + first/second MP4")

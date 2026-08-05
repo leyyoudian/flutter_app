@@ -424,6 +424,9 @@ test('admin page exposes official factory animation management', async () => {
     assert.match(adminPage.text, /page-factory/);
     assert.match(adminPage.text, /function uploadFactoryZip/);
     assert.match(adminPage.text, /function loadFactoryCatalog/);
+    assert.match(adminPage.text, /function factoryPreviewFallbackUrl/);
+    assert.match(adminPage.text, /\/assets\/factory_previews\//);
+    assert.match(adminPage.text, /Confirm again/);
   });
 });
 
@@ -524,6 +527,19 @@ test('factory catalog starts with protected baseline and rejects protected delet
 
     const deleted = await request(baseUrl, 'DELETE', '/api/admin/factory/F001', null, admin);
     assert.equal(deleted.status, 409);
+  });
+});
+
+test('factory preview fallback serves static preview assets', async () => {
+  await withServer(async (baseUrl, dataDir) => {
+    const previewDir = path.join(dataDir, 'assets', 'factory_previews');
+    fs.mkdirSync(previewDir, { recursive: true });
+    fs.writeFileSync(path.join(previewDir, 'F001.png'), 'png-preview');
+
+    const preview = await request(baseUrl, 'GET', '/assets/factory_previews/F001.png');
+    assert.equal(preview.status, 200);
+    assert.equal(preview.headers['content-type'], 'image/png');
+    assert.equal(preview.text, 'png-preview');
   });
 });
 
