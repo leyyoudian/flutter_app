@@ -143,6 +143,11 @@ import UIKit
         return
       }
       switchToAsset(id: id, result: result)
+    case "setRandomMode":
+      let enabled = args["enabled"] as? Bool ?? false
+      setRandomMode(enabled: enabled, result: result)
+    case "getRandomMode":
+      getRandomMode(result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -181,9 +186,9 @@ import UIKit
       } catch {
         self.connectedAddress = nil
         self.sdAvailable = false
-        self.sendConnectionEvent(connected: false, connecting: false, message: "请先连接 ESP-BAJI Wi-Fi")
+        self.sendConnectionEvent(connected: false, connecting: false, message: "请先连接 DotLoop Wi-Fi")
         DispatchQueue.main.async {
-          result(FlutterError(code: "connect_failed", message: "请先连接 ESP-BAJI Wi-Fi", details: nil))
+          result(FlutterError(code: "connect_failed", message: "请先连接 DotLoop Wi-Fi", details: nil))
         }
       }
     }
@@ -292,7 +297,7 @@ import UIKit
       setActiveBadgeHost(discovered.host)
       return discovered.status
     }
-    throw BadgeError.message("请先连接 ESP-BAJI Wi-Fi，或让手机和设备在同一 Wi-Fi 下")
+    throw BadgeError.message("请先连接 DotLoop Wi-Fi，或让手机和设备在同一 Wi-Fi 下")
   }
 
   private func publishLanBadgeScanResult() {
@@ -796,6 +801,32 @@ import UIKit
     }
   }
 
+  private func setRandomMode(enabled: Bool, result: @escaping FlutterResult) {
+    sendRandomModeCommand(enabled ? "ON" : "OFF", result: result)
+  }
+
+  private func getRandomMode(result: @escaping FlutterResult) {
+    sendRandomModeCommand("GET", result: result)
+  }
+
+  private func sendRandomModeCommand(_ arg: String, result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let response = try self.sendRawTcpCommand("RANDOM \(arg)\n")
+        guard response.hasPrefix("OK RANDOM") else {
+          throw BadgeError.message(response.isEmpty ? "随机播放设置失败" : response)
+        }
+        DispatchQueue.main.async {
+          result(response.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("1"))
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "random_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
   private func requestNewUserId(result: @escaping FlutterResult) {
     DispatchQueue.global(qos: .userInitiated).async {
       do {
@@ -831,6 +862,51 @@ import UIKit
         let cmd = "SWITCH \(id)\n"
         connection.send(
           content: cmd.data(using: .utf8),
+          completion: .contentProcessed { error in
+            if let error = error {
+              failure = error
+              semaphore.signal()
+              return
+            }
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, receiveError in
+              if let data = data { responseData = data }
+              if let receiveError = receiveError { failure = receiveError }
+              connection.cancel()
+              semaphore.signal()
+            }
+          }
+        )
+      case .failed(let error), .waiting(let error):
+        failure = error
+        connection.cancel()
+        semaphore.signal()
+      case .cancelled:
+        semaphore.signal()
+      default:
+        break
+      }
+    }
+    connection.start(queue: .global())
+    _ = semaphore.wait(timeout: .now() + .seconds(5))
+    connection.cancel()
+    if let failure = failure { throw failure }
+    return String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  }
+
+  private func sendRawTcpCommand(_ command: String) throws -> String {
+    let semaphore = DispatchSemaphore(value: 0)
+    var responseData = Data()
+    var failure: Error?
+    let connection = NWConnection(
+      host: NWEndpoint.Host(activeBadgeHost),
+      port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
+      using: .tcp
+    )
+    connection.stateUpdateHandler = { state in
+      switch state {
+      case .ready:
+        connection.send(
+          content: command.data(using: .utf8),
           completion: .contentProcessed { error in
             if let error = error {
               failure = error
@@ -1880,7 +1956,7 @@ private final class EbajEncoder {
 
 private enum BadgeConstants {
   static let channel = "esp_baji/native"
-  static let badgeDeviceName = "ESP-DotLoop"
+  static let badgeDeviceName = "DotLoop"
   static let badgeApHost = "192.168.4.1"
   static let badgeUploadTcpPort = 3333
   static let discoveryUdpPort: UInt16 = 3334

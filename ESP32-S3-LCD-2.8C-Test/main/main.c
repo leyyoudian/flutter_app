@@ -29,12 +29,15 @@ void Driver_Init(void)
 {
     Log_Flash_Size();
 }
+
 void app_main(void)
 {   
+    ESP_ERROR_CHECK(ST7701S_PrepareBootCs());
+    vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(TAG, "Badge firmware build: %s", BADGE_FW_BUILD_ID);
     Driver_Init();
-    ESP_ERROR_CHECK(badge_storage_init());
     ESP_ERROR_CHECK(Wireless_Init());
+    ESP_ERROR_CHECK(badge_storage_init());
     vTaskDelay(pdMS_TO_TICKS(1000));
     LCD_Init();   
 

@@ -7,6 +7,10 @@
 
 static const char *LCD_TAG = "LCD";
 
+#define LCD_POWER_SETTLE_DELAY_MS 400u
+#define LCD_RESET_LOW_DELAY_MS 250u
+#define LCD_RESET_RELEASE_DELAY_MS 300u
+
 /**
  * @brief Example Create an ST7701S object
  * @param SDA SDA pin
@@ -56,7 +60,7 @@ ST7701S_handle ST7701S_newObject(int SDA, int SCL, int CS, char channel_select)
 void ST7701S_screen_init(ST7701S_handle St7701S_handle, unsigned char type)
 {
     if (type == 1){
-    // 2.5inch 圆屏 (厂商初始化序列)
+    // 2.5 inch round panel vendor initialization sequence.
     SPI_WriteComm(0xFF);
     SPI_WriteData(0x77);
     SPI_WriteData(0x01);
@@ -343,6 +347,22 @@ void ST7701S_WriteData(ST7701S_handle St7701S_handle, uint8_t data)
     spi_device_transmit(St7701S_handle->spi_device, &spi_tran);
 }
 
+esp_err_t ST7701S_PrepareBootCs(void)
+{
+    if (LCD_CS < 0) {
+        return ESP_OK;
+    }
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << LCD_CS,
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_set_level(LCD_CS, 1), LCD_TAG, "preload LCD CS high failed");
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), LCD_TAG, "hold LCD CS high failed");
+    return ESP_OK;
+}
 
 esp_err_t ST7701S_reset(void)
 {
@@ -353,11 +373,11 @@ esp_err_t ST7701S_reset(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), LCD_TAG, "configure LCD reset GPIO failed");
     ESP_RETURN_ON_ERROR(gpio_set_level(LCD_RST, 0), LCD_TAG, "set LCD reset low failed");
-    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), LCD_TAG, "configure LCD reset GPIO failed");
+    vTaskDelay(pdMS_TO_TICKS(LCD_RESET_LOW_DELAY_MS));
     ESP_RETURN_ON_ERROR(gpio_set_level(LCD_RST, 1), LCD_TAG, "set LCD reset high failed");
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(LCD_RESET_RELEASE_DELAY_MS));
     return ESP_OK;
 }
 
@@ -368,13 +388,13 @@ esp_err_t ST7701S_CS_EN(void)
     }
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << LCD_CS,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), LCD_TAG, "configure LCD CS GPIO failed");
     ESP_RETURN_ON_ERROR(gpio_set_level(LCD_CS, 0), LCD_TAG, "set LCD CS low failed");
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), LCD_TAG, "configure LCD CS GPIO failed");
     return ESP_OK;
 }
 esp_err_t ST7701S_CS_Dis(void)
@@ -383,6 +403,23 @@ esp_err_t ST7701S_CS_Dis(void)
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(gpio_set_level(LCD_CS, 1), LCD_TAG, "set LCD CS high failed");
+    return ESP_OK;
+}
+
+esp_err_t ST7701S_PrepareForRestart(void)
+{
+    if (LCD_CS < 0) {
+        return ESP_OK;
+    }
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << LCD_CS,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_set_level(LCD_CS, 1), LCD_TAG, "preload LCD CS high before restart failed");
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), LCD_TAG, "release LCD CS GPIO before restart failed");
     return ESP_OK;
 }
 
@@ -410,28 +447,42 @@ static bool example_on_vsync_event(esp_lcd_panel_handle_t panel, const esp_lcd_r
 }
 
 esp_lcd_panel_handle_t panel_handle = NULL;
-esp_err_t LCD_WaitForVsync(TickType_t timeout_ticks)
+void LCD_PrepareForVsync(void)
 {
     if (s_lcd_vsync_sem == NULL) {
-        return ESP_ERR_INVALID_STATE;
+        return;
     }
 
     while (xSemaphoreTake(s_lcd_vsync_sem, 0) == pdTRUE) {
     }
+}
 
+esp_err_t LCD_WaitForPreparedVsync(TickType_t timeout_ticks)
+{
+    if (s_lcd_vsync_sem == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return xSemaphoreTake(s_lcd_vsync_sem, timeout_ticks) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t LCD_WaitForVsync(TickType_t timeout_ticks)
+{
+    LCD_PrepareForVsync();
+    return LCD_WaitForPreparedVsync(timeout_ticks);
 }
 
 void LCD_Init(void)
 {
     /********************* LCD *********************/
+    ESP_ERROR_CHECK(ST7701S_PrepareBootCs());
+    vTaskDelay(pdMS_TO_TICKS(LCD_POWER_SETTLE_DELAY_MS));
     ST7701S_reset();
-    ST7701S_CS_EN();
-    vTaskDelay(pdMS_TO_TICKS(100));
     ST7701S_handle st7701s = ST7701S_newObject(LCD_MOSI, LCD_SCLK, LCD_CS, SPI2_HOST);
+    ST7701S_CS_EN();
+    vTaskDelay(pdMS_TO_TICKS(20));
     
     ST7701S_screen_init(st7701s, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(200));
     #if CONFIG_EXAMPLE_AVOID_TEAR_EFFECT_WITH_SEM
         ESP_LOGI(LCD_TAG, "Create semaphores");
         sem_vsync_end = xSemaphoreCreateBinary();
@@ -508,6 +559,7 @@ void LCD_Init(void)
     ESP_LOGI(LCD_TAG, "Step 4: calling esp_lcd_panel_init...");
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_LOGI(LCD_TAG, "Step 4: OK");
+    vTaskDelay(pdMS_TO_TICKS(50));
     if (!LCD_CS_ALWAYS_LOW_AFTER_BOOT) {
         ST7701S_CS_Dis();
     }
@@ -522,7 +574,7 @@ static void example_ledc_init(void)
         .speed_mode       = LEDC_MODE,
         .timer_num        = LEDC_TIMER,
         .duty_resolution  = LEDC_DUTY_RES,
-        .freq_hz          = LEDC_FREQUENCY,  // Set output frequency at 4 kHz
+        .freq_hz          = LEDC_FREQUENCY,  // Set output frequency at 8 kHz
         .clk_cfg          = LEDC_AUTO_CLK
     };
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));

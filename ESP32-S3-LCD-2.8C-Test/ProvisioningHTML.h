@@ -285,7 +285,8 @@ function updateStatus(message, type) {
                     }
                 })
                 .catch(error => {
-                    showStatus('保存配置失败，请保持连接 ESP-DotLoop-Setup 后重试', 'error');
+                    showStatus('请求已发送，正在等待设备连接路由器...', 'info');
+                    pollConnectionStatus(0);
                 });
         }
 
@@ -315,9 +316,9 @@ function updateStatus(message, type) {
                 .then(data => {
                     if (data.connected) {
                         const ipText = data.ip ? `IP：${data.ip}` : '已连接到路由器';
-                        showStatus('配网成功，' + ipText, 'success');
+                        showStatus('配网成功，' + ipText + '，设备即将重启', 'success');
                         setTimeout(() => {
-                            document.body.innerHTML = '<div style="text-align: center; padding: 50px;"><h1>配网成功</h1><p>设备已连接到 Wi-Fi。手机可以切回原来的网络后打开 App 使用。</p></div>';
+                            document.body.innerHTML = '<div style="text-align: center; padding: 50px;"><h1>配网成功</h1><p>设备即将重启。手机可以切回原来的网络后打开 App 使用。</p></div>';
                         }, 1200);
                         return;
                     }

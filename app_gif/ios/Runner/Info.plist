@@ -32,7 +32,7 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>用于连接 ESP-BAJI 设备并上传车标动画。</string>
+	<string>用于连接 DotLoop 设备并上传车标动画。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于导入图片、GIF 或视频素材。</string>
 	<key>UILaunchStoryboardName</key>

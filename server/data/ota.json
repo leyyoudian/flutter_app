@@ -1,9 +1,12 @@
-{
+﻿{
     "esp32s3":  {
                     "hardware":  "esp32s3",
-                    "version":  "0.1.4",
-                    "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.4.bin",
-                    "sha256":  "0f55a8cb27d241307b8df64cfcf5f2e859024b0cf758fc42e5d5c394b30565a0",
-                    "notes":  "固件版本 0.1.4，公网 80 端口 OTA"
+                    "version":  "0.1.47",
+                    "filename":  "esp-baji-esp32s3-0.1.47.bin",
+                    "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.47.bin",
+                    "size":  1665856,
+                    "sha256":  "481605b187cf7050242f15552a7f5e54ff9bf451f15794fc61c2101ceb13e4c2",
+                    "notes":  "0.1.47 changes provisioning AP SSID to DotLoop and adds persisted true-random playback control over TCP for factory and user animations, keeping special transition handling.",
+                    "uploadedAt":  "2026-08-11T10:50:33.4533889Z"
                 }
 }

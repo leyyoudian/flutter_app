@@ -1,18 +1,22 @@
-{
+﻿{
     "android":  {
                     "platform":  "android",
-                    "latestVersion":  "1.0.6",
-                    "minimumVersion":  "1.0.0",
+                    "latestVersion":  "1.0.18",
+                    "minimumVersion":  "1.0.15",
                     "force":  false,
-                    "storeUrl":  "http://60.205.122.153/downloads/apk/app_gif_1.0.6.apk",
-                    "notes":  "修复素材审核状态自动刷新"
+                    "storeUrl":  "http://60.205.122.153/downloads/apk/app_gif_1.0.18.apk",
+                    "notes":  "1.0.18 adds DotLoop naming and the random playback toggle.",
+                    "releaseNotes":  "1.0.18 adds DotLoop naming and the random playback toggle.",
+                    "sha256":  "6e51a188c19ac1ac831b46838eab023d341ed9b19d4ffc8a7449775015e430dc",
+                    "size":  73956776,
+                    "updatedAt":  "2026-08-11T10:54:54.5202179Z"
                 },
     "ios":  {
                 "platform":  "ios",
-                "latestVersion":  "1.0.0",
+                "latestVersion":  "1.0.18",
                 "minimumVersion":  "1.0.0",
                 "force":  false,
                 "storeUrl":  "https://apps.apple.com/app/id0000000000",
-                "notes":  "首个远程更新配置。"
+                "notes":  "iOS version metadata updated for cloud build."
             }
 }

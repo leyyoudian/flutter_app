@@ -1,42 +1,10 @@
-[
-    {
-        "hardware":  "esp32s3",
-        "version":  "0.1.4",
-        "filename":  "esp-baji-esp32s3-0.1.4.bin",
-        "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.4.bin",
-        "size":  1172336,
-        "sha256":  "0f55a8cb27d241307b8df64cfcf5f2e859024b0cf758fc42e5d5c394b30565a0",
-        "notes":  "固件版本 0.1.4，公网 80 端口 OTA",
-        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
-    },
-    {
-        "hardware":  "esp32s3",
-        "version":  "0.1.3",
-        "filename":  "esp-baji-esp32s3-0.1.3.bin",
-        "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.3.bin",
-        "size":  1172336,
-        "sha256":  "84f1ce062d87848fb07f080b7c095f5211b9797f31cf4944ab780893554713c4",
-        "notes":  "历史固件版本 0.1.3",
-        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
-    },
-    {
-        "hardware":  "esp32s3",
-        "version":  "0.1.2",
-        "filename":  "esp-baji-esp32s3-0.1.2.bin",
-        "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.2.bin",
-        "size":  1172336,
-        "sha256":  "4ae073ed06acea8c4b45a69c6c0330dc75419ff1ce5ad46314d7773e477915e3",
-        "notes":  "历史固件版本 0.1.2",
-        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
-    },
-    {
-        "hardware":  "esp32s3",
-        "version":  "0.1.0",
-        "filename":  "esp-baji-esp32s3-0.1.0.bin",
-        "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.0.bin",
-        "size":  1162032,
-        "sha256":  "a458ef17050aa474da22d63598ef01d30ce8ca16559a26a8ed86c946ff865806",
-        "notes":  "历史固件版本 0.1.0",
-        "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
-    }
-]
+﻿{
+    "hardware":  "esp32s3",
+    "version":  "0.1.47",
+    "filename":  "esp-baji-esp32s3-0.1.47.bin",
+    "url":  "http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.47.bin",
+    "size":  1665856,
+    "sha256":  "481605b187cf7050242f15552a7f5e54ff9bf451f15794fc61c2101ceb13e4c2",
+    "notes":  "0.1.47 changes provisioning AP SSID to DotLoop and adds persisted true-random playback control over TCP for factory and user animations, keeping special transition handling.",
+    "uploadedAt":  "2026-08-11T10:50:33.4533889Z"
+}

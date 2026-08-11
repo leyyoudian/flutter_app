@@ -94,6 +94,16 @@ esp_err_t badge_anim_mgr_play(const char *id, badge_play_mode_t mode);
 esp_err_t badge_anim_mgr_switch_to(const char *new_id);
 
 /**
+ * @brief Enable/disable random playback and persist the mode to NVS.
+ */
+esp_err_t badge_anim_mgr_set_random_enabled(bool enabled);
+
+/**
+ * @brief Get whether random playback is enabled.
+ */
+bool badge_anim_mgr_random_enabled(void);
+
+/**
  * @brief Notify that current playback finished.
  * Called by the display task when an animation ends.
  */

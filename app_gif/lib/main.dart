@@ -72,7 +72,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: 'http://60.205.122.153',
   );
-  static const _appVersion = '1.0.17';
+  static const _appVersion = '1.0.18';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -91,6 +91,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   bool _demoMode = false;
   bool _checkingVersion = false;
   bool _reviewRefreshInFlight = false;
+  bool _randomEnabled = false;
   double _prepareProgress = 0;
   double _uploadProgress = 0;
   String _status = '未连接';
@@ -195,6 +196,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         });
         break;
       case 'connectionState':
+        final wasConnected = _connected;
         setState(() {
           _connected = event['connected'] == true;
           _connecting = event['connecting'] == true;
@@ -203,6 +205,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           _status =
               (event['message'] as String?) ?? (_connected ? '已连接' : '未连接');
         });
+        if (_connected && !wasConnected) {
+          unawaited(_refreshRandomMode());
+        }
         break;
       case 'status':
         setState(() => _status = (event['message'] as String?) ?? _status);
@@ -368,6 +373,53 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
+  Future<void> _refreshRandomMode() async {
+    if (_demoMode || !_connected) {
+      return;
+    }
+    try {
+      final enabled = await _invokeNative<bool>('getRandomMode');
+      if (!mounted || enabled == null) {
+        return;
+      }
+      setState(() => _randomEnabled = enabled);
+    } catch (_) {
+      // Keep the current UI state if the device is temporarily unreachable.
+    }
+  }
+
+  Future<void> _setRandomMode(bool enabled) async {
+    if (_demoMode) {
+      setState(() {
+        _randomEnabled = enabled;
+        _status = enabled ? '随机播放' : '顺序播放';
+      });
+      return;
+    }
+    if (!_connected) {
+      _showSnack('请先连接设备');
+      return;
+    }
+    final previous = _randomEnabled;
+    setState(() {
+      _randomEnabled = enabled;
+      _status = enabled ? '随机播放' : '顺序播放';
+    });
+    try {
+      final deviceEnabled = await _invokeNative<bool>('setRandomMode', {
+        'enabled': enabled,
+      });
+      if (!mounted) return;
+      if (deviceEnabled != null) {
+        setState(() => _randomEnabled = deviceEnabled);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _randomEnabled = previous);
+      _showSnack('随机播放设置失败: $e');
+    }
+  }
+
   Future<void> _saveHistory() async {
     await _invokeNative<void>(
       'saveHistory',
@@ -382,7 +434,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         ..clear()
         ..add(
           const BadgeDevice(
-            name: 'Demo ESP-BAJI',
+            name: 'Demo DotLoop',
             address: '192.168.4.1',
             rssi: -38,
             serviceMatch: true,
@@ -391,7 +443,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _connected = true;
       _connecting = false;
       _sdAvailable = true;
-      _connectedAddress = 'Demo ESP-BAJI';
+      _connectedAddress = 'Demo DotLoop';
       _status = '审核演示模式';
       _pageIndex = 1;
     });
@@ -423,7 +475,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _scanning = false;
       _devices.add(
         const BadgeDevice(
-          name: 'Demo ESP-BAJI',
+          name: 'Demo DotLoop',
           address: '192.168.4.1',
           rssi: -38,
           serviceMatch: true,
@@ -452,7 +504,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       setState(() {
         _connected = true;
         _sdAvailable = true;
-        _connectedAddress = 'Demo ESP-BAJI';
+        _connectedAddress = 'Demo DotLoop';
         _status = '审核演示模式';
       });
       return;
@@ -473,6 +525,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           (state['message'] as String?) ??
           (_connected ? '已连接' : (wasConnected ? '断开连接' : '未连接'));
     });
+    if (_connected && !wasConnected) {
+      unawaited(_refreshRandomMode());
+    }
   }
 
   Future<void> _scan() async {
@@ -483,7 +538,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     setState(() {
       _devices.clear();
       _scanning = true;
-      _status = '扫描 ESP-BAJI';
+      _status = '扫描 DotLoop';
     });
     try {
       await _invokeNative<void>('startScan');
@@ -1282,6 +1337,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onHistoryDelete: (entry) =>
             unawaited(_confirmDeleteHistoryEntry(entry)),
         onFactoryTap: (anim) => unawaited(_switchToFactory(anim)),
+        randomEnabled: _randomEnabled,
+        onRandomToggle: (enabled) => unawaited(_setRandomMode(enabled)),
       ),
       _MakerPage(
         active: previewActive && _pageIndex == 2,
@@ -1455,6 +1512,8 @@ class _DisplayLibraryPage extends StatelessWidget {
     required this.onHistoryTap,
     required this.onHistoryDelete,
     required this.onFactoryTap,
+    required this.randomEnabled,
+    required this.onRandomToggle,
   });
 
   final bool active;
@@ -1472,6 +1531,8 @@ class _DisplayLibraryPage extends StatelessWidget {
   final ValueChanged<HistoryEntry> onHistoryTap;
   final ValueChanged<HistoryEntry> onHistoryDelete;
   final ValueChanged<FactoryAnimation> onFactoryTap;
+  final bool randomEnabled;
+  final ValueChanged<bool> onRandomToggle;
 
   @override
   Widget build(BuildContext context) {
@@ -1498,6 +1559,11 @@ class _DisplayLibraryPage extends StatelessWidget {
                           ? const Color(0xff32d583)
                           : const Color(0xffff5b5b),
                     ),
+                  ),
+                  const Spacer(),
+                  _RandomToggleButton(
+                    enabled: randomEnabled,
+                    onChanged: onRandomToggle,
                   ),
                 ],
               ),
@@ -1584,6 +1650,47 @@ class _DisplayLibraryPage extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _RandomToggleButton extends StatelessWidget {
+  const _RandomToggleButton({required this.enabled, required this.onChanged});
+
+  final bool enabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = enabled ? const Color(0xff37e26f) : Colors.white;
+    return Tooltip(
+      message: enabled ? '关闭随机播放' : '随机播放',
+      child: InkResponse(
+        radius: 28,
+        onTap: () => onChanged(!enabled),
+        child: SizedBox(
+          width: 42,
+          height: 42,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Icon(Icons.shuffle_rounded, color: color, size: 28),
+              if (enabled)
+                Positioned(
+                  bottom: 3,
+                  child: Container(
+                    width: 6,
+                    height: 6,
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Color(0xff37e26f),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -2956,7 +3063,7 @@ class BadgeDevice {
       address: (map['address'] as String?) ?? '',
       name: (map['name'] as String?)?.isNotEmpty == true
           ? map['name'] as String
-          : 'ESP-BAJI',
+          : 'DotLoop',
       rssi: (map['rssi'] as num?)?.toInt() ?? -127,
       serviceMatch: map['serviceMatch'] == true,
     );

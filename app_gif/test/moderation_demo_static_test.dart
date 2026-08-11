@@ -44,8 +44,8 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.17';"));
-    expect(pubspec, contains('version: 1.0.17+19'));
+    expect(source, contains("static const _appVersion = '1.0.18';"));
+    expect(pubspec, contains('version: 1.0.18+20'));
   });
 
   test('firmware project version is aligned with OTA release version', () {

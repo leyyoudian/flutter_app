@@ -70,7 +70,7 @@ class UploadKeepAliveService : Service() {
         return builder
             .setSmallIcon(applicationInfo.icon)
             .setContentTitle("ESP Baji")
-            .setContentText("正在上传到 ESP-BAJI")
+            .setContentText("正在上传到 DotLoop")
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()

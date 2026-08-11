@@ -9,7 +9,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define BADGE_STREAM_SLOT_COUNT 8u
+#define BADGE_STREAM_SLOT_COUNT 16u
 #define BADGE_STREAM_TASK_STACK 4096u
 #define BADGE_STREAM_TASK_PRIORITY 6u
 

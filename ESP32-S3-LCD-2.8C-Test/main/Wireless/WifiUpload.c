@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "BadgeAnimMgr.h"
@@ -43,8 +44,8 @@
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 
-#define BADGE_WIFI_SSID "ESP-DotLoop"
-#define BADGE_PROVISIONING_SSID "ESP-DotLoop-Setup"
+#define BADGE_WIFI_SSID "DotLoop"
+#define BADGE_PROVISIONING_SSID "DotLoop"
 #define BADGE_WIFI_CHANNEL 6
 #define BADGE_WIFI_MAX_STA 1
 #define BADGE_WIFI_INACTIVE_TIME_SEC 600u
@@ -1786,8 +1787,8 @@ static bool request_targets_captive_host(httpd_req_t *req)
         return true;
     }
     return strncmp(host, "192.168.4.1", strlen("192.168.4.1")) == 0 ||
-           strncmp(host, "esp-dotloop", strlen("esp-dotloop")) == 0 ||
-           strncmp(host, "ESP-DotLoop", strlen("ESP-DotLoop")) == 0;
+           strncmp(host, "dotloop", strlen("dotloop")) == 0 ||
+           strncmp(host, "DotLoop", strlen("DotLoop")) == 0;
 }
 
 static void log_captive_http_request(httpd_req_t *req, const char *known_host)
@@ -2591,6 +2592,45 @@ static esp_err_t handle_tcp_upload(int sock)
     esp_err_t ret = recv_exact(sock, peek, sizeof(peek), &header_recv_us);
     if (ret != ESP_OK) {
         return ret;
+    }
+
+    /* RANDOM command: "RANDOM ON|OFF|GET\n" */
+    if (memcmp(peek, "RANDOM", 6) == 0) {
+        char cmd[32] = {0};
+        int total = 0;
+        while (total < (int)sizeof(cmd) - 1) {
+            int r = recv(sock, cmd + total, 1, 0);
+            if (r <= 0) break;
+            total += r;
+            if (cmd[total - 1] == '\n') break;
+        }
+        cmd[total] = '\0';
+
+        char *arg = cmd;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        size_t len = strlen(arg);
+        while (len > 0 && (arg[len - 1] == '\n' || arg[len - 1] == '\r' || arg[len - 1] == ' ')) {
+            arg[--len] = '\0';
+        }
+
+        esp_err_t random_ret = ESP_OK;
+        if (strcasecmp(arg, "ON") == 0 || strcmp(arg, "1") == 0) {
+            random_ret = badge_anim_mgr_set_random_enabled(true);
+        } else if (strcasecmp(arg, "OFF") == 0 || strcmp(arg, "0") == 0) {
+            random_ret = badge_anim_mgr_set_random_enabled(false);
+        } else if (strcasecmp(arg, "GET") != 0 && strcmp(arg, "?") != 0 && arg[0] != '\0') {
+            random_ret = ESP_ERR_INVALID_ARG;
+        }
+
+        if (random_ret == ESP_OK) {
+            char response[32];
+            snprintf(response, sizeof(response), "OK RANDOM %u\n",
+                     badge_anim_mgr_random_enabled() ? 1u : 0u);
+            send_tcp_line(sock, response);
+        } else {
+            send_tcp_status(sock, random_ret);
+        }
+        return random_ret;
     }
 
     /* SWITCH command: "SWITCH <ID>\n" */

@@ -3,8 +3,13 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define BADGE_INDEXED_PALETTE_BYTES (BADGE_EBAJ_PALETTE_ENTRIES * 2u)
+#define BADGE_INDEXED_YIELD_EVERY_TILES 16u
+#define BADGE_INDEXED_YIELD_EVERY_ROWS 32u
+#define BADGE_INDEXED_COPY_CHUNK_BYTES (32u * 1024u)
 
 static uint16_t read_le16(const uint8_t *data)
 {
@@ -31,6 +36,38 @@ static bool palette_matches(const uint16_t *palette, const uint8_t *payload)
         }
     }
     return true;
+}
+
+static void badge_indexed_yield_if_needed(uint16_t *work_since_yield, uint16_t interval)
+{
+    if (work_since_yield == NULL || interval == 0) {
+        return;
+    }
+
+    ++(*work_since_yield);
+    if (*work_since_yield < interval) {
+        return;
+    }
+
+    *work_since_yield = 0;
+    taskYIELD();
+}
+
+static void badge_indexed_copy_payload_yielding(uint8_t *dst, const uint8_t *src, size_t bytes)
+{
+    size_t offset = 0;
+    while (offset < bytes) {
+        size_t chunk = bytes - offset;
+        if (chunk > BADGE_INDEXED_COPY_CHUNK_BYTES) {
+            chunk = BADGE_INDEXED_COPY_CHUNK_BYTES;
+        }
+
+        memcpy(dst + offset, src + offset, chunk);
+        offset += chunk;
+        if (offset < bytes) {
+            taskYIELD();
+        }
+    }
 }
 
 esp_err_t badge_indexed_init(badge_indexed_t *indexed, uint16_t width, uint16_t height)
@@ -91,7 +128,9 @@ static esp_err_t decode_indexed_key(badge_indexed_t *indexed, const uint8_t *pay
 
     int next = indexed->has_frame ? 1 - indexed->active : indexed->active;
     load_palette(indexed->palette[next], payload);
-    memcpy(indexed->buffers[next], payload + BADGE_INDEXED_PALETTE_BYTES, frame_bytes);
+    badge_indexed_copy_payload_yielding(indexed->buffers[next],
+                                        payload + BADGE_INDEXED_PALETTE_BYTES,
+                                        frame_bytes);
     indexed->active = next;
     indexed->has_frame = true;
     indexed->full_dirty = true;
@@ -128,6 +167,7 @@ static esp_err_t apply_indexed_tile_payload(badge_indexed_t *indexed, const uint
     indexed->dirty_tile_count = tile_count;
 
     const uint8_t *src = payload + BADGE_INDEXED_PALETTE_BYTES + 2u;
+    uint16_t tiles_since_yield = 0;
     for (uint16_t i = 0; i < tile_count; ++i) {
         uint16_t tile_index = read_le16(src);
         src += 2u;
@@ -143,6 +183,7 @@ static esp_err_t apply_indexed_tile_payload(badge_indexed_t *indexed, const uint
             memcpy(dst, src, BADGE_EBAJ_TILE_SIZE);
             src += BADGE_EBAJ_TILE_SIZE;
         }
+        badge_indexed_yield_if_needed(&tiles_since_yield, BADGE_INDEXED_YIELD_EVERY_TILES);
     }
 
     indexed->active = next;
@@ -186,9 +227,9 @@ static inline uint16_t bilinear_rgb565(uint16_t p00, uint16_t p01,
                                        uint32_t fx, uint32_t fy)
 {
     /* Unpack each 5-6-5 pixel into 8-bit channels (left-aligned for precision). */
-    uint32_t r00 = (p00 >> 8) & 0xF8; /* R: high 5 bits ¡ú top of 8 */
-    uint32_t g00 = (p00 >> 3) & 0xFC; /* G: high 6 bits ¡ú top of 8 */
-    uint32_t b00 = (p00 << 3) & 0xF8; /* B: low 5 bits ¡ú top of 8 */
+    uint32_t r00 = (p00 >> 8) & 0xF8; /* R: high 5 bits â†’ top of 8 */
+    uint32_t g00 = (p00 >> 3) & 0xFC; /* G: high 6 bits â†’ top of 8 */
+    uint32_t b00 = (p00 << 3) & 0xF8; /* B: low 5 bits â†’ top of 8 */
 
     uint32_t r01 = (p01 >> 8) & 0xF8;
     uint32_t g01 = (p01 >> 3) & 0xFC;
@@ -245,6 +286,7 @@ static esp_err_t render_scaled_rgb565(const badge_indexed_t *indexed, uint16_t *
     uint16_t src_w = indexed->width;
     uint16_t src_h = indexed->height;
 
+    uint16_t rows_since_yield = 0;
     for (uint16_t y = 0; y < BADGE_EBAJ_HEIGHT; ++y) {
         uint32_t vy = y * scale_mul_y;
         uint16_t src_y      = (uint16_t)(vy >> 16);
@@ -267,6 +309,7 @@ static esp_err_t render_scaled_rgb565(const badge_indexed_t *indexed, uint16_t *
 
             dst_row[x] = bilinear_rgb565(p00, p01, p10, p11, sx_frac, src_y_frac);
         }
+        badge_indexed_yield_if_needed(&rows_since_yield, BADGE_INDEXED_YIELD_EVERY_ROWS);
     }
 
     return ESP_OK;
@@ -280,6 +323,7 @@ static esp_err_t render_native_rgb565(const badge_indexed_t *indexed, uint16_t *
 
     const uint8_t *src = indexed->buffers[indexed->active];
     const uint16_t *palette = indexed->palette[indexed->active];
+    uint16_t rows_since_yield = 0;
     for (uint16_t y = 0; y < BADGE_EBAJ_HEIGHT; ++y) {
         const uint8_t *src_row = src + (size_t)y * BADGE_EBAJ_WIDTH;
         uint16_t *dst_row = rgb565 + (size_t)y * BADGE_EBAJ_WIDTH;
@@ -299,6 +343,7 @@ static esp_err_t render_native_rgb565(const badge_indexed_t *indexed, uint16_t *
         for (; x < BADGE_EBAJ_WIDTH; ++x) {
             dst_row[x] = palette[src_row[x]];
         }
+        badge_indexed_yield_if_needed(&rows_since_yield, BADGE_INDEXED_YIELD_EVERY_ROWS);
     }
 
     return ESP_OK;
@@ -320,6 +365,7 @@ static esp_err_t blit_native_dirty_tiles_rgb565(const badge_indexed_t *indexed, 
     const uint16_t *palette = indexed->palette[indexed->active];
     const uint16_t tile_cols = indexed->width / BADGE_EBAJ_TILE_SIZE;
 
+    uint16_t tiles_since_yield = 0;
     for (uint16_t i = 0; i < indexed->dirty_tile_count; ++i) {
         uint16_t tile_index = indexed->dirty_tiles[i];
         uint16_t tile_x = (tile_index % tile_cols) * BADGE_EBAJ_TILE_SIZE;
@@ -331,6 +377,7 @@ static esp_err_t blit_native_dirty_tiles_rgb565(const badge_indexed_t *indexed, 
                 dst_row[x] = palette[src_row[x]];
             }
         }
+        badge_indexed_yield_if_needed(&tiles_since_yield, BADGE_INDEXED_YIELD_EVERY_TILES);
     }
 
     return ESP_OK;

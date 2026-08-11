@@ -9,6 +9,21 @@ storage_c = (ROOT / "main" / "Badge" / "BadgeStorage.c").read_text(encoding="utf
 main_c = (ROOT / "main" / "main.c").read_text(encoding="utf-8", errors="ignore")
 cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8", errors="ignore")
 
+
+def extract_function(source: str, signature: str) -> str:
+    start = source.index(signature)
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f"function body not found: {signature}")
+
 expected_sd_pins = {
     "CONFIG_EXAMPLE_PIN_CLK": "7",
     "CONFIG_EXAMPLE_PIN_CMD": "15",
@@ -31,12 +46,23 @@ assert "#define LCD_CS   0" in lcd_h or "#define LCD_CS  0" in lcd_h or "#define
 assert "#define LCD_CS_ALWAYS_LOW_AFTER_BOOT 1" in lcd_h, (
     "GPIO0 is a boot strap pin; test CS-low behavior in firmware after boot instead of hard-grounding IO0"
 )
+assert "#define EXAMPLE_PIN_NUM_BK_LIGHT       6" in lcd_h, "backlight PWM should stay on GPIO6 / BL_PWM"
+assert "#define LEDC_FREQUENCY          (8000)" in lcd_h, (
+    "TPS61165 CTRL PWM dimming should use 8 kHz, above its low-frequency EasyScale command range"
+)
 assert "st7701s_protocol_config_t.spics_io_num = -1" in lcd_c, (
     "CS-low test firmware should not let SPI auto-drive GPIO0 high during LCD init"
 )
 assert "if (!LCD_CS_ALWAYS_LOW_AFTER_BOOT)" in lcd_c, (
     "CS-low test firmware must skip deasserting LCD_CS after init"
 )
+cs_en = extract_function(lcd_c, "esp_err_t ST7701S_CS_EN(void)")
+assert cs_en.index("gpio_set_level(LCD_CS, 0)") < cs_en.index("gpio_config(&io_conf)"), (
+    "LCD CS on GPIO0 must preload the output data register low before enabling output"
+)
+restart_prepare = extract_function(lcd_c, "esp_err_t ST7701S_PrepareForRestart(void)")
+assert "GPIO_MODE_INPUT" in restart_prepare, "restart preparation must release GPIO0 output before reset"
+assert "GPIO_PULLUP_ENABLE" in restart_prepare, "restart preparation must bias GPIO0 high for safe strap sampling"
 assert "#define EXAMPLE_PIN_NUM_DATA11         46" in lcd_h, (
     "RGB565 red data bit 0 must drive LCD DB13 through GPIO46 on the new board"
 )

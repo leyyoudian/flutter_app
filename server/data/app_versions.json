@@ -1,17 +1,83 @@
-[
+﻿[
     {
         "platform":  "android",
-        "version":  "1.0.6",
-        "filename":  "app_gif_1.0.6.apk",
-        "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.6.apk",
-        "size":  144730644,
-        "sha256":  "8f5c613c741d89187913264b1fa945c881cadabf5fe762b4287a562bbc54bdea",
+        "version":  "1.0.18",
+        "filename":  "app_gif_1.0.18.apk",
+        "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.18.apk",
+        "size":  73956776,
+        "sha256":  "6e51a188c19ac1ac831b46838eab023d341ed9b19d4ffc8a7449775015e430dc",
         "force":  false,
-        "notes":  "修复素材审核状态自动刷新",
-        "uploadedAt":  "2026-07-04T07:57:32.1152742Z"
+        "notes":  "1.0.18 adds DotLoop naming and the random playback toggle for Android; iOS version metadata is updated for cloud builds.",
+        "uploadedAt":  "2026-08-11T10:50:33.4533889Z"
     },
     {
         "value":  [
+                      {
+                          "platform":  "android",
+                          "version":  "1.0.14",
+                          "filename":  "app_gif_1.0.14.apk",
+                          "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.14.apk",
+                          "size":  73293053,
+                          "sha256":  "d53808312ce73941c9df7387489025e57efec58d8f98916f174e44bc4ec15326",
+                          "force":  false,
+                          "notes":  "1.0.14 extends TCP switch retries for transient hotspot/router stalls.",
+                          "uploadedAt":  "2026-07-09T06:38:57.129Z"
+                      },
+                      {
+                          "platform":  "android",
+                          "version":  "1.0.13",
+                          "filename":  "app_gif_1.0.13.apk",
+                          "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.13.apk",
+                          "size":  73293032,
+                          "sha256":  "6bd4f6dbfde1032ecdf419e79b2e2307f556ba3f6d80b0839df2cf812a48312e",
+                          "force":  false,
+                          "notes":  "1.0.13 fixes direct LAN/hotspot IP connection and avoids Android system Wi-Fi picker fallback.",
+                          "uploadedAt":  "2026-07-09T05:30:18.588Z"
+                      },
+                      {
+                          "platform":  "android",
+                          "version":  "1.0.12",
+                          "filename":  "app_gif_1.0.12.apk",
+                          "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.12.apk",
+                          "size":  73292882,
+                          "sha256":  "f5f3d5c8fd5f43e7444e10fb966be4224095d3aa7b2c3c590338010c2238bbe6",
+                          "force":  false,
+                          "notes":  "1.0.12 fixes transient TCP timeout handling when switching assets on LAN/hotspot and improves connection-state tolerance.",
+                          "uploadedAt":  "2026-07-09T04:23:13.2055367Z"
+                      },
+                      {
+                          "platform":  "android",
+                          "version":  "1.0.8",
+                          "filename":  "app_gif_1.0.8.apk",
+                          "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.8.apk",
+                          "size":  72888561,
+                          "sha256":  "6b25a1eef024409a224bea795d1edc6f8266a579e0b664ebe3f51b2a5ec384b0",
+                          "force":  false,
+                          "notes":  "1.0.8 fixes animated MP4 moderation previews.",
+                          "uploadedAt":  "2026-07-04T08:44:00.0834787Z"
+                      },
+                      {
+                          "platform":  "android",
+                          "version":  "1.0.7",
+                          "filename":  "app_gif_1.0.7.apk",
+                          "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.7.apk",
+                          "size":  72887505,
+                          "sha256":  "9ed8ac95919368439b9419dac1dc97ffc0de01983b631ed60cb8561df5cd0cc3",
+                          "force":  false,
+                          "notes":  "1.0.7 release APK reduces package size and fixes moderation status auto-refresh.",
+                          "uploadedAt":  "2026-07-04T08:18:18.6434882Z"
+                      },
+                      {
+                          "platform":  "android",
+                          "version":  "1.0.6",
+                          "filename":  "app_gif_1.0.6.apk",
+                          "url":  "http://60.205.122.153/downloads/apk/app_gif_1.0.6.apk",
+                          "size":  144730644,
+                          "sha256":  "8f5c613c741d89187913264b1fa945c881cadabf5fe762b4287a562bbc54bdea",
+                          "force":  false,
+                          "notes":  "Fix moderation status auto-refresh.",
+                          "uploadedAt":  "2026-07-04T07:57:32.1152742Z"
+                      },
                       {
                           "platform":  "android",
                           "version":  "1.0.5",
@@ -20,7 +86,7 @@
                           "size":  144730004,
                           "sha256":  "7c255ab17734efb10a3957237bc2fd56512f465ff09ee74362c2a83753588d7d",
                           "force":  false,
-                          "notes":  "公网 80 端口版本 1.0.5",
+                          "notes":  "Public port 80 version 1.0.5",
                           "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
                       },
                       {
@@ -31,7 +97,7 @@
                           "size":  144730105,
                           "sha256":  "34f1899614f9ce9601a5278d303009725c80a7baaccfe5fd6b3313519a973cfc",
                           "force":  false,
-                          "notes":  "历史版本 1.0.4",
+                          "notes":  "Historical version 1.0.4",
                           "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
                       },
                       {
@@ -42,10 +108,10 @@
                           "size":  144730095,
                           "sha256":  "2ea5fc6e778557d44430fd8d622e95213f5de801edb2d9264e3b3aebc7d01d15",
                           "force":  false,
-                          "notes":  "历史版本 1.0.3",
+                          "notes":  "Historical version 1.0.3",
                           "uploadedAt":  "2026-07-04T07:15:28.2054116Z"
                       }
                   ],
-        "Count":  3
+        "Count":  9
     }
 ]

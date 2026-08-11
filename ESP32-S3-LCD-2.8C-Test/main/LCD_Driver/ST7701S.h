@@ -25,6 +25,7 @@
 #define EXAMPLE_LCD_H_RES              480
 
 #define EXAMPLE_LCD_PIXEL_CLOCK_HZ     (10 * 1000 * 1000)
+#define EXAMPLE_LCD_REFRESH_ON_DEMAND 0
 #define EXAMPLE_LCD_BK_LIGHT_ON_LEVEL  1
 #define EXAMPLE_LCD_BK_LIGHT_OFF_LEVEL !EXAMPLE_LCD_BK_LIGHT_ON_LEVEL
 #define EXAMPLE_PIN_NUM_BK_LIGHT       6
@@ -32,22 +33,22 @@
 #define EXAMPLE_PIN_NUM_VSYNC          39
 #define EXAMPLE_PIN_NUM_DE             40
 #define EXAMPLE_PIN_NUM_PCLK           41
-#define EXAMPLE_PIN_NUM_DATA0          5  // B1 (ÆÁÄ»DB1, 18bit RGBµÍÎ»DB0Î´½Ó)
-#define EXAMPLE_PIN_NUM_DATA1          45 // B2 (ÆÁÄ»DB2)
-#define EXAMPLE_PIN_NUM_DATA2          48 // B3 (ÆÁÄ»DB3)
-#define EXAMPLE_PIN_NUM_DATA3          47 // B4 (ÆÁÄ»DB4)
-#define EXAMPLE_PIN_NUM_DATA4          21 // B5 (ÆÁÄ»DB5)
-#define EXAMPLE_PIN_NUM_DATA5          14 // G0 (ÆÁÄ»DB6)
-#define EXAMPLE_PIN_NUM_DATA6          13 // G1 (ÆÁÄ»DB7)
-#define EXAMPLE_PIN_NUM_DATA7          12 // G2 (ÆÁÄ»DB8)
-#define EXAMPLE_PIN_NUM_DATA8          11 // G3 (ÆÁÄ»DB9)
-#define EXAMPLE_PIN_NUM_DATA9          10 // G4 (ÆÁÄ»DB10)
-#define EXAMPLE_PIN_NUM_DATA10         9  // G5 (ÆÁÄ»DB11)
-#define EXAMPLE_PIN_NUM_DATA11         46 // R1 (ÆÁÄ»DB13, 18bit RGBµÍÎ»R0=DB12Î´½Ó)
-#define EXAMPLE_PIN_NUM_DATA12         3  // R2 (ÆÁÄ»DB14)
-#define EXAMPLE_PIN_NUM_DATA13         8  // R3 (ÆÁÄ»DB15)
-#define EXAMPLE_PIN_NUM_DATA14         18 // R4 (ÆÁÄ»DB16)
-#define EXAMPLE_PIN_NUM_DATA15         17 // R5 (ÆÁÄ»DB17)
+#define EXAMPLE_PIN_NUM_DATA0          5  // B1 (ï¿½ï¿½Ä»DB1, 18bit RGBï¿½ï¿½Î»DB0Î´ï¿½ï¿½)
+#define EXAMPLE_PIN_NUM_DATA1          45 // B2 (ï¿½ï¿½Ä»DB2)
+#define EXAMPLE_PIN_NUM_DATA2          48 // B3 (ï¿½ï¿½Ä»DB3)
+#define EXAMPLE_PIN_NUM_DATA3          47 // B4 (ï¿½ï¿½Ä»DB4)
+#define EXAMPLE_PIN_NUM_DATA4          21 // B5 (ï¿½ï¿½Ä»DB5)
+#define EXAMPLE_PIN_NUM_DATA5          14 // G0 (ï¿½ï¿½Ä»DB6)
+#define EXAMPLE_PIN_NUM_DATA6          13 // G1 (ï¿½ï¿½Ä»DB7)
+#define EXAMPLE_PIN_NUM_DATA7          12 // G2 (ï¿½ï¿½Ä»DB8)
+#define EXAMPLE_PIN_NUM_DATA8          11 // G3 (ï¿½ï¿½Ä»DB9)
+#define EXAMPLE_PIN_NUM_DATA9          10 // G4 (ï¿½ï¿½Ä»DB10)
+#define EXAMPLE_PIN_NUM_DATA10         9  // G5 (ï¿½ï¿½Ä»DB11)
+#define EXAMPLE_PIN_NUM_DATA11         46 // R1 (ï¿½ï¿½Ä»DB13, 18bit RGBï¿½ï¿½Î»R0=DB12Î´ï¿½ï¿½)
+#define EXAMPLE_PIN_NUM_DATA12         3  // R2 (ï¿½ï¿½Ä»DB14)
+#define EXAMPLE_PIN_NUM_DATA13         8  // R3 (ï¿½ï¿½Ä»DB15)
+#define EXAMPLE_PIN_NUM_DATA14         18 // R4 (ï¿½ï¿½Ä»DB16)
+#define EXAMPLE_PIN_NUM_DATA15         17 // R5 (ï¿½ï¿½Ä»DB17)
 #define EXAMPLE_PIN_NUM_DISP_EN        -1
 
 #if CONFIG_EXAMPLE_DOUBLE_FB
@@ -65,7 +66,7 @@
 #define LEDC_CHANNEL            LEDC_CHANNEL_0
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
 #define LEDC_DUTY               (2000)    // Set duty to 50%. (2 ** 13) * 50% = 4096
-#define LEDC_FREQUENCY          (4000) // Frequency in Hertz. Set frequency at 4 kHz
+#define LEDC_FREQUENCY          (8000) // Frequency in Hertz. Set frequency at 8 kHz
 #define Backlight_MAX   100    
 
 #if CONFIG_EXAMPLE_AVOID_TEAR_EFFECT_WITH_SEM
@@ -91,13 +92,17 @@ void ST7701S_screen_init(ST7701S_handle St7701S_handle, unsigned char type);//Sc
 void ST7701S_delObject(ST7701S_handle St7701S_handle);//Delete object
 void ST7701S_WriteCommand(ST7701S_handle St7701S_handle, uint8_t cmd);//SPI write instruction
 void ST7701S_WriteData(ST7701S_handle St7701S_handle, uint8_t data);//SPI write data
+esp_err_t ST7701S_PrepareBootCs(void);//Hold LCD CS/GPIO0 high before LCD init
 esp_err_t ST7701S_CS_EN(void);//Enables SPI CS
 esp_err_t ST7701S_CS_Dis(void);//Disable SPI CS
+esp_err_t ST7701S_PrepareForRestart(void);//Release LCD CS/GPIO0 before software reset
 esp_err_t ST7701S_reset(void);// LCD Reset
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void LCD_Init(void);
+void LCD_PrepareForVsync(void);
+esp_err_t LCD_WaitForPreparedVsync(TickType_t timeout_ticks);
 esp_err_t LCD_WaitForVsync(TickType_t timeout_ticks);
 
 /********************* BackLight *********************/

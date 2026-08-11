@@ -28,9 +28,9 @@
 #define BADGE_SD_ASSET_PATH BADGE_SD_MOUNT_POINT "/badge.eb4"
 #define BADGE_SD_TEMP_PATH BADGE_SD_MOUNT_POINT "/badge.tmp"
 #define BADGE_UPLOAD_LOG_STEP (512u * 1024u)
-#define BADGE_SD_READ_STAGING_BYTES (64u * 1024u)
-#define BADGE_SD_READ_STAGING_FALLBACK_BYTES (32u * 1024u)
-#define BADGE_SD_READ_STAGING_MIN_BYTES (16u * 1024u)
+#define BADGE_SD_READ_STAGING_BYTES (256u * 1024u)
+#define BADGE_SD_READ_STAGING_FALLBACK_BYTES (128u * 1024u)
+#define BADGE_SD_READ_STAGING_MIN_BYTES (64u * 1024u)
 #define BADGE_SD_WRITE_BUFFER_BYTES (128u * 1024u)
 
 typedef struct {
@@ -152,8 +152,16 @@ static esp_err_t begin_sd_upload_locked(uint32_t total_size)
         mark_sd_failed_locked();
         return ESP_FAIL;
     }
+    int fd = fileno(file);
+    if (fd < 0 || ftruncate(fd, (off_t)total_size) != 0) {
+        ESP_LOGW(TAG, "preallocate SD temp failed");
+        fclose(file);
+        unlink(BADGE_SD_TEMP_PATH);
+        mark_sd_failed_locked();
+        return ESP_FAIL;
+    }
     /* Allocate FILE buffer from internal DMA RAM so SDMMC can DMA directly.
-     * PSRAM is NOT DMA-capable for SDMMC ¨C never fall back to malloc (PSRAM). */
+     * PSRAM is NOT DMA-capable for SDMMC â€“ never fall back to malloc (PSRAM). */
     static const size_t file_buf_candidates[] = { 128u * 1024u, 64u * 1024u, 32u * 1024u };
     void *file_buf = NULL;
     size_t file_buf_size = 0;

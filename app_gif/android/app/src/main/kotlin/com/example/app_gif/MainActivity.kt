@@ -311,6 +311,13 @@ class MainActivity : FlutterActivity() {
                 }
                 switchToAsset(id, result)
             }
+            "setRandomMode" -> {
+                val enabled = call.argument<Boolean>("enabled") == true
+                setRandomMode(enabled, result)
+            }
+            "getRandomMode" -> {
+                getRandomMode(result)
+            }
             "getFactoryAnimations" -> {
                 result.success(buildFactoryAnimationList())
             }
@@ -635,7 +642,7 @@ class MainActivity : FlutterActivity() {
             controlCharacteristic = service?.getCharacteristic(CONTROL_UUID)
             dataCharacteristic = service?.getCharacteristic(DATA_UUID)
             if (service == null || controlCharacteristic == null || dataCharacteristic == null) {
-                sendConnectionEvent(false, false, connectedAddress, "不是 ESP-BAJI")
+                sendConnectionEvent(false, false, connectedAddress, "不是 DotLoop")
                 return
             }
 
@@ -1089,7 +1096,7 @@ class MainActivity : FlutterActivity() {
     private fun bindBadgeWifiNetwork(network: Network) {
         val bound = connectivityManager().bindProcessToNetwork(network)
         if (!bound) {
-            throw IllegalStateException("ESP-BAJI 网络绑定失败，需重新连接")
+            throw IllegalStateException("DotLoop 网络绑定失败，需重新连接")
         }
         badgeDirectIpMode = false
         acquireUploadWifiLock()
@@ -1601,6 +1608,35 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
+    private fun setRandomMode(enabled: Boolean, result: MethodChannel.Result) {
+        sendRandomModeCommand(if (enabled) "ON" else "OFF", result)
+    }
+
+    private fun getRandomMode(result: MethodChannel.Result) {
+        sendRandomModeCommand("GET", result)
+    }
+
+    private fun sendRandomModeCommand(arg: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                acquireUploadWifiLock()
+                val network = activeBadgeNetworkForRequest(fastUpload = true)
+                val response = sendRawTcpCommandWithRetry(network, "RANDOM $arg\n")
+                if (!response.startsWith("OK RANDOM")) {
+                    throw IllegalStateException(response.ifBlank { "随机播放设置失败" })
+                }
+                val enabled = response.trim().endsWith("1")
+                mainHandler.post { result.success(enabled) }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("random_failed", error.message ?: "随机播放设置失败", null)
+                }
+            } finally {
+                releaseUploadWifiLock(keepIfConnected = true)
+            }
+        }.start()
+    }
+
     private fun sendSwitchCommandWithRetry(network: Network?, id: String): String {
         var lastError: Exception? = null
         repeat(SWITCH_TCP_ATTEMPTS) { attempt ->
@@ -1625,6 +1661,34 @@ class MainActivity : FlutterActivity() {
             s.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
             val cmd = "SWITCH $id\n"
             s.getOutputStream().write(cmd.toByteArray())
+            s.getOutputStream().flush()
+            return s.getInputStream().bufferedReader().readLine().orEmpty()
+        }
+    }
+
+    private fun sendRawTcpCommandWithRetry(network: Network?, command: String): String {
+        var lastError: Exception? = null
+        repeat(SWITCH_TCP_ATTEMPTS) { attempt ->
+            try {
+                return sendRawTcpCommand(network, command)
+            } catch (error: Exception) {
+                lastError = error
+                if (attempt + 1 < SWITCH_TCP_ATTEMPTS) {
+                    closeTcpSocket()
+                    Thread.sleep(SWITCH_TCP_RETRY_DELAY_MS)
+                }
+            }
+        }
+        throw lastError ?: IllegalStateException("TCP command failed")
+    }
+
+    private fun sendRawTcpCommand(network: Network?, command: String): String {
+        val socket = network?.socketFactory?.createSocket() as? Socket ?: Socket()
+        socket.use { s ->
+            s.tcpNoDelay = true
+            s.soTimeout = UPLOAD_TCP_CONNECT_TIMEOUT_MS
+            s.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
+            s.getOutputStream().write(command.toByteArray())
             s.getOutputStream().flush()
             return s.getInputStream().bufferedReader().readLine().orEmpty()
         }
@@ -3291,8 +3355,8 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val CHANNEL = "esp_baji/native"
-        private const val BADGE_DEVICE_NAME = "ESP-DotLoop"
-        private const val BADGE_WIFI_SSID = "ESP-DotLoop"
+        private const val BADGE_DEVICE_NAME = "DotLoop"
+        private const val BADGE_WIFI_SSID = "DotLoop"
         private const val BADGE_AP_HOST = "192.168.4.1"
         private const val BADGE_UPLOAD_TCP_PORT = 3333
         private const val BADGE_DISCOVERY_UDP_PORT = 3334

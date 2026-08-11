@@ -29,10 +29,17 @@
 #define BADGE_PLAYER_PRIORITY 6u
 #define BADGE_STATUS_PERIOD_MS 250u
 #define BADGE_FB_COUNT 3u
-#define BADGE_STREAM_PREFILL_FRAMES 8u
+#define BADGE_STREAM_PREFILL_FRAMES 16u
+#define BADGE_PLAYER_YIELD_EVERY_FRAMES 8u
+#define BADGE_STATIC_FRAME_HOLD_POLL_MS 20u
+#define BADGE_LCD_SWAP_VSYNC_TIMEOUT_MS 80u
+#define BADGE_LCD_STARTUP_SYNC_VSYNCS 3u
 #define BADGE_FPS_OVERLAY_ENABLED 0u
 #define BADGE_STATIC_LCD_TEST 0u
 #define BADGE_FRAME_FLAG_LZ4 0x80u
+#define BADGE_OTA_IMAGE_BYTES BADGE_EBAJ_FRAME_BYTES
+#define BADGE_OTA_LCD_PIXEL_CLOCK_HZ (5 * 1000 * 1000)
+#define BADGE_OTA_LCD_SETTLE_MS 300u
 
 static const char *TAG = "BadgeDisplay";
 static EventGroupHandle_t s_events;
@@ -40,6 +47,8 @@ static TaskHandle_t s_player_task;
 static void *s_fb[BADGE_FB_COUNT];
 static int s_display_fb;
 static int s_next_render_fb = 1;
+static int s_ota_fb = -1;
+static bool s_ota_screen_visible;
 static int64_t s_perf_window_us;
 static uint32_t s_perf_frames;
 static uint32_t s_perf_source_frames;
@@ -53,7 +62,12 @@ static int64_t s_perf_vsync_us;
 static badge_play_mode_t s_play_mode = BADGE_PLAY_MODE_LOOP;
 static char s_asset_path[64];
 
+extern const uint8_t upload_480_rgb565_bin_start[] asm("_binary_upload_480_rgb565_bin_start");
+extern const uint8_t upload_480_rgb565_bin_end[] asm("_binary_upload_480_rgb565_bin_end");
+
 static void switch_panel_to_fb(int fb_index, int64_t *out_display_us, int64_t *out_vsync_us);
+static esp_err_t badge_display_request_refresh(void);
+static void badge_player_yield_if_needed(uint32_t *frames_since_yield);
 
 #if BADGE_STATIC_LCD_TEST
 static uint16_t rgb565(uint8_t red, uint8_t green, uint8_t blue)
@@ -231,10 +245,177 @@ static void update_playback_perf_counter(const badge_asset_t *asset)
     s_perf_window_us = now;
 }
 
+static void badge_player_yield_if_needed(uint32_t *frames_since_yield)
+{
+    if (frames_since_yield == NULL) {
+        return;
+    }
+
+    ++(*frames_since_yield);
+    if (*frames_since_yield < BADGE_PLAYER_YIELD_EVERY_FRAMES) {
+        return;
+    }
+
+    *frames_since_yield = 0;
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+static esp_err_t badge_display_request_refresh(void)
+{
+#if EXAMPLE_LCD_REFRESH_ON_DEMAND
+    esp_err_t ret = esp_lcd_rgb_panel_refresh(panel_handle);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "RGB panel refresh request failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+#else
+    return ESP_OK;
+#endif
+}
+
+static void badge_display_wait_vsyncs(uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        LCD_PrepareForVsync();
+#if EXAMPLE_LCD_REFRESH_ON_DEMAND
+        (void)badge_display_request_refresh();
+#endif
+        esp_err_t ret = LCD_WaitForPreparedVsync(pdMS_TO_TICKS(BADGE_LCD_SWAP_VSYNC_TIMEOUT_MS));
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "LCD vsync wait timed out during startup/swap sync");
+            return;
+        }
+    }
+}
+
+static esp_err_t badge_display_sync_lcd_after_init(void)
+{
+    if (s_fb[0] == NULL || s_fb[1] == NULL || s_fb[2] == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (size_t i = 0; i < BADGE_FB_COUNT; ++i) {
+        memset(s_fb[i], 0, BADGE_EBAJ_FRAME_BYTES);
+    }
+
+    s_display_fb = 0;
+    s_next_render_fb = 1;
+    esp_err_t draw_ret = esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,
+                                                   BADGE_EBAJ_WIDTH,
+                                                   BADGE_EBAJ_HEIGHT,
+                                                   s_fb[0]);
+    if (draw_ret != ESP_OK) {
+        ESP_LOGW(TAG, "initial LCD clear draw failed: %s", esp_err_to_name(draw_ret));
+    }
+    badge_display_wait_vsyncs(BADGE_LCD_STARTUP_SYNC_VSYNCS);
+
+#if !EXAMPLE_LCD_REFRESH_ON_DEMAND
+    esp_err_t restart_ret = esp_lcd_rgb_panel_restart(panel_handle);
+    if (restart_ret != ESP_OK) {
+        ESP_LOGW(TAG, "startup RGB panel restart failed: %s", esp_err_to_name(restart_ret));
+    }
+    badge_display_wait_vsyncs(BADGE_LCD_STARTUP_SYNC_VSYNCS);
+#endif
+
+    ESP_LOGI(TAG, "LCD startup sync completed");
+    return draw_ret == ESP_OK ? ESP_OK : draw_ret;
+}
+
+esp_err_t badge_display_resync_after_wireless(void)
+{
+    if (s_fb[0] == NULL || s_fb[1] == NULL || s_fb[2] == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int fb_index = s_display_fb;
+    if (fb_index < 0 || fb_index >= (int)BADGE_FB_COUNT || s_fb[fb_index] == NULL) {
+        fb_index = 0;
+    }
+
+    esp_err_t draw_ret = esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,
+                                                   BADGE_EBAJ_WIDTH,
+                                                   BADGE_EBAJ_HEIGHT,
+                                                   s_fb[fb_index]);
+    if (draw_ret != ESP_OK) {
+        ESP_LOGW(TAG, "wireless LCD redraw failed: %s", esp_err_to_name(draw_ret));
+    }
+
+    badge_display_wait_vsyncs(BADGE_LCD_STARTUP_SYNC_VSYNCS);
+
+    ESP_LOGI(TAG, "LCD wireless resync completed fb=%d", fb_index);
+    return draw_ret;
+}
+
+static void wait_for_reload_while_frozen(void)
+{
+    xEventGroupSetBits(s_events, BADGE_STOPPED_BIT);
+    while ((xEventGroupGetBits(s_events) & BADGE_RELOAD_BIT) == 0) {
+        xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdFALSE, pdFALSE,
+                            pdMS_TO_TICKS(BADGE_STATIC_FRAME_HOLD_POLL_MS));
+#if EXAMPLE_LCD_REFRESH_ON_DEMAND
+        (void)badge_display_request_refresh();
+#endif
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    xEventGroupClearBits(s_events, BADGE_RELOAD_BIT);
+}
+
 static int choose_render_fb(void)
 {
     s_next_render_fb = (s_next_render_fb + 1) % (int)BADGE_FB_COUNT;
     return s_next_render_fb;
+}
+
+static int choose_static_screen_fb(void)
+{
+    for (int offset = 1; offset <= (int)BADGE_FB_COUNT; ++offset) {
+        int candidate = (s_display_fb + offset) % (int)BADGE_FB_COUNT;
+        if (candidate != s_display_fb && s_fb[candidate] != NULL) {
+            return candidate;
+        }
+    }
+    return s_display_fb;
+}
+
+static void wait_lcd_settle(void)
+{
+    LCD_PrepareForVsync();
+#if EXAMPLE_LCD_REFRESH_ON_DEMAND
+    (void)badge_display_request_refresh();
+#endif
+    (void)LCD_WaitForPreparedVsync(pdMS_TO_TICKS(BADGE_OTA_LCD_SETTLE_MS));
+}
+
+static void badge_display_enter_ota_static_mode(void)
+{
+    wait_lcd_settle();
+
+    esp_err_t pclk_ret = esp_lcd_rgb_panel_set_pclk(panel_handle, BADGE_OTA_LCD_PIXEL_CLOCK_HZ);
+    if (pclk_ret != ESP_OK) {
+        ESP_LOGW(TAG, "OTA RGB PCLK set failed: %s", esp_err_to_name(pclk_ret));
+    }
+    esp_err_t restart_ret = esp_lcd_rgb_panel_restart(panel_handle);
+    if (restart_ret != ESP_OK) {
+        ESP_LOGW(TAG, "OTA RGB restart failed: %s", esp_err_to_name(restart_ret));
+    }
+    badge_display_wait_vsyncs(BADGE_LCD_STARTUP_SYNC_VSYNCS);
+
+    ESP_LOGI(TAG, "OTA static LCD mode entered: pclk=%u", (unsigned)BADGE_OTA_LCD_PIXEL_CLOCK_HZ);
+}
+
+static void badge_display_restore_after_ota_static_mode(void)
+{
+    wait_lcd_settle();
+
+    esp_err_t pclk_ret = esp_lcd_rgb_panel_set_pclk(panel_handle, EXAMPLE_LCD_PIXEL_CLOCK_HZ);
+    if (pclk_ret != ESP_OK) {
+        ESP_LOGW(TAG, "restore RGB PCLK failed: %s", esp_err_to_name(pclk_ret));
+    }
+    esp_err_t restart_ret = esp_lcd_rgb_panel_restart(panel_handle);
+    if (restart_ret != ESP_OK) {
+        ESP_LOGW(TAG, "restore RGB restart failed: %s", esp_err_to_name(restart_ret));
+    }
+    badge_display_wait_vsyncs(BADGE_LCD_STARTUP_SYNC_VSYNCS);
 }
 
 static void show_waiting_screen(void)
@@ -264,6 +445,33 @@ static void show_upload_screen(void)
     s_display_fb = 0;
 }
 
+static void show_ota_screen(void)
+{
+    if (s_fb[0] == NULL || s_fb[1] == NULL || s_fb[2] == NULL) {
+        return;
+    }
+    if (s_ota_screen_visible) {
+        return;
+    }
+
+    int ota_fb = choose_static_screen_fb();
+    size_t embedded_bytes = (size_t)(upload_480_rgb565_bin_end - upload_480_rgb565_bin_start);
+    if (embedded_bytes < BADGE_OTA_IMAGE_BYTES) {
+        ESP_LOGE(TAG, "embedded OTA image too small: %u", (unsigned)embedded_bytes);
+        return;
+    }
+
+    for (size_t i = 0; i < BADGE_FB_COUNT; ++i) {
+        memcpy(s_fb[i], upload_480_rgb565_bin_start, BADGE_OTA_IMAGE_BYTES);
+    }
+    switch_panel_to_fb(ota_fb, NULL, NULL);
+    wait_lcd_settle();
+    s_next_render_fb = ota_fb;
+    s_ota_fb = ota_fb;
+    s_ota_screen_visible = true;
+    ESP_LOGI(TAG, "OTA screen displayed: fb=%d bytes=%u", ota_fb, (unsigned)BADGE_OTA_IMAGE_BYTES);
+}
+
 static void render_status_if_needed(esp_err_t err)
 {
     static bool shown_waiting;
@@ -289,6 +497,10 @@ static void switch_panel_to_fb(int fb_index, int64_t *out_display_us, int64_t *o
     if (draw_ret != ESP_OK) {
         ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(draw_ret));
     }
+    esp_err_t refresh_ret = badge_display_request_refresh();
+    if (refresh_ret != ESP_OK && refresh_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "framebuffer refresh request failed: %s", esp_err_to_name(refresh_ret));
+    }
     if (out_display_us != NULL) {
         *out_display_us += done_us - display_start_us;
     }
@@ -307,7 +519,7 @@ static esp_err_t render_stream_frame(badge_indexed_t *indexed,
     const uint8_t *payload = stream_frame->data;
     size_t payload_size = stream_frame->size;
 
-    /* LZ4 decompression wrapper ¨C reduces SD read bandwidth. */
+    /* LZ4 decompression wrapper - reduces SD read bandwidth. */
     static uint8_t *s_lz4_buf = NULL;
     static size_t s_lz4_cap = 0;
     if ((frame->flags & BADGE_FRAME_FLAG_LZ4) && payload_size >= 4) {
@@ -344,9 +556,6 @@ static esp_err_t render_stream_frame(badge_indexed_t *indexed,
 
     int64_t render_start_us = esp_timer_get_time();
     if (frame->codec == BADGE_FRAME_INDEXED_TILE && badge_indexed_dirty_rgb565_is_partial(indexed)) {
-        /* Copy the last displayed frame into the new render buffer as baseline,
-         * then apply tile deltas.  This avoids tearing that would occur when
-         * writing tile updates directly into the buffer the LCD is scanning from. */
         if (last_render_fb >= 0 && last_render_fb < (int)BADGE_FB_COUNT && s_fb[last_render_fb] != NULL) {
             memcpy(s_fb[*render_fb], s_fb[last_render_fb], BADGE_EBAJ_FRAME_BYTES);
         }
@@ -412,6 +621,41 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
     int64_t next_tick_us = esp_timer_get_time();
     int last_render_fb = s_display_fb;
     uint16_t frames_consumed = 0;
+    uint32_t frames_since_yield = 0;
+
+    if (asset->header.frame_count == 1 && entry_mode == BADGE_PLAY_MODE_LOOP) {
+        badge_stream_frame_t stream_frame = {0};
+        ret = badge_stream_read_frame(stream, &stream_frame, 1200);
+        if (ret == ESP_OK) {
+            s_perf_read_us += stream_frame.read_us;
+            if (stream_frame.status == ESP_OK && stream_frame.frame_index < asset->header.frame_count) {
+                int render_fb = choose_render_fb();
+                ret = render_stream_frame(&indexed, &frames[stream_frame.frame_index],
+                                          &stream_frame, &render_fb, last_render_fb);
+                if (ret == ESP_OK) {
+                    switch_panel_to_fb(render_fb, &s_perf_display_us, &s_perf_vsync_us);
+                    ++s_perf_source_frames;
+                    update_playback_perf_counter(asset);
+                    ESP_LOGI(TAG, "single-frame asset rendered once; holding framebuffer");
+                }
+            } else {
+                ret = stream_frame.status;
+                ESP_LOGE(TAG, "frame %u read failed: %s",
+                         stream_frame.frame_index, esp_err_to_name(stream_frame.status));
+            }
+            badge_stream_release_frame(stream, &stream_frame);
+        }
+
+        badge_stream_stop(stream);
+        badge_indexed_deinit(&indexed);
+        heap_caps_free(frames);
+
+        if (ret == ESP_OK) {
+            wait_for_reload_while_frozen();
+        }
+
+        return ret;
+    }
 
     while ((xEventGroupGetBits(s_events) & BADGE_RELOAD_BIT) == 0) {
         int64_t now = esp_timer_get_time();
@@ -472,6 +716,7 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
         }
 
         update_playback_perf_counter(asset);
+        badge_player_yield_if_needed(&frames_since_yield);
         next_tick_us += frame_delay_us;
 
         /* Break after one full play-through for non-loop modes */
@@ -494,7 +739,7 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
         ESP_LOGI(TAG, "first_half finished, freezing");
         xEventGroupSetBits(s_events, BADGE_STOPPED_BIT);
         /* Stay frozen until RELOAD (next switch) */
-        xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+        wait_for_reload_while_frozen();
     }
 
     /* Second-half: notify anim mgr to trigger pending switch */
@@ -505,7 +750,7 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
         if ((xEventGroupGetBits(s_events) & BADGE_RELOAD_BIT) == 0) {
             ESP_LOGI(TAG, "second_half finished, no pending switch, freezing");
             xEventGroupSetBits(s_events, BADGE_STOPPED_BIT);
-            xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+            wait_for_reload_while_frozen();
         }
     }
 
@@ -574,6 +819,7 @@ esp_err_t badge_display_init(void)
 
     ESP_RETURN_ON_ERROR(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, BADGE_FB_COUNT, &s_fb[0], &s_fb[1], &s_fb[2]),
                         TAG, "failed to get RGB frame buffers");
+    ESP_RETURN_ON_ERROR(badge_display_sync_lcd_after_init(), TAG, "LCD startup sync failed");
 
 #if BADGE_STATIC_LCD_TEST
     ESP_RETURN_ON_ERROR(draw_static_lcd_test_pattern(), TAG, "static LCD test draw failed");
@@ -642,10 +888,29 @@ void badge_display_resume_after_upload(void)
 
 esp_err_t badge_display_pause_for_ota(TickType_t timeout_ticks)
 {
-    return pause_player_task(timeout_ticks);
+    esp_err_t ret = pause_player_task(timeout_ticks);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    s_ota_screen_visible = false;
+    s_ota_fb = -1;
+    badge_display_enter_ota_static_mode();
+    show_ota_screen();
+    return ESP_OK;
+}
+
+void badge_display_refresh_ota_screen(void)
+{
+    if (!s_ota_screen_visible) {
+        show_ota_screen();
+    }
 }
 
 void badge_display_resume_after_ota(void)
 {
+    s_ota_screen_visible = false;
+    s_ota_fb = -1;
+    badge_display_restore_after_ota_static_mode();
     badge_display_exit_upload_mode();
 }
