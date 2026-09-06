@@ -66,7 +66,7 @@ void main() {
     expect(plist, isNot(contains('<string>app_gif</string>')));
     expect(
       project,
-      contains('PRODUCT_BUNDLE_IDENTIFIER = com.leyyoudian.espbaji;'),
+      contains('PRODUCT_BUNDLE_IDENTIFIER = com.domainname.DotLoop;'),
     );
     expect(
       project,
@@ -75,9 +75,11 @@ void main() {
     expect(codemagic, contains('ios_app_store'));
     expect(codemagic, contains('app-store-ipa'));
     expect(codemagic, contains('flutter build ipa --release'));
-    expect(podfile, contains("platform :ios, '14.0'"));
+    expect(podfile, contains("platform :ios, '15.0'"));
     expect(podfile, contains('flutter_install_all_ios_pods'));
     expect(codemagic, contains('working_directory: app_gif'));
+    expect(codemagic, contains('rm -rf Pods Podfile.lock'));
+    expect(codemagic, contains('pod deintegrate || true'));
     expect(codemagic, contains('flutter build ios --release --no-codesign'));
     expect(codemagic, contains('Runner-release-adhoc.ipa'));
     expect(codemagic, contains('/usr/bin/codesign --force --deep --sign -'));

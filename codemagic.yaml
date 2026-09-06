@@ -20,7 +20,8 @@ workflows:
       - name: Install pods
         script: |
           cd ios
-          pod deintegrate
+          rm -rf Pods Podfile.lock
+          pod deintegrate || true
           pod install --repo-update
           cd ..
           rm -f ios/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
@@ -32,7 +33,9 @@ workflows:
           flutter clean
           flutter pub get
           cd ios
-          pod install
+          rm -rf Pods Podfile.lock
+          pod deintegrate || true
+          pod install --repo-update
           cd ..
           flutter build ipa --release --export-options-plist=$HOME/export_options.plist
     artifacts:
