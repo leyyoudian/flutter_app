@@ -72,6 +72,7 @@ void main() {
       project,
       isNot(contains('PRODUCT_BUNDLE_IDENTIFIER = com.example.appGif;')),
     );
+    expect(project, contains('IPHONEOS_DEPLOYMENT_TARGET = 15.0;'));
     expect(codemagic, contains('ios_app_store'));
     expect(codemagic, contains('app-store-ipa'));
     expect(codemagic, contains('flutter build ipa --release'));
