@@ -26,9 +26,19 @@ void main() {
     expect(source, contains('case "loadHistory"'));
     expect(source, contains('case "saveHistory"'));
     expect(source, contains('case "deleteAssetFiles"'));
+    expect(source, contains('case "loadPendingDeviceDeletes"'));
+    expect(source, contains('case "savePendingDeviceDeletes"'));
+    expect(source, contains('case "getDeviceIdentity"'));
+    expect(source, contains('case "statDeviceAsset"'));
+    expect(source, contains('case "deleteDeviceAsset"'));
     expect(source, contains('case "openUrl"'));
     expect(source, contains('case "requestUserId"'));
-    expect(source, contains('private func requestNewUserId(result: @escaping FlutterResult)'));
+    expect(
+      source,
+      contains(
+        'private func requestNewUserId(result: @escaping FlutterResult)',
+      ),
+    );
     expect(source, contains('UIApplication.shared.open'));
     expect(source, contains('private func assetRootDirectory'));
     expect(source, contains('private func deleteAssetFiles'));
@@ -54,8 +64,14 @@ void main() {
     expect(plist, contains('CFBundleDisplayName'));
     expect(plist, isNot(contains('<string>App Gif</string>')));
     expect(plist, isNot(contains('<string>app_gif</string>')));
-    expect(project, contains('PRODUCT_BUNDLE_IDENTIFIER = com.leyyoudian.espbaji;'));
-    expect(project, isNot(contains('PRODUCT_BUNDLE_IDENTIFIER = com.example.appGif;')));
+    expect(
+      project,
+      contains('PRODUCT_BUNDLE_IDENTIFIER = com.leyyoudian.espbaji;'),
+    );
+    expect(
+      project,
+      isNot(contains('PRODUCT_BUNDLE_IDENTIFIER = com.example.appGif;')),
+    );
     expect(codemagic, contains('ios_app_store'));
     expect(codemagic, contains('app-store-ipa'));
     expect(codemagic, contains('flutter build ipa --release'));
@@ -69,8 +85,22 @@ void main() {
     expect(codemagic, contains('Payload/Runner.app/Runner'));
     expect(codemagic, contains('Runner.debug.dylib'));
     expect(codemagic, contains('build/ios/ipa/Runner-release-adhoc.ipa'));
-    expect(codemagic, isNot(contains('flutter build ios --debug --no-codesign')));
+    expect(
+      codemagic,
+      isNot(contains('flutter build ios --debug --no-codesign')),
+    );
     expect(codemagic, isNot(contains('build/ios/iphoneos/*.app')));
+  });
+
+  test('iOS bridges guarded user asset identity and deletion commands', () {
+    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+
+    expect(source, contains('pendingDeviceDeletesKey'));
+    expect(source, contains('self.sendRawTcpCommand("IDENTITY\\n")'));
+    expect(source, contains(r'"STAT \(id) \(crc32)\n"'));
+    expect(source, contains(r'"DELETE \(id) \(crc32)\n"'));
+    expect(source, contains(r'"SWITCH \(id) \($0)\n"'));
+    expect(source, contains('resultMap["deviceKey"]'));
   });
 
   test('iOS RGB332 palette helper calls are defined', () {
@@ -85,18 +115,21 @@ void main() {
     expect(calls.difference(definitions), isEmpty);
   });
 
-  test('iOS native rendering matches Android crop direction and RGB byte order', () {
-    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+  test(
+    'iOS native rendering matches Android crop direction and RGB byte order',
+    () {
+      final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
 
-    expect(source, contains('+ crop.offsetY * Double(height)'));
-    expect(source, contains('+ crop.offsetY * Double(streamSize)'));
-    expect(source, isNot(contains('- crop.offsetY * Double(height)')));
-    expect(source, isNot(contains('- crop.offsetY * Double(streamSize)')));
-    expect(
-      RegExp(r'byteOrder32Big').allMatches(source).length,
-      greaterThanOrEqualTo(5),
-    );
-  });
+      expect(source, contains('+ crop.offsetY * Double(height)'));
+      expect(source, contains('+ crop.offsetY * Double(streamSize)'));
+      expect(source, isNot(contains('- crop.offsetY * Double(height)')));
+      expect(source, isNot(contains('- crop.offsetY * Double(streamSize)')));
+      expect(
+        RegExp(r'byteOrder32Big').allMatches(source).length,
+        greaterThanOrEqualTo(5),
+      );
+    },
+  );
 
   test('iOS AppIcon set only contains referenced generated app icons', () {
     final iconDir = Directory('ios/Runner/Assets.xcassets/AppIcon.appiconset');
@@ -116,28 +149,34 @@ void main() {
     expect(File('${iconDir.path}/icon_1024.png').existsSync(), isFalse);
   });
 
-  test('iOS video animated previews use asset reader instead of image generator frame seeking', () {
-    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
-    final previewStart = source.indexOf(
-      '  private func buildVideoAnimatedPreview(url: URL, crop: CropTransform, warmPreviewPath: String?) throws -> Data {',
-    );
-    final previewEnd = source.indexOf(
-      '  private func buildVideoPreviewFrames',
-      previewStart,
-    );
-    expect(previewStart, isNot(-1));
-    expect(previewEnd, isNot(-1));
-    final previewSource = source.substring(previewStart, previewEnd);
+  test(
+    'iOS video animated previews use asset reader instead of image generator frame seeking',
+    () {
+      final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+      final previewStart = source.indexOf(
+        '  private func buildVideoAnimatedPreview(url: URL, crop: CropTransform, warmPreviewPath: String?) throws -> Data {',
+      );
+      final previewEnd = source.indexOf(
+        '  private func buildVideoPreviewFrames',
+        previewStart,
+      );
+      expect(previewStart, isNot(-1));
+      expect(previewEnd, isNot(-1));
+      final previewSource = source.substring(previewStart, previewEnd);
 
-    expect(previewSource, contains('buildVideoPreviewFrames(url: url, crop: crop)'));
-    expect(source, contains('AVAssetReaderVideoCompositionOutput'));
-    expect(source, contains('CMSampleBufferGetImageBuffer'));
-    expect(source, contains('quantizePixelBufferToGifIndexed'));
-    expect(source, contains('"assetPreviewReady"'));
-    expect(source, contains('scheduleVideoAnimatedPreview'));
-    expect(previewSource, isNot(contains('AVAssetImageGenerator')));
-    expect(previewSource, isNot(contains('copyCGImage')));
-  });
+      expect(
+        previewSource,
+        contains('buildVideoPreviewFrames(url: url, crop: crop)'),
+      );
+      expect(source, contains('AVAssetReaderVideoCompositionOutput'));
+      expect(source, contains('CMSampleBufferGetImageBuffer'));
+      expect(source, contains('quantizePixelBufferToGifIndexed'));
+      expect(source, contains('"assetPreviewReady"'));
+      expect(source, contains('scheduleVideoAnimatedPreview'));
+      expect(previewSource, isNot(contains('AVAssetImageGenerator')));
+      expect(previewSource, isNot(contains('copyCGImage')));
+    },
+  );
 
   test('iOS video asset encoding skips intermediate GIF conversion', () {
     final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
@@ -157,45 +196,97 @@ void main() {
     final imageBranchStart = encodeSource.indexOf('} else {', videoBranchStart);
     expect(videoBranchStart, isNot(-1));
     expect(imageBranchStart, isNot(-1));
-    final videoBranch = encodeSource.substring(videoBranchStart, imageBranchStart);
+    final videoBranch = encodeSource.substring(
+      videoBranchStart,
+      imageBranchStart,
+    );
 
     expect(
       videoBranch,
-      contains('frames = try encodeVideoFrames(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)'),
+      contains(
+        'frames = try encodeVideoFrames(url: url, delayMs: delayMs, streamSize: streamSize, crop: crop)',
+      ),
     );
     expect(videoBranch, isNot(contains('convertVideoToAnimatedGif')));
     expect(videoBranch, isNot(contains('视频转GIF失败')));
   });
 
-  test('iOS upload streams packages from disk instead of concatenating payloads', () {
-    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
-    final uploadStart = source.indexOf('  private func uploadAsset(assetPath: String');
-    final uploadEnd = source.indexOf('  private func uploadAssetOverTcp', uploadStart);
-    expect(uploadStart, isNot(-1));
-    expect(uploadEnd, isNot(-1));
-    final uploadSource = source.substring(uploadStart, uploadEnd);
-    final tcpStart = source.indexOf('  private func uploadAssetOverTcp(');
-    final tcpEnd = source.indexOf('  private func uploadAssetOverHttp', tcpStart);
-    expect(tcpStart, isNot(-1));
-    expect(tcpEnd, isNot(-1));
-    final tcpSource = source.substring(tcpStart, tcpEnd);
+  test(
+    'iOS upload streams packages from disk instead of concatenating payloads',
+    () {
+      final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+      final uploadStart = source.indexOf(
+        '  private func uploadAsset(assetPath: String',
+      );
+      final uploadEnd = source.indexOf(
+        '  private func uploadAssetOverTcp',
+        uploadStart,
+      );
+      expect(uploadStart, isNot(-1));
+      expect(uploadEnd, isNot(-1));
+      final uploadSource = source.substring(uploadStart, uploadEnd);
+      final tcpStart = source.indexOf('  private func uploadAssetOverTcp(');
+      final tcpEnd = source.indexOf(
+        '  private func uploadAssetOverHttp',
+        tcpStart,
+      );
+      expect(tcpStart, isNot(-1));
+      expect(tcpEnd, isNot(-1));
+      final tcpSource = source.substring(tcpStart, tcpEnd);
 
-    expect(
-      uploadSource.indexOf('try self.uploadAssetOverTcp(package: package)'),
-      lessThan(uploadSource.indexOf('try self.uploadAssetOverHttp(package: package)')),
-    );
-    expect(source, contains('private struct UploadPackageInfo'));
-    expect(source, contains('private func preparePackageForUpload(fileURL: URL) throws -> UploadPackageInfo'));
-    expect(source, contains('private func sendTcpFileChunks('));
-    expect(source, contains('InputStream(url: package.fileURL)'));
-    expect(source, contains('URLSession.shared.uploadTask(with: request, fromFile: package.fileURL)'));
-    expect(tcpSource, contains('appendLe32(&header, UInt32(package.size))'));
-    expect(tcpSource, contains('readyText.hasPrefix("READY")'));
-    expect(
-      tcpSource.indexOf('readyText.hasPrefix("READY")'),
-      lessThan(tcpSource.indexOf('self.sendTcpFileChunks(connection: connection, package: package)')),
-    );
-    expect(tcpSource, isNot(contains('payload.append(packageBytes)')));
-    expect(tcpSource, isNot(contains('var payload = Data()')));
-  });
+      expect(
+        uploadSource.indexOf('try self.uploadAssetOverTcp(package: package)'),
+        lessThan(
+          uploadSource.indexOf(
+            'try self.uploadAssetOverHttp(package: package)',
+          ),
+        ),
+      );
+      expect(source, contains('private struct UploadPackageInfo'));
+      expect(
+        source,
+        contains(
+          'private func preparePackageForUpload(fileURL: URL) throws -> UploadPackageInfo',
+        ),
+      );
+      expect(source, contains('private func sendTcpFileChunks('));
+      expect(source, contains('InputStream(url: package.fileURL)'));
+      expect(
+        source,
+        contains(
+          'URLSession.shared.uploadTask(with: request, fromFile: package.fileURL)',
+        ),
+      );
+      expect(tcpSource, contains('appendLe32(&header, UInt32(package.size))'));
+      expect(tcpSource, contains('readyText.hasPrefix("READY")'));
+      expect(
+        tcpSource.indexOf('readyText.hasPrefix("READY")'),
+        lessThan(
+          tcpSource.indexOf(
+            'self.sendTcpFileChunks(connection: connection, package: package)',
+          ),
+        ),
+      );
+      expect(tcpSource, isNot(contains('payload.append(packageBytes)')));
+      expect(tcpSource, isNot(contains('var payload = Data()')));
+    },
+  );
+
+  test(
+    'iOS random mode retries transient TCP failures and serializes taps',
+    () {
+      final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+      final dartSource = File('lib/main.dart').readAsStringSync();
+
+      expect(
+        source,
+        contains('sendRawTcpCommandWithRetry("RANDOM \\(arg)\\n")'),
+      );
+      expect(source, contains('randomCommandAttempts = 4'));
+      expect(source, contains('randomCommandRetryDelayMs = 120'));
+      expect(dartSource, contains('bool _randomUpdating = false;'));
+      expect(dartSource, contains('if (_randomUpdating)'));
+      expect(dartSource, contains('onTap: updating ? null :'));
+    },
+  );
 }

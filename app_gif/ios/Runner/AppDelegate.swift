@@ -104,6 +104,14 @@ import UIKit
     case "saveHistory":
       saveHistory(call.arguments as? [[String: Any]] ?? [])
       result(nil)
+    case "loadPendingDeviceDeletes":
+      result(loadPendingDeviceDeletes())
+    case "savePendingDeviceDeletes":
+      if savePendingDeviceDeletes(call.arguments as? [[String: Any]] ?? []) {
+        result(nil)
+      } else {
+        result(FlutterError(code: "delete_queue_save_failed", message: "删除队列保存失败", details: nil))
+      }
     case "deleteAssetFiles":
       deleteAssetFiles(
         assetPath: args["assetPath"] as? String,
@@ -142,7 +150,30 @@ import UIKit
         result(FlutterError(code: "bad_id", message: "素材ID为空", details: nil))
         return
       }
-      switchToAsset(id: id, result: result)
+      switchToAsset(id: id, crc32: args["crc32"] as? String, result: result)
+    case "getDeviceIdentity":
+      runDeviceCommand("IDENTITY\n", errorCode: "identity_failed", result: result) { response in
+        guard let key = self.parseDeviceKey(response) else {
+          throw BadgeError.message(response.isEmpty ? "设备身份读取失败" : response)
+        }
+        return key
+      }
+    case "statDeviceAsset":
+      guard let id = args["id"] as? String,
+            let crc32 = args["crc32"] as? String,
+            validUserDeviceCommand(id: id, crc32: crc32) else {
+        result(FlutterError(code: "bad_asset_identity", message: "素材身份无效", details: nil))
+        return
+      }
+      runDeviceCommand("STAT \(id) \(crc32)\n", errorCode: "asset_stat_failed", result: result) { $0 }
+    case "deleteDeviceAsset":
+      guard let id = args["id"] as? String,
+            let crc32 = args["crc32"] as? String,
+            validUserDeviceCommand(id: id, crc32: crc32) else {
+        result(FlutterError(code: "bad_asset_identity", message: "素材身份无效", details: nil))
+        return
+      }
+      runDeviceCommand("DELETE \(id) \(crc32)\n", errorCode: "asset_delete_failed", result: result) { $0 }
     case "setRandomMode":
       let enabled = args["enabled"] as? Bool ?? false
       setRandomMode(enabled: enabled, result: result)
@@ -740,6 +771,11 @@ import UIKit
         self.sendEvent(["type": "uploadProgress", "progress": 1.0, "message": "已切换显示"])
         var resultMap: [String: Any] = [:]
         if let id = assignedId { resultMap["assignedId"] = id }
+        if assignedId != nil,
+           let response = try? self.sendRawTcpCommand("IDENTITY\n"),
+           let deviceKey = self.parseDeviceKey(response) {
+          resultMap["deviceKey"] = deviceKey
+        }
         DispatchQueue.main.async { result(resultMap.isEmpty ? nil : resultMap) }
       } catch {
         DispatchQueue.main.async {
@@ -775,10 +811,10 @@ import UIKit
     }
   }
 
-  private func switchToAsset(id: String, result: @escaping FlutterResult) {
+  private func switchToAsset(id: String, crc32: String?, result: @escaping FlutterResult) {
     DispatchQueue.global(qos: .userInitiated).async {
       do {
-        let response = try self.sendSwitchCommand(id: id)
+        let response = try self.sendSwitchCommand(id: id, crc32: crc32)
         if response.hasPrefix("OK") {
           self.sendEvent(["type": "switchResult", "id": id, "success": true])
           DispatchQueue.main.async { result(true) }
@@ -812,7 +848,7 @@ import UIKit
   private func sendRandomModeCommand(_ arg: String, result: @escaping FlutterResult) {
     DispatchQueue.global(qos: .userInitiated).async {
       do {
-        let response = try self.sendRawTcpCommand("RANDOM \(arg)\n")
+        let response = try self.sendRawTcpCommandWithRetry("RANDOM \(arg)\n")
         guard response.hasPrefix("OK RANDOM") else {
           throw BadgeError.message(response.isEmpty ? "随机播放设置失败" : response)
         }
@@ -847,7 +883,7 @@ import UIKit
     }
   }
 
-  private func sendSwitchCommand(id: String) throws -> String {
+  private func sendSwitchCommand(id: String, crc32: String? = nil) throws -> String {
     let semaphore = DispatchSemaphore(value: 0)
     var responseData = Data()
     var failure: Error?
@@ -859,7 +895,7 @@ import UIKit
     connection.stateUpdateHandler = { state in
       switch state {
       case .ready:
-        let cmd = "SWITCH \(id)\n"
+        let cmd = crc32.map { "SWITCH \(id) \($0)\n" } ?? "SWITCH \(id)\n"
         connection.send(
           content: cmd.data(using: .utf8),
           completion: .contentProcessed { error in
@@ -936,6 +972,60 @@ import UIKit
     connection.cancel()
     if let failure = failure { throw failure }
     return String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  }
+
+  private func validUserDeviceCommand(id: String, crc32: String) -> Bool {
+    let idChars = Array(id)
+    return idChars.count == 4 && idChars[0] == "U" &&
+      idChars.dropFirst().allSatisfy(\.isNumber) &&
+      crc32.count == 8 && crc32.allSatisfy(\.isHexDigit)
+  }
+
+  private func parseDeviceKey(_ response: String) -> String? {
+    let prefix = "OK DEVICE "
+    guard response.hasPrefix(prefix) else { return nil }
+    let key = String(response.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+    let suffix = key.hasPrefix("P4-") ? key.dropFirst(3) : Substring()
+    guard suffix.count == 12 && suffix.allSatisfy(\.isHexDigit) else { return nil }
+    return key
+  }
+
+  private func runDeviceCommand<T>(
+    _ command: String,
+    errorCode: String,
+    result: @escaping FlutterResult,
+    transform: @escaping (String) throws -> T
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let response = try self.sendRawTcpCommand(command)
+        let value = try transform(response)
+        DispatchQueue.main.async { result(value) }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: errorCode, message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
+  private func sendRawTcpCommandWithRetry(_ command: String) throws -> String {
+    var lastError: Error = BadgeError.message("设备未返回响应")
+    for attempt in 0..<BadgeConstants.randomCommandAttempts {
+      do {
+        let response = try sendRawTcpCommand(command)
+        if !response.isEmpty {
+          return response
+        }
+        throw BadgeError.message("设备未返回响应")
+      } catch {
+        lastError = error
+        if attempt + 1 < BadgeConstants.randomCommandAttempts {
+          usleep(useconds_t(BadgeConstants.randomCommandRetryDelayMs * 1000))
+        }
+      }
+    }
+    throw lastError
   }
 
   private func uploadAssetOverTcp(package: UploadPackageInfo) throws -> String? {
@@ -1426,6 +1516,26 @@ import UIKit
       return
     }
     UserDefaults.standard.set(text, forKey: BadgeConstants.historyKey)
+  }
+
+  private func loadPendingDeviceDeletes() -> [[String: Any]] {
+    guard
+      let text = UserDefaults.standard.string(forKey: BadgeConstants.pendingDeviceDeletesKey),
+      let data = text.data(using: .utf8),
+      let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    else {
+      return []
+    }
+    return array
+  }
+
+  private func savePendingDeviceDeletes(_ items: [[String: Any]]) -> Bool {
+    guard let data = try? JSONSerialization.data(withJSONObject: items),
+          let text = String(data: data, encoding: .utf8) else {
+      return false
+    }
+    UserDefaults.standard.set(text, forKey: BadgeConstants.pendingDeviceDeletesKey)
+    return UserDefaults.standard.synchronize()
   }
 
   private func copyPickedFileToCache(_ url: URL) throws -> URL {
@@ -1971,10 +2081,13 @@ private enum BadgeConstants {
   static let uploadTimeoutSeconds = 180
   static let uploadChunkBytes = 256 * 1024
   static let uploadProgressStepBytes = 512 * 1024
+  static let randomCommandAttempts = 4
+  static let randomCommandRetryDelayMs = 120
   static let sdStreamBudgetBytes = 512 * 1024 * 1024
   static let assetTooLargeMessage = "转换后的设备包超过当前素材存储空间，请换短一点的素材。"
   static let maxHistoryItems = 20
   static let historyKey = "history"
+  static let pendingDeviceDeletesKey = "pending_device_deletes_v1"
   static let width = 480
   static let height = 480
   static let minDeviceFps = 25

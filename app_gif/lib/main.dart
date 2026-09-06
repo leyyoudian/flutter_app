@@ -10,6 +10,8 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
 import 'factory_catalog_sync.dart';
+import 'device_asset_delete.dart';
+import 'transcode_policy.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -70,9 +72,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       'https://leyyoudian.github.io/flutter_app/privacy.html';
   static const _backendBaseUrl = String.fromEnvironment(
     'ESP_BAJI_API_BASE',
-    defaultValue: 'http://60.205.122.153',
+    defaultValue: 'http://10.25.140.205:8787',
   );
-  static const _appVersion = '1.0.18';
+  static const _appVersion = '1.0.21';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -92,6 +94,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   bool _checkingVersion = false;
   bool _reviewRefreshInFlight = false;
   bool _randomEnabled = false;
+  bool _randomUpdating = false;
+  bool _pendingDeviceDeletesLoaded = false;
+  Completer<void>? _deviceDeleteSync;
+  Future<void>? _pendingDeviceDeletesLoad;
   double _prepareProgress = 0;
   double _uploadProgress = 0;
   String _status = '未连接';
@@ -100,6 +106,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   PreparedAsset? _asset;
   CropTransform _cropTransform = const CropTransform();
   List<FactoryAnimation> _factoryAnims = [];
+  final List<PendingDeviceDeletion> _pendingDeviceDeletes = [];
+  String? _connectedDeviceKey;
   String? _selectedFactoryId;
   String? _activeFactoryId; // currently playing on dial
   List<String> _videoQueue = []; // pending video sequence
@@ -119,6 +127,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     WidgetsBinding.instance.addObserver(this);
     _channel.setMethodCallHandler(_handleNativeCall);
     unawaited(_loadHistory());
+    _pendingDeviceDeletesLoad = _loadPendingDeviceDeletes();
     unawaited(_refreshConnectionState());
     unawaited(_loadFactoryAnimations());
     unawaited(_checkRemoteVersion());
@@ -207,6 +216,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         });
         if (_connected && !wasConnected) {
           unawaited(_refreshRandomMode());
+          unawaited(_reconcilePendingDeviceDeletes());
         }
         break;
       case 'status':
@@ -374,7 +384,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _refreshRandomMode() async {
-    if (_demoMode || !_connected) {
+    if (_demoMode || !_connected || _randomUpdating) {
       return;
     }
     try {
@@ -400,8 +410,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _showSnack('请先连接设备');
       return;
     }
+    if (_randomUpdating) {
+      return;
+    }
     final previous = _randomEnabled;
     setState(() {
+      _randomUpdating = true;
       _randomEnabled = enabled;
       _status = enabled ? '随机播放' : '顺序播放';
     });
@@ -417,6 +431,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (!mounted) return;
       setState(() => _randomEnabled = previous);
       _showSnack('随机播放设置失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _randomUpdating = false);
+      }
     }
   }
 
@@ -425,6 +443,125 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       'saveHistory',
       _history.map((entry) => entry.toMap()).toList(),
     );
+  }
+
+  Future<void> _loadPendingDeviceDeletes() async {
+    final result = await _invokeNative<List<dynamic>>(
+      'loadPendingDeviceDeletes',
+    );
+    _pendingDeviceDeletes
+      ..clear()
+      ..addAll(
+        (result ?? const <dynamic>[]).map((item) {
+          try {
+            return PendingDeviceDeletion.fromMap(_asStringMap(item));
+          } on FormatException {
+            return null;
+          }
+        }).whereType<PendingDeviceDeletion>(),
+      );
+    final coalesced = coalescePendingDeviceDeletions(_pendingDeviceDeletes);
+    _pendingDeviceDeletes
+      ..clear()
+      ..addAll(coalesced);
+    _pendingDeviceDeletesLoaded = true;
+    if (_connected) {
+      unawaited(_reconcilePendingDeviceDeletes());
+    }
+  }
+
+  Future<void> _savePendingDeviceDeletes() async {
+    await _invokeNative<void>(
+      'savePendingDeviceDeletes',
+      _pendingDeviceDeletes.map((item) => item.toMap()).toList(),
+    );
+  }
+
+  Future<void> _reconcilePendingDeviceDeletes() {
+    final existing = _deviceDeleteSync;
+    if (existing != null) {
+      return existing.future;
+    }
+    final completer = Completer<void>();
+    _deviceDeleteSync = completer;
+    unawaited(_runPendingDeviceDeleteReconciliation(completer));
+    return completer.future;
+  }
+
+  Future<void> _runPendingDeviceDeleteReconciliation(
+    Completer<void> completer,
+  ) async {
+    try {
+      if (!_pendingDeviceDeletesLoaded ||
+          !_connected ||
+          _demoMode ||
+          _uploading ||
+          _pendingDeviceDeletes.isEmpty) {
+        return;
+      }
+      final deviceKey = await _invokeNative<String>('getDeviceIdentity');
+      if (deviceKey == null || deviceKey.isEmpty) {
+        return;
+      }
+      _connectedDeviceKey = deviceKey;
+
+      for (final original in List<PendingDeviceDeletion>.from(
+        _pendingDeviceDeletes,
+      )) {
+        var deletion = original;
+        if (deletion.deviceKey == null) {
+          final response = await _invokeNative<String>('statDeviceAsset', {
+            'id': deletion.deviceAssetId,
+            'crc32': crc32Hex(deletion.crc32),
+          });
+          final status = parseDeviceAssetStatusResponse(response ?? '');
+          if (status == DeviceAssetStatus.retry) {
+            break;
+          }
+          if (status == DeviceAssetStatus.rejected) {
+            _pendingDeviceDeletes.removeWhere(
+              (item) => item.operationKey == original.operationKey,
+            );
+            await _savePendingDeviceDeletes();
+            continue;
+          }
+          if (status != DeviceAssetStatus.match) {
+            continue;
+          }
+          deletion = deletion.copyWith(deviceKey: deviceKey);
+          final index = _pendingDeviceDeletes.indexWhere(
+            (item) => item.operationKey == original.operationKey,
+          );
+          if (index >= 0) {
+            _pendingDeviceDeletes[index] = deletion;
+            await _savePendingDeviceDeletes();
+          }
+        }
+        if (!deletion.matchesDevice(deviceKey)) {
+          continue;
+        }
+
+        final response = await _invokeNative<String>('deleteDeviceAsset', {
+          'id': deletion.deviceAssetId,
+          'crc32': crc32Hex(deletion.crc32),
+        });
+        final outcome = parseDeviceAssetDeleteResponse(response ?? '');
+        if (!isTerminalDeviceAssetDeleteOutcome(outcome)) {
+          break;
+        }
+        _pendingDeviceDeletes.removeWhere(
+          (item) => item.operationKey == deletion.operationKey,
+        );
+        await _savePendingDeviceDeletes();
+      }
+    } on PlatformException {
+      // Keep the durable tombstones for the next connection/retry.
+    } finally {
+      _deviceDeleteSync = null;
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
   }
 
   void _enterDemoMode() {
@@ -527,6 +664,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     });
     if (_connected && !wasConnected) {
       unawaited(_refreshRandomMode());
+      unawaited(_reconcilePendingDeviceDeletes());
     }
   }
 
@@ -632,6 +770,67 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _status = '保存素材';
     });
     try {
+      final useServerTranscode = _isVideoMime(media.mime);
+      if (useServerTranscode) {
+        /* Server-side transcoding (P4): the phone only uploads the source
+         * video + crop params; the server decodes and packs the EBAJ4
+         * package, which then enters the normal review flow. */
+        setState(() => _status = '上传服务器解码');
+        final transcodeResult =
+            await _invokeNative<Map<dynamic, dynamic>>('transcodeOnServer', {
+              'uri': media.uri,
+              'name': media.name,
+              'maxFps': p4MaxTranscodeFps,
+              'cropScale': _cropTransform.scale,
+              'cropOffsetX': _cropTransform.offset.dx,
+              'cropOffsetY': _cropTransform.offset.dy,
+              'backendBase': _backendBaseUrl,
+            });
+        if (!mounted || transcodeResult == null) {
+          return;
+        }
+        final reviewId = _readNullableString(transcodeResult['reviewId']);
+        if (reviewId == null) {
+          throw PlatformException(code: 'transcode_failed', message: '服务器转码失败');
+        }
+        final actualFps = resolveServerTranscodeFps(transcodeResult['fps']);
+        final asset = PreparedAsset(
+          assetPath: '',
+          previewPath: _readNullableString(transcodeResult['previewPath']),
+          animatedPreviewPath: media.animatedPreviewPath,
+          sourceUri: media.uri,
+          mime: media.mime,
+          name: media.name,
+          packageSize: 0,
+          frameCount: 0,
+          fps: actualFps,
+          crc32: 0,
+          cropScale: _cropTransform.scale,
+          cropOffsetX: _cropTransform.offset.dx,
+          cropOffsetY: _cropTransform.offset.dy,
+          reviewId: reviewId,
+          reviewStatus: 'pending',
+        );
+        final entry = HistoryEntry.fromAsset(
+          asset,
+          cropTransform: _cropTransform,
+        );
+        setState(() {
+          _asset = asset;
+          _preparing = false;
+          _prepareProgress = 1;
+          _pageIndex = 1;
+          _history.removeWhere((item) => item.reviewId == asset.reviewId);
+          _history.insert(0, entry);
+          if (_history.length > 20) {
+            _history.removeRange(20, _history.length);
+          }
+          _status = '待审核';
+        });
+        _showSnack('已提交服务器转码，等待审核');
+        unawaited(_saveHistory());
+        return;
+      }
       final prepared = await _invokeNative<Map<dynamic, dynamic>>(
         'prepareAsset',
         {
@@ -711,9 +910,59 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       setState(() => _pageIndex = 0);
       return;
     }
-    final approvedAsset = await _ensureAssetApproved(asset);
+    await _pendingDeviceDeletesLoad;
+    await _reconcilePendingDeviceDeletes();
+    if (!mounted) {
+      return;
+    }
+    var approvedAsset = await _ensureAssetApproved(asset);
     if (!mounted || approvedAsset == null) {
       return;
+    }
+    /* Server-transcoded assets hold no local package yet: download it from
+     * the backend before pushing to the device. */
+    if (approvedAsset.assetPath.isEmpty && approvedAsset.reviewId != null) {
+      setState(() => _status = '下载素材包');
+      final downloadResult = await _invokeNative<Map<dynamic, dynamic>>(
+        'downloadApprovedPackage',
+        {
+          'assetId': approvedAsset.reviewId,
+          'name': approvedAsset.name,
+          'backendBase': _backendBaseUrl,
+        },
+      );
+      if (!mounted || downloadResult == null) {
+        return;
+      }
+      final downloadedPath = _readNullableString(downloadResult['assetPath']);
+      if (downloadedPath == null || downloadedPath.isEmpty) {
+        setState(() {
+          _uploading = false;
+          _status = '下载失败';
+        });
+        _showSnack('素材包下载失败');
+        return;
+      }
+      approvedAsset = PreparedAsset(
+        assetPath: downloadedPath,
+        previewPath: approvedAsset.previewPath,
+        animatedPreviewPath: approvedAsset.animatedPreviewPath,
+        sourceUri: approvedAsset.sourceUri,
+        mime: approvedAsset.mime,
+        name: approvedAsset.name,
+        packageSize: approvedAsset.packageSize,
+        frameCount: approvedAsset.frameCount,
+        fps: approvedAsset.fps,
+        crc32: approvedAsset.crc32,
+        cropScale: approvedAsset.cropScale,
+        cropOffsetX: approvedAsset.cropOffsetX,
+        cropOffsetY: approvedAsset.cropOffsetY,
+        reviewId: approvedAsset.reviewId,
+        reviewStatus: approvedAsset.reviewStatus,
+      );
+      if (!mounted) {
+        return;
+      }
     }
     setState(() {
       _uploading = true;
@@ -721,21 +970,34 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _status = '准备上传';
     });
     try {
+      final uploadTarget = approvedAsset;
       final result = _demoMode
-          ? await _simulateDemoUpload(approvedAsset)
+          ? await _simulateDemoUpload(uploadTarget)
           : await _invokeNative<Map<dynamic, dynamic>>('uploadAsset', {
-              'assetPath': approvedAsset.assetPath,
+              'assetPath': uploadTarget.assetPath,
             });
       if (!mounted) return;
       final assignedId = _readNullableString(result?['assignedId']);
+      final deviceKey = _readNullableString(result?['deviceKey']);
+      if (deviceKey != null) {
+        _connectedDeviceKey = deviceKey;
+      }
       setState(() {
         _uploading = false;
         _uploadProgress = 1;
         _status = '已切换';
         // Store assigned device ID on the history entry
         for (var i = 0; i < _history.length; i++) {
-          if (_history[i].assetPath == approvedAsset.assetPath) {
-            _history[i] = _history[i].copyWith(deviceId: assignedId);
+          if (uploadMatchesHistory(
+            historyAssetPath: _history[i].assetPath,
+            historyReviewId: _history[i].reviewId,
+            uploadedAssetPath: uploadTarget.assetPath,
+            uploadedReviewId: uploadTarget.reviewId,
+          )) {
+            _history[i] = _history[i].copyWith(
+              deviceId: assignedId,
+              deviceKey: deviceKey ?? _connectedDeviceKey,
+            );
             break;
           }
         }
@@ -1104,6 +1366,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
     // If already uploaded, just switch to it
     if (entry.deviceId != null && _connected) {
+      await _pendingDeviceDeletesLoad;
+      await _reconcilePendingDeviceDeletes();
+      if (!mounted) {
+        return;
+      }
       final reviewed = await _ensureAssetApproved(
         PreparedAsset(
           assetPath: entry.assetPath,
@@ -1138,31 +1405,38 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         return;
       }
       try {
-        await _invokeNative<dynamic>('switchToAsset', {'id': entry.deviceId});
-        if (!mounted) return;
-        setState(() {
-          _status = '已切换';
-          _asset = PreparedAsset(
-            assetPath: entry.assetPath,
-            previewPath: entry.previewPath,
-            animatedPreviewPath: entry.animatedPreviewPath,
-            sourceUri: entry.sourceUri,
-            mime: entry.mime,
-            name: entry.name,
-            packageSize: entry.packageSize,
-            frameCount: entry.frameCount,
-            fps: entry.fps,
-            crc32: entry.crc32,
-            reviewId: entry.reviewId,
-            reviewStatus: entry.reviewStatus,
-          );
+        final switchResult = await _invokeNative<dynamic>('switchToAsset', {
+          'id': entry.deviceId,
+          'crc32': crc32Hex(entry.crc32),
         });
+        if (!mounted) return;
+        if (!switchResultNeedsUpload(switchResult)) {
+          setState(() {
+            _status = '已切换';
+            _asset = PreparedAsset(
+              assetPath: entry.assetPath,
+              previewPath: entry.previewPath,
+              animatedPreviewPath: entry.animatedPreviewPath,
+              sourceUri: entry.sourceUri,
+              mime: entry.mime,
+              name: entry.name,
+              packageSize: entry.packageSize,
+              frameCount: entry.frameCount,
+              fps: entry.fps,
+              crc32: entry.crc32,
+              reviewId: entry.reviewId,
+              reviewStatus: entry.reviewStatus,
+            );
+          });
+          return;
+        }
+        setState(() => _status = '设备缺少素材，重新上传');
       } catch (e) {
         if (!mounted) return;
         _showSnack('切换失败: $e');
         setState(() => _status = '切换失败');
+        return;
       }
-      return;
     }
     final asset = PreparedAsset(
       assetPath: entry.assetPath,
@@ -1193,15 +1467,57 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _deleteHistoryEntry(HistoryEntry entry) async {
+    await _pendingDeviceDeletesLoad;
+    if (isUserDeviceAssetId(entry.deviceId)) {
+      final deletion = PendingDeviceDeletion(
+        deviceKey: entry.deviceKey,
+        deviceAssetId: entry.deviceId!,
+        crc32: entry.crc32,
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      final updated = coalescePendingDeviceDeletions(<PendingDeviceDeletion>[
+        ..._pendingDeviceDeletes,
+        deletion,
+      ]);
+      _pendingDeviceDeletes
+        ..clear()
+        ..addAll(updated);
+      try {
+        await _savePendingDeviceDeletes();
+      } on PlatformException catch (error) {
+        if (mounted) {
+          _showSnack(error.message ?? '删除队列保存失败');
+        }
+        return;
+      }
+    }
     await _deleteNativeAssetFiles(entry);
     setState(() {
-      _history.removeWhere((item) => item.assetPath == entry.assetPath);
-      if (_asset?.assetPath == entry.assetPath) {
+      _history.removeWhere(
+        (item) => historyEntriesMatch(
+          leftAssetPath: item.assetPath,
+          leftReviewId: item.reviewId,
+          leftCreatedAt: item.createdAt,
+          rightAssetPath: entry.assetPath,
+          rightReviewId: entry.reviewId,
+          rightCreatedAt: entry.createdAt,
+        ),
+      );
+      if (_asset != null &&
+          uploadMatchesHistory(
+            historyAssetPath: entry.assetPath,
+            historyReviewId: entry.reviewId,
+            uploadedAssetPath: _asset!.assetPath,
+            uploadedReviewId: _asset!.reviewId,
+          )) {
         _asset = null;
       }
       _status = '已删除历史记录';
     });
     await _saveHistory();
+    if (_connected) {
+      unawaited(_reconcilePendingDeviceDeletes());
+    }
   }
 
   Future<void> _deleteNativeAssetFiles(HistoryEntry entry) async {
@@ -1338,6 +1654,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
             unawaited(_confirmDeleteHistoryEntry(entry)),
         onFactoryTap: (anim) => unawaited(_switchToFactory(anim)),
         randomEnabled: _randomEnabled,
+        randomUpdating: _randomUpdating,
         onRandomToggle: (enabled) => unawaited(_setRandomMode(enabled)),
       ),
       _MakerPage(
@@ -1513,6 +1830,7 @@ class _DisplayLibraryPage extends StatelessWidget {
     required this.onHistoryDelete,
     required this.onFactoryTap,
     required this.randomEnabled,
+    required this.randomUpdating,
     required this.onRandomToggle,
   });
 
@@ -1532,6 +1850,7 @@ class _DisplayLibraryPage extends StatelessWidget {
   final ValueChanged<HistoryEntry> onHistoryDelete;
   final ValueChanged<FactoryAnimation> onFactoryTap;
   final bool randomEnabled;
+  final bool randomUpdating;
   final ValueChanged<bool> onRandomToggle;
 
   @override
@@ -1563,6 +1882,7 @@ class _DisplayLibraryPage extends StatelessWidget {
                   const Spacer(),
                   _RandomToggleButton(
                     enabled: randomEnabled,
+                    updating: randomUpdating,
                     onChanged: onRandomToggle,
                   ),
                 ],
@@ -1630,9 +1950,23 @@ class _DisplayLibraryPage extends StatelessWidget {
                 if (index < history.length) {
                   final entry = history[index];
                   return _HistoryGridTile(
+                    key: ValueKey(
+                      historyEntryIdentity(
+                        assetPath: entry.assetPath,
+                        reviewId: entry.reviewId,
+                        createdAt: entry.createdAt,
+                      ),
+                    ),
                     active: active,
                     entry: entry,
-                    selected: asset?.assetPath == entry.assetPath,
+                    selected:
+                        asset != null &&
+                        uploadMatchesHistory(
+                          historyAssetPath: entry.assetPath,
+                          historyReviewId: entry.reviewId,
+                          uploadedAssetPath: asset!.assetPath,
+                          uploadedReviewId: asset!.reviewId,
+                        ),
                     onTap: uploading ? null : () => onHistoryTap(entry),
                     onLongPress: () => onHistoryDelete(entry),
                   );
@@ -1655,9 +1989,14 @@ class _DisplayLibraryPage extends StatelessWidget {
 }
 
 class _RandomToggleButton extends StatelessWidget {
-  const _RandomToggleButton({required this.enabled, required this.onChanged});
+  const _RandomToggleButton({
+    required this.enabled,
+    required this.updating,
+    required this.onChanged,
+  });
 
   final bool enabled;
+  final bool updating;
   final ValueChanged<bool> onChanged;
 
   @override
@@ -1667,27 +2006,30 @@ class _RandomToggleButton extends StatelessWidget {
       message: enabled ? '关闭随机播放' : '随机播放',
       child: InkResponse(
         radius: 28,
-        onTap: () => onChanged(!enabled),
+        onTap: updating ? null : () => onChanged(!enabled),
         child: SizedBox(
           width: 42,
           height: 42,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              Icon(Icons.shuffle_rounded, color: color, size: 28),
-              if (enabled)
-                Positioned(
-                  bottom: 3,
-                  child: Container(
-                    width: 6,
-                    height: 6,
-                    decoration: const BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: Color(0xff37e26f),
+          child: Opacity(
+            opacity: updating ? 0.55 : 1,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                Icon(Icons.shuffle_rounded, color: color, size: 28),
+                if (enabled)
+                  Positioned(
+                    bottom: 3,
+                    child: Container(
+                      width: 6,
+                      height: 6,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Color(0xff37e26f),
+                      ),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -2055,6 +2397,7 @@ class _DevicePage extends StatelessWidget {
 
 class _HistoryGridTile extends StatelessWidget {
   const _HistoryGridTile({
+    super.key,
     required this.active,
     required this.entry,
     required this.selected,
@@ -3234,6 +3577,7 @@ class HistoryEntry {
     required this.cropOffsetX,
     required this.cropOffsetY,
     this.deviceId,
+    this.deviceKey,
     this.reviewId,
     this.reviewStatus = 'local',
   });
@@ -3279,6 +3623,7 @@ class HistoryEntry {
       cropOffsetX: (map['cropOffsetX'] as num?)?.toDouble() ?? 0,
       cropOffsetY: (map['cropOffsetY'] as num?)?.toDouble() ?? 0,
       deviceId: _readNullableString(map['deviceId']),
+      deviceKey: _readNullableString(map['deviceKey']),
       reviewId: _readNullableString(map['reviewId']),
       reviewStatus: (map['reviewStatus'] as String?) ?? 'local',
     );
@@ -3301,6 +3646,7 @@ class HistoryEntry {
       'cropOffsetX': cropOffsetX,
       'cropOffsetY': cropOffsetY,
       if (deviceId != null) 'deviceId': deviceId,
+      if (deviceKey != null) 'deviceKey': deviceKey,
       if (reviewId != null) 'reviewId': reviewId,
       'reviewStatus': reviewStatus,
     };
@@ -3321,6 +3667,7 @@ class HistoryEntry {
   final double cropOffsetX;
   final double cropOffsetY;
   final String? deviceId;
+  final String? deviceKey;
   final String? reviewId;
   final String reviewStatus;
 
@@ -3334,6 +3681,7 @@ class HistoryEntry {
   HistoryEntry copyWith({
     String? animatedPreviewPath,
     String? deviceId,
+    String? deviceKey,
     String? reviewId,
     String? reviewStatus,
   }) {
@@ -3353,6 +3701,7 @@ class HistoryEntry {
       cropOffsetX: cropOffsetX,
       cropOffsetY: cropOffsetY,
       deviceId: deviceId ?? this.deviceId,
+      deviceKey: deviceKey ?? this.deviceKey,
       reviewId: reviewId ?? this.reviewId,
       reviewStatus: reviewStatus ?? this.reviewStatus,
     );
