@@ -495,7 +495,9 @@ static void factory_sync_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "checking factory catalog: %s", BADGE_FACTORY_CATALOG_URL);
+    ESP_LOGI(TAG, "checking factory catalog: primary=%s fallback=%s",
+             BADGE_FACTORY_PRIMARY_BASE_URL,
+             BADGE_FACTORY_FALLBACK_BASE_URL);
     esp_err_t ret = fetch_catalog(catalog, BADGE_FACTORY_CATALOG_MAX);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "factory catalog fetch failed: %s", esp_err_to_name(ret));
@@ -595,7 +597,9 @@ static void factory_sync_task(void *arg)
 
 void badge_factory_sync_start_once(void)
 {
-    if (s_sync_started || s_sync_running || BADGE_FACTORY_CATALOG_URL[0] == '\0') {
+    if (s_sync_started || s_sync_running ||
+        (BADGE_FACTORY_PRIMARY_BASE_URL[0] == '\0' &&
+         BADGE_FACTORY_FALLBACK_BASE_URL[0] == '\0')) {
         return;
     }
     s_sync_started = true;
