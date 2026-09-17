@@ -6,7 +6,24 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-const { createApp } = require('../src/app');
+const { createApp, findDuplicateAsset } = require('../src/app');
+
+test('transcoded package reuse prefers an existing approved asset', () => {
+  const items = [
+    { id: 'pending', status: 'pending', packageSha256: 'same' },
+    { id: 'approved', status: 'approved', packageSha256: 'same' },
+  ];
+  assert.equal(findDuplicateAsset(items, 'same', '123', 456).id, 'approved');
+});
+
+test('package reuse never crosses the S3 and P4 hardware formats', () => {
+  const items = [
+    { id: 's3', status: 'approved', packageSha256: 'same', hardware: 'esp32s3' },
+    { id: 'p4', status: 'approved', packageSha256: 'same', hardware: 'esp32p4' },
+  ];
+  assert.equal(findDuplicateAsset(items, 'same', '123', 456, 'esp32s3').id, 's3');
+  assert.equal(findDuplicateAsset(items, 'same', '123', 456, 'esp32p4').id, 'p4');
+});
 
 const crcTable = Array.from({ length: 256 }, (_, index) => {
   let crc = index;
@@ -177,6 +194,28 @@ function multipartRequest(baseUrl, pathname, fields, file, headers = {}) {
   });
 }
 
+function rawRequest(baseUrl, pathname, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      `${baseUrl}${pathname}`,
+      {
+        method: 'POST',
+        headers: { 'content-length': payload.length, ...headers },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve({ status: res.statusCode, text, json: text ? JSON.parse(text) : null });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
 async function withServer(fn) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'esp-baji-server-'));
   const app = createApp({ dataDir, adminToken: 'test-token' });
@@ -321,6 +360,30 @@ test('asset review deduplicates packages, serves previews, and deletes old asset
     );
     assert.equal(afterDelete.status, 200);
     assert.equal(afterDelete.json.items.length, 0);
+  });
+});
+
+test('video transcode upload streams the request body to disk', async () => {
+  await withServer(async (baseUrl) => {
+    const params = Buffer.from(JSON.stringify({
+      name: 'stream.mp4',
+      maxFps: 60,
+      streamSize: 480,
+      hardware: 'esp32s3',
+      crop: { scale: 1, offsetX: 0, offsetY: 0 },
+    })).toString('base64');
+    const submitted = await rawRequest(
+      baseUrl,
+      '/api/transcode',
+      Buffer.from('not-a-real-video'),
+      {
+        'content-type': 'video/mp4',
+        'x-esp-baji-filename': 'stream.mp4',
+        'x-esp-baji-params': params,
+      },
+    );
+    assert.equal(submitted.status, 202);
+    assert.ok(submitted.json.jobId);
   });
 });
 
@@ -649,6 +712,38 @@ test('firmware uploads publish HTTP OTA URLs even behind HTTPS proxy', async () 
   });
 });
 
+test('admin firmware history accepts legacy single-object data file', async () => {
+  await withServer(async (baseUrl, dataDir) => {
+    fs.writeFileSync(
+      path.join(dataDir, 'firmware_versions.json'),
+      JSON.stringify({
+        hardware: 'esp32s3',
+        version: '0.1.47',
+        filename: 'esp-baji-esp32s3-0.1.47.bin',
+        url: 'http://60.205.122.153/downloads/firmware/esp-baji-esp32s3-0.1.47.bin',
+        size: 1665856,
+        sha256: '4'.repeat(64),
+        notes: 'legacy object',
+        uploadedAt: '2026-08-11T10:50:33.453Z',
+      }),
+    );
+
+    const history = await request(
+      baseUrl,
+      'GET',
+      '/api/admin/firmware-versions?hardware=esp32s3',
+      null,
+      { 'X-Admin-Token': 'test-token' },
+    );
+
+    assert.equal(history.status, 200);
+    assert.deepEqual(
+      history.json.items.map((item) => item.version),
+      ['0.1.47'],
+    );
+  });
+});
+
 test('download endpoints support header probes', async () => {
   await withServer(async (baseUrl, dataDir) => {
     const apkDir = path.join(dataDir, 'downloads', 'apk');
@@ -778,5 +873,22 @@ test('admin uploads maintain app and firmware version history', async () => {
     const afterFirmwareDelete = await request(baseUrl, 'GET', '/api/ota/manifest?hardware=esp32s3');
     assert.equal(afterFirmwareDelete.status, 200);
     assert.equal(afterFirmwareDelete.json.version, '0.1.1');
+
+    const p4Firmware = await multipartRequest(
+      baseUrl,
+      '/api/admin/upload-firmware',
+      { hardware: 'esp32p4-2.5', version: '0.2.1', notes: 'P4 2.5' },
+      { name: 'file', filename: 'esp-baji-esp32p4-2.5-0.2.1.bin', content: Buffer.from('p4-fw') },
+      admin,
+    );
+    assert.equal(p4Firmware.status, 200);
+    assert.equal(p4Firmware.json['esp32p4-2.5'].version, '0.2.1');
+    const p4Manifest = await request(
+      baseUrl,
+      'GET',
+      '/api/ota/manifest?hardware=esp32p4-2.5',
+    );
+    assert.equal(p4Manifest.status, 200);
+    assert.match(p4Manifest.json.url, /esp-baji-esp32p4-2\.5-0\.2\.1\.bin$/);
   });
 });

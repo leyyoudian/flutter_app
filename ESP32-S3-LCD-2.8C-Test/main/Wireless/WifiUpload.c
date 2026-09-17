@@ -98,7 +98,8 @@
 #define BADGE_FW_VERSION "0.0.0"
 #endif
 #ifndef BADGE_OTA_MANIFEST_URL
-#define BADGE_OTA_MANIFEST_URL "http://60.205.122.153/api/ota/manifest?hardware=esp32s3"
+#define BADGE_OTA_MANIFEST_URL "http://47.108.204.22/api/ota/manifest?hardware=esp32s3"
+#define BADGE_OTA_MANIFEST_FALLBACK_URL "http://60.205.122.153/api/ota/manifest?hardware=esp32s3"
 #endif
 
 static const char *TAG = "WifiUpload";
@@ -1741,8 +1742,10 @@ static esp_err_t parse_crc_header(httpd_req_t *req, uint32_t *out_crc)
 static esp_err_t status_handler(httpd_req_t *req)
 {
     mark_local_activity();
-    char status[96] = {0};
-    badge_storage_get_status(status, sizeof(status));
+    char storage_status[96] = {0};
+    char status[128] = {0};
+    badge_storage_get_status(storage_status, sizeof(storage_status));
+    snprintf(status, sizeof(status), "%s hardware=esp32s3", storage_status);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_send(req, status, HTTPD_RESP_USE_STRLEN);
 }
@@ -2142,14 +2145,14 @@ static bool ota_version_is_newer(const char *remote, const char *current)
     return false;
 }
 
-static esp_err_t fetch_ota_manifest(char *buffer, size_t buffer_size)
+static esp_err_t fetch_ota_manifest_url(const char *url, char *buffer, size_t buffer_size)
 {
     if (buffer == NULL || buffer_size < 2) {
         return ESP_ERR_INVALID_ARG;
     }
 
     esp_http_client_config_t config = {
-        .url = BADGE_OTA_MANIFEST_URL,
+        .url = url,
         .timeout_ms = BADGE_OTA_MANIFEST_TIMEOUT_MS,
         .keep_alive_enable = false,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -2190,6 +2193,22 @@ static esp_err_t fetch_ota_manifest(char *buffer, size_t buffer_size)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return (ret == ESP_OK && total > 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t fetch_ota_manifest(char *buffer, size_t buffer_size)
+{
+    const char *urls[] = {BADGE_OTA_MANIFEST_URL, BADGE_OTA_MANIFEST_FALLBACK_URL};
+    esp_err_t ret = ESP_FAIL;
+    for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); ++i) {
+        buffer[0] = '\0';
+        ESP_LOGI(TAG, "checking OTA manifest: %s", urls[i]);
+        ret = fetch_ota_manifest_url(urls[i], buffer, buffer_size);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "OTA manifest endpoint failed: %s (%s)", urls[i], esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static bool parse_ota_manifest(const char *json_text,
@@ -2319,7 +2338,6 @@ static void auto_ota_check_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "checking OTA manifest: %s", BADGE_OTA_MANIFEST_URL);
     esp_err_t ret = fetch_ota_manifest(manifest, BADGE_OTA_MANIFEST_MAX);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "OTA manifest fetch failed: %s", esp_err_to_name(ret));

@@ -18,6 +18,7 @@ import UIKit
   private var connectedAddress: String?
   private var activeBadgeHost = BadgeConstants.badgeApHost
   private var sdAvailable = false
+  private var badgeHardware = "esp32s3"
   private var isUploading = false
   private var uploadBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -99,6 +100,39 @@ import UIKit
         return
       }
       uploadAsset(assetPath: path, result: result)
+    case "transcodeOnServer":
+      guard let uri = args["uri"] as? String else {
+        result(FlutterError(code: "bad_uri", message: "素材地址为空", details: nil))
+        return
+      }
+      let name = args["name"] as? String ?? "asset"
+      let maxFps = min(80, max(1, args["maxFps"] as? Int ?? 80))
+      let crop = CropTransform(
+        scale: min(4.0, max(1.0, args["cropScale"] as? Double ?? 1.0)),
+        offsetX: min(1.5, max(-1.5, args["cropOffsetX"] as? Double ?? 0.0)),
+        offsetY: min(1.5, max(-1.5, args["cropOffsetY"] as? Double ?? 0.0))
+      )
+      transcodeOnServer(
+        uriText: uri,
+        name: name,
+        maxFps: maxFps,
+        crop: crop,
+        hardware: normalizeBadgeHardware(args["hardware"] as? String),
+        backendBase: args["backendBase"] as? String ?? "http://47.108.204.22",
+        result: result
+      )
+    case "downloadApprovedPackage":
+      guard let assetId = args["assetId"] as? String, !assetId.isEmpty else {
+        result(FlutterError(code: "bad_asset", message: "素材 ID 为空", details: nil))
+        return
+      }
+      downloadApprovedPackage(
+        assetId: assetId,
+        name: args["name"] as? String ?? "asset",
+        hardware: normalizeBadgeHardware(args["hardware"] as? String),
+        backendBase: args["backendBase"] as? String ?? "http://47.108.204.22",
+        result: result
+      )
     case "loadHistory":
       result(loadHistory())
     case "saveHistory":
@@ -232,6 +266,7 @@ import UIKit
         "connecting": false,
         "address": nullable(connectedAddress),
         "sdAvailable": sdAvailable,
+        "hardware": badgeHardware,
         "message": "上传中",
       ])
       return
@@ -261,6 +296,7 @@ import UIKit
           "connecting": false,
           "address": nullable(self.connectedAddress),
           "sdAvailable": self.sdAvailable,
+          "hardware": self.badgeHardware,
           "message": message,
         ])
       }
@@ -972,6 +1008,174 @@ import UIKit
     connection.cancel()
     if let failure = failure { throw failure }
     return String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  }
+
+  private func transcodeOnServer(
+    uriText: String,
+    name: String,
+    maxFps: Int,
+    crop: CropTransform,
+    hardware: String,
+    backendBase: String,
+    result: @escaping FlutterResult
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        self.sendEvent(["type": "transcodeProgress", "stage": "upload", "message": "上传素材到服务器"])
+        let source = try self.url(from: uriText)
+        let params: [String: Any] = [
+          "name": name,
+          "maxFps": maxFps,
+          "streamSize": 480,
+          "userId": "ios-user",
+          "hardware": hardware,
+          "crop": ["scale": crop.scale, "offsetX": crop.offsetX, "offsetY": crop.offsetY],
+        ]
+        let backend = backendBase.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let jobId = try self.postTranscodeJob(backend: backend, source: source, params: params)
+        self.sendEvent(["type": "transcodeProgress", "stage": "transcoding", "message": "服务器解码中"])
+        let job = try self.waitForTranscode(backend: backend, jobId: jobId)
+        let assetId = job["assetId"] as? String ?? ""
+        guard !assetId.isEmpty else { throw BadgeError.message("转码结果缺失") }
+
+        let directory = try self.cacheDirectory("ebaj")
+        let stem = "\(Int(Date().timeIntervalSince1970 * 1000))_\(self.safeFileName(name))"
+        let preview = directory.appendingPathComponent("\(stem).png")
+        let previewPath = try? self.downloadBackendFile(
+          url: URL(string: "\(backend)/api/assets/\(assetId)/preview")!,
+          target: preview
+        )
+        DispatchQueue.main.async {
+          result([
+            "reviewId": assetId,
+            "reviewStatus": "pending",
+            "fps": job["fps"] as? Int ?? 60,
+            "previewPath": nullable(previewPath?.path),
+          ])
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "transcode_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
+  private func downloadApprovedPackage(
+    assetId: String,
+    name: String,
+    hardware: String,
+    backendBase: String,
+    result: @escaping FlutterResult
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        self.sendEvent(["type": "transcodeProgress", "stage": "download", "message": "下载素材包"])
+        let backend = backendBase.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let directory = try self.cacheDirectory("ebaj")
+        let target = directory.appendingPathComponent(
+          "\(Int(Date().timeIntervalSince1970 * 1000))_\(self.safeFileName(name)).ebaj"
+        )
+        guard let url = URL(string: "\(backend)/api/assets/\(assetId)/package?hardware=\(hardware)") else {
+          throw BadgeError.message("素材包地址错误")
+        }
+        _ = try self.downloadBackendFile(url: url, target: target)
+        DispatchQueue.main.async { result(["assetPath": target.path]) }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "download_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
+  private func postTranscodeJob(backend: String, source: URL, params: [String: Any]) throws -> String {
+    guard let endpoint = URL(string: "\(backend)/api/transcode") else {
+      throw BadgeError.message("服务器地址错误")
+    }
+    var request = URLRequest(url: endpoint)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 3600
+    request.setValue(mimeType(for: source), forHTTPHeaderField: "Content-Type")
+    request.setValue(safeFileName(source.lastPathComponent), forHTTPHeaderField: "X-Esp-Baji-Filename")
+    request.setValue(
+      try JSONSerialization.data(withJSONObject: params).base64EncodedString(),
+      forHTTPHeaderField: "X-Esp-Baji-Params"
+    )
+    let data = try performBackendRequest(request, uploadFile: source)
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    guard let jobId = json?["jobId"] as? String, !jobId.isEmpty else {
+      throw BadgeError.message("服务器未接受转码任务")
+    }
+    return jobId
+  }
+
+  private func waitForTranscode(backend: String, jobId: String) throws -> [String: Any] {
+    for _ in 0..<900 {
+      guard let url = URL(string: "\(backend)/api/transcode/\(jobId)") else {
+        throw BadgeError.message("转码任务地址错误")
+      }
+      var request = URLRequest(url: url)
+      request.timeoutInterval = 30
+      let data = try performBackendRequest(request)
+      let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+      switch json["status"] as? String {
+      case "done": return json
+      case "failed": throw BadgeError.message(json["error"] as? String ?? "服务器转码失败")
+      default: Thread.sleep(forTimeInterval: 1)
+      }
+    }
+    throw BadgeError.message("转码超时")
+  }
+
+  private func performBackendRequest(_ request: URLRequest, uploadFile: URL? = nil) throws -> Data {
+    let semaphore = DispatchSemaphore(value: 0)
+    var responseData: Data?
+    var responseError: Error?
+    var statusCode = 0
+    let completion: (Data?, URLResponse?, Error?) -> Void = { data, response, error in
+      responseData = data
+      responseError = error
+      statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+      semaphore.signal()
+    }
+    let task: URLSessionTask = uploadFile == nil
+      ? URLSession.shared.dataTask(with: request, completionHandler: completion)
+      : URLSession.shared.uploadTask(with: request, fromFile: uploadFile!, completionHandler: completion)
+    task.resume()
+    semaphore.wait()
+    if let responseError { throw responseError }
+    guard (200...299).contains(statusCode) else {
+      let message = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? "HTTP \(statusCode)"
+      throw BadgeError.message(message)
+    }
+    return responseData ?? Data()
+  }
+
+  private func downloadBackendFile(url: URL, target: URL) throws -> URL {
+    let semaphore = DispatchSemaphore(value: 0)
+    var responseError: Error?
+    var statusCode = 0
+    var copied = false
+    let task = URLSession.shared.downloadTask(with: url) { temporary, response, error in
+      responseError = error
+      statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+      if let temporary, (200...299).contains(statusCode) {
+        do {
+          try? FileManager.default.removeItem(at: target)
+          try FileManager.default.copyItem(at: temporary, to: target)
+          copied = true
+        } catch {
+          responseError = error
+        }
+      }
+      semaphore.signal()
+    }
+    task.resume()
+    semaphore.wait()
+    if let responseError { throw responseError }
+    guard copied else { throw BadgeError.message("下载失败 HTTP \(statusCode)") }
+    return target
   }
 
   private func validUserDeviceCommand(id: String, crc32: String) -> Bool {
@@ -1712,8 +1916,22 @@ import UIKit
   }
 
   private func parseSdAvailable(_ status: String) -> Bool {
+    badgeHardware = parseBadgeHardware(status)
     status.split { $0 == " " || $0 == "\n" || $0 == "\r" || $0 == "\t" }
       .contains { token in token.lowercased() == "sd=1" || token.lowercased() == "storage=sd" }
+  }
+
+  private func parseBadgeHardware(_ status: String) -> String {
+    let token = status
+      .split { $0 == " " || $0 == "\n" || $0 == "\r" || $0 == "\t" }
+      .first { $0.lowercased().hasPrefix("hardware=") }
+    return token?.split(separator: "=", maxSplits: 1).last?.lowercased() == "esp32p4"
+      ? "esp32p4"
+      : "esp32s3"
+  }
+
+  private func normalizeBadgeHardware(_ value: String?) -> String {
+    value?.lowercased() == "esp32p4" ? "esp32p4" : "esp32s3"
   }
 
   private func sendConnectionEvent(connected: Bool, connecting: Bool, message: String) {
@@ -1723,6 +1941,7 @@ import UIKit
       "connecting": connecting,
       "address": nullable(connectedAddress),
       "sdAvailable": sdAvailable,
+      "hardware": badgeHardware,
       "message": message,
     ])
   }

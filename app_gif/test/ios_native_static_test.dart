@@ -106,6 +106,27 @@ void main() {
     expect(source, contains('resultMap["deviceKey"]'));
   });
 
+  test('iOS server transcode keeps S3 and P4 packages separated', () {
+    final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
+
+    expect(source, contains('case "transcodeOnServer"'));
+    expect(source, contains('case "downloadApprovedPackage"'));
+    expect(
+      source,
+      contains('hardware: normalizeBadgeHardware(args["hardware"] as? String)'),
+    );
+    expect(source, contains('"hardware": hardware'));
+    expect(source, contains(r'/package?hardware=\(hardware)'));
+    expect(source, contains('X-Esp-Baji-Filename'));
+    expect(source, contains('X-Esp-Baji-Params'));
+    expect(
+      source,
+      contains(
+        'URLSession.shared.uploadTask(with: request, fromFile: uploadFile!, completionHandler: completion)',
+      ),
+    );
+  });
+
   test('iOS RGB332 palette helper calls are defined', () {
     final source = File('ios/Runner/AppDelegate.swift').readAsStringSync();
     final definitions = RegExp(

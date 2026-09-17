@@ -21,9 +21,10 @@ class FactoryCatalogSync {
   }
 
   static Future<List<Map<String, dynamic>>> syncOnce({
-    required Uri backendBase,
+    required List<Uri> backendBases,
     required Directory cacheRoot,
     required List<Map<String, dynamic>> builtIn,
+    required String hardware,
   }) async {
     final installFile = File(
       '${cacheRoot.path}${Platform.pathSeparator}$installFileName',
@@ -31,12 +32,27 @@ class FactoryCatalogSync {
     final installed = await _readJsonFile(installFile);
     Map<String, dynamic>? remote;
     try {
-      remote = await _fetchJson(backendBase.resolve('/api/factory-catalog'));
-      remote = await _downloadAppFiles(
-        backendBase: backendBase,
-        cacheRoot: cacheRoot,
-        remote: remote,
-      );
+      Object? lastError;
+      for (final backendBase in backendBases) {
+        try {
+          final hardwareQuery = Uri.encodeQueryComponent(hardware);
+          remote = await _fetchJson(
+            backendBase.resolve('/api/factory-catalog?hardware=$hardwareQuery'),
+          );
+          remote = await _downloadAppFiles(
+            backendBase: backendBase,
+            cacheRoot: cacheRoot,
+            remote: remote,
+          );
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (remote == null) {
+        throw lastError ?? HttpException('no backend configured');
+      }
       await _deleteRemovedInstalledFiles(cacheRoot, installed, remote);
       await installFile.parent.create(recursive: true);
       await installFile.writeAsString(json.encode(remote), flush: true);

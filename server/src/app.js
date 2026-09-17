@@ -2,6 +2,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
+const { spawn } = require('node:child_process');
+const { transcodeToEbaj, ffprobeVideo, normalizeTranscodeHardware, selectOutputFps } = require('./transcode');
 
 const defaultVersions = {
   android: {
@@ -64,6 +66,13 @@ function loadJson(file, fallback) {
   }
 }
 
+function loadHistoryJson(file, fallback) {
+  const data = loadJson(file, fallback);
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object' && data.version) return [data];
+  return JSON.parse(JSON.stringify(fallback));
+}
+
 function saveJson(file, data) {
   ensureDir(path.dirname(file));
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
@@ -74,6 +83,7 @@ function writeFileAtomicSync(file, data) {
   const tmpPath = `${file}.tmp-${process.pid}-${Date.now()}`;
   fs.writeFileSync(tmpPath, data);
   fs.renameSync(tmpPath, file);
+  fs.chmodSync(file, 0o644);
 }
 
 function sendJson(res, status, data) {
@@ -147,6 +157,7 @@ function publicAsset(item) {
     packageSize: item.packageSize,
     frameCount: item.frameCount,
     fps: item.fps,
+    hardware: item.hardware || 'esp32s3',
     previewMime: item.previewMime,
     previewUrl: item.previewPath ? `/api/admin/assets/${encodeURIComponent(item.id)}/preview` : null,
     submittedAt: item.submittedAt,
@@ -167,10 +178,14 @@ function duplicateStatusPriority(status) {
   return 2;
 }
 
-function findDuplicateAsset(items, packageSha256, crc32, packageSize) {
+function findDuplicateAsset(items, packageSha256, crc32, packageSize, hardware = 'esp32s3') {
+  const normalizedHardware = String(hardware || 'esp32s3').toLowerCase();
   let best = null;
   let bestPriority = Number.MAX_SAFE_INTEGER;
   for (const asset of items) {
+    if (String(asset.hardware || 'esp32s3').toLowerCase() !== normalizedHardware) {
+      continue;
+    }
     if (!duplicateAssetMatches(asset, packageSha256, crc32, packageSize)) {
       continue;
     }
@@ -181,6 +196,37 @@ function findDuplicateAsset(items, packageSha256, crc32, packageSize) {
     }
   }
   return best;
+}
+
+function inferEbajHardware(file) {
+  try {
+    const descriptor = fs.openSync(file, 'r');
+    const headerAndEntry = Buffer.alloc(60);
+    const bytesRead = fs.readSync(descriptor, headerAndEntry, 0, headerAndEntry.length, 0);
+    fs.closeSync(descriptor);
+    if (bytesRead < 55 || headerAndEntry.readUInt32LE(0) !== 0x344a4142) {
+      return 'esp32s3';
+    }
+    const tableOffset = headerAndEntry.readUInt32LE(16);
+    if (tableOffset + 11 >= bytesRead) {
+      return 'esp32s3';
+    }
+    return headerAndEntry[tableOffset + 10] === 0x20 ? 'esp32p4' : 'esp32s3';
+  } catch (_) {
+    return 'esp32s3';
+  }
+}
+
+function backfillAssetHardware(dataDir, metadataFile) {
+  const items = loadJson(metadataFile, []);
+  let changed = false;
+  for (const item of items) {
+    if (item.hardware === 'esp32s3' || item.hardware === 'esp32p4') continue;
+    const file = item.packagePath ? path.join(dataDir, item.packagePath) : '';
+    item.hardware = inferEbajHardware(file);
+    changed = true;
+  }
+  if (changed) saveJson(metadataFile, items);
 }
 
 function extractVersionFromFilename(filename) {
@@ -355,9 +401,11 @@ function saveFactoryCatalogAtomic(factoryCatalogFile, catalog) {
   writeFileAtomicSync(factoryCatalogFile, JSON.stringify(withProtectedBaseline(catalog), null, 2));
 }
 
-function publicFactoryCatalog(catalog) {
+function publicFactoryCatalog(catalog, hardware = null) {
+  const normalizedHardware = hardware ? String(hardware).toLowerCase() : null;
   return {
     schemaVersion: factorySchemaVersion,
+    ...(normalizedHardware ? { hardware: normalizedHardware } : {}),
     catalogRevision: catalog.catalogRevision || 0,
     publishedAt: catalog.publishedAt || new Date(0).toISOString(),
     items: catalog.items.map((item) => ({
@@ -368,7 +416,10 @@ function publicFactoryCatalog(catalog) {
       revision: item.revision || 0,
       minFirmwareVersion: item.minFirmwareVersion || '',
       appFiles: item.appFiles || {},
-      deviceFiles: item.deviceFiles || [],
+      deviceFiles: (item.deviceFiles || []).filter((file) => {
+        if (!normalizedHardware) return true;
+        return String(file.hardware || 'esp32s3').toLowerCase() === normalizedHardware;
+      }),
     })),
   };
 }
@@ -385,6 +436,14 @@ function validateFactoryTargetPath(targetPath) {
     throw Object.assign(new Error('invalid device file path'), { status: 400 });
   }
   return value;
+}
+
+function normalizeFactoryHardware(value) {
+  const hardware = String(value || 'esp32s3').toLowerCase();
+  if (hardware !== 'esp32s3' && hardware !== 'esp32p4') {
+    throw Object.assign(new Error('invalid factory hardware'), { status: 400 });
+  }
+  return hardware;
 }
 
 function safeStagePath(stageDir, relativePath) {
@@ -441,6 +500,7 @@ function stageFactoryImport(zipBuffer, factoryImportsDir) {
 
     const deviceFiles = [];
     for (const deviceFile of manifest.deviceFiles || []) {
+      const hardware = normalizeFactoryHardware(deviceFile.hardware || manifest.hardware);
       const targetPath = validateFactoryTargetPath(deviceFile.path);
       const sourceRel = String(deviceFile.source || '').replace(/\\/g, '/');
       const zipRel = `${itemRoot}/${sourceRel}`;
@@ -451,7 +511,7 @@ function stageFactoryImport(zipBuffer, factoryImportsDir) {
       const outPath = safeStagePath(stageDir, outRel);
       ensureDir(path.dirname(outPath));
       fs.writeFileSync(outPath, entries.get(zipRel));
-      deviceFiles.push({ path: targetPath, source: outRel });
+      deviceFiles.push({ path: targetPath, source: outRel, hardware });
     }
 
     candidates.push({
@@ -499,17 +559,31 @@ function publishFactoryCandidates({ factoryCatalogFile, factoryImportsDir, facto
     const deviceFiles = [];
     for (const deviceFile of candidate.deviceFiles || []) {
       const source = safeStagePath(stageDir, deviceFile.source);
-      const destination = path.join(itemDir, 'device', deviceFile.path);
+      const hardware = normalizeFactoryHardware(deviceFile.hardware);
+      const deviceRoot = hardware === 'esp32s3'
+        ? path.join(itemDir, 'device')
+        : path.join(itemDir, 'device', hardware);
+      const deviceUrlRoot = hardware === 'esp32s3'
+        ? `/downloads/factory/${candidate.id}/${revision}/device`
+        : `/downloads/factory/${candidate.id}/${revision}/device/${hardware}`;
+      const destination = path.join(deviceRoot, deviceFile.path);
       ensureDir(path.dirname(destination));
       fs.copyFileSync(source, destination);
       const stat = fs.statSync(destination);
       deviceFiles.push({
         path: deviceFile.path,
-        url: `/downloads/factory/${candidate.id}/${revision}/device/${deviceFile.path}`,
+        hardware,
+        url: `${deviceUrlRoot}/${deviceFile.path}`,
         size: stat.size,
         sha256: computeBufferSha256(fs.readFileSync(destination)),
       });
     }
+
+    const incomingHardware = new Set(deviceFiles.map((file) => file.hardware));
+    const preservedDeviceFiles = (existing?.deviceFiles || []).filter((file) => {
+      const hardware = String(file.hardware || 'esp32s3').toLowerCase();
+      return !incomingHardware.has(hardware);
+    });
 
     const nextItem = {
       id: candidate.id,
@@ -519,8 +593,8 @@ function publishFactoryCandidates({ factoryCatalogFile, factoryImportsDir, facto
       revision,
       minFirmwareVersion: candidate.minFirmwareVersion,
       publishedAt: now,
-      appFiles,
-      deviceFiles,
+      appFiles: Object.keys(appFiles).length > 0 ? appFiles : (existing?.appFiles || {}),
+      deviceFiles: [...preservedDeviceFiles, ...deviceFiles],
       history: [
         ...(existing?.history || []),
         ...(existing ? [{
@@ -695,6 +769,53 @@ function readMultipart(req) {
       resolve(parts);
     });
     req.on('error', reject);
+  });
+}
+
+function readBase64JsonHeader(req, name) {
+  const encoded = String(req.headers[name] || '');
+  if (!encoded) {
+    throw Object.assign(new Error(`missing ${name}`), { status: 400 });
+  }
+  try {
+    return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+  } catch (_) {
+    throw Object.assign(new Error(`invalid ${name}`), { status: 400 });
+  }
+}
+
+function streamRequestToFile(req, file, maxBytes = 1024 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(file, { flags: 'wx' });
+    let size = 0;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      output.destroy();
+      fs.rmSync(file, { force: true });
+      reject(error);
+    };
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        fail(Object.assign(new Error('video file too large'), { status: 413 }));
+        req.destroy();
+      }
+    });
+    req.on('error', fail);
+    output.on('error', fail);
+    output.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      if (size === 0) {
+        fs.rmSync(file, { force: true });
+        reject(Object.assign(new Error('video file missing'), { status: 400 }));
+        return;
+      }
+      resolve(size);
+    });
+    req.pipe(output);
   });
 }
 
@@ -1503,6 +1624,8 @@ function createApp(options = {}) {
   const factoryCatalogFile = path.join(dataDir, 'factory_catalog.json');
   const factoryImportsDir = path.join(dataDir, 'factory_imports');
   const factoryDownloadsDir = path.join(downloadsDir, 'factory');
+  const transcodesDir = path.join(dataDir, 'transcodes');
+  const transcodeJobs = new Map();
   const factoryPreviewDirs = [
     path.join(assetsDir, 'factory_previews'),
     path.join(__dirname, '..', 'factory_previews'),
@@ -1515,11 +1638,13 @@ function createApp(options = {}) {
   ensureDir(firmwareDir);
   ensureDir(factoryImportsDir);
   ensureDir(factoryDownloadsDir);
+  ensureDir(transcodesDir);
   loadJson(versionsFile, defaultVersions);
   loadJson(otaFile, defaultOta);
   loadJson(appVersionsFile, defaultAppVersionHistory);
   loadJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
   loadJson(metadataFile, []);
+  backfillAssetHardware(dataDir, metadataFile);
   loadFactoryCatalog(factoryCatalogFile);
 
   function getServerBaseUrl(req) {
@@ -1576,7 +1701,12 @@ function createApp(options = {}) {
 
       if (req.method === 'GET' && url.pathname === '/api/factory-catalog') {
         const catalog = loadFactoryCatalog(factoryCatalogFile);
-        sendJson(res, 200, publicFactoryCatalog(catalog));
+        const hardware = (url.searchParams.get('hardware') || 'esp32s3').toLowerCase();
+        if (hardware !== 'esp32s3' && hardware !== 'esp32p4') {
+          sendJson(res, 404, { error: 'unknown hardware' });
+          return;
+        }
+        sendJson(res, 200, publicFactoryCatalog(catalog, hardware));
         return;
       }
 
@@ -1639,7 +1769,7 @@ function createApp(options = {}) {
           return;
         }
         const platform = (url.searchParams.get('platform') || 'android').toLowerCase();
-        const items = loadJson(appVersionsFile, defaultAppVersionHistory)
+        const items = loadHistoryJson(appVersionsFile, defaultAppVersionHistory)
           .filter((item) => item.platform === platform);
         sendJson(res, 200, { platform, items });
         return;
@@ -1651,7 +1781,7 @@ function createApp(options = {}) {
           return;
         }
         const hardware = (url.searchParams.get('hardware') || 'esp32s3').toLowerCase();
-        const items = loadJson(firmwareVersionsFile, defaultFirmwareVersionHistory)
+        const items = loadHistoryJson(firmwareVersionsFile, defaultFirmwareVersionHistory)
           .filter((item) => item.hardware === hardware);
         sendJson(res, 200, { hardware, items });
         return;
@@ -1665,7 +1795,7 @@ function createApp(options = {}) {
         }
         const platform = decodeURIComponent(deleteAppVersionMatch[1]).toLowerCase();
         const version = decodeURIComponent(deleteAppVersionMatch[2]);
-        const history = loadJson(appVersionsFile, defaultAppVersionHistory);
+        const history = loadHistoryJson(appVersionsFile, defaultAppVersionHistory);
         const index = history.findIndex((item) => item.platform === platform && item.version === version);
         if (index === -1) {
           sendJson(res, 404, { error: 'version not found' });
@@ -1690,7 +1820,7 @@ function createApp(options = {}) {
         }
         const hardware = decodeURIComponent(deleteFirmwareVersionMatch[1]).toLowerCase();
         const version = decodeURIComponent(deleteFirmwareVersionMatch[2]);
-        const history = loadJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
+        const history = loadHistoryJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
         const index = history.findIndex((item) => item.hardware === hardware && item.version === version);
         if (index === -1) {
           sendJson(res, 404, { error: 'version not found' });
@@ -1735,7 +1865,7 @@ function createApp(options = {}) {
         const baseUrl = getServerBaseUrl(req);
         const storeUrl = `${baseUrl}/downloads/apk/${encodeURIComponent(apkName)}`;
 
-        let history = loadJson(appVersionsFile, defaultAppVersionHistory);
+        let history = loadHistoryJson(appVersionsFile, defaultAppVersionHistory);
         history = upsertHistoryItem(history, {
           platform: 'android',
           version,
@@ -1765,17 +1895,23 @@ function createApp(options = {}) {
         let filePart = null;
         let version = '';
         let notes = '';
+        let hardware = 'esp32s3';
         for (const part of parts) {
           if (part.name === 'file' && part.filename) filePart = part;
           else if (part.name === 'version') version = part.data.toString('utf8').trim();
           else if (part.name === 'notes') notes = part.data.toString('utf8').trim();
+          else if (part.name === 'hardware') hardware = part.data.toString('utf8').trim().toLowerCase();
         }
         if (!filePart) {
           sendJson(res, 400, { error: 'missing file' });
           return;
         }
+        if (!['esp32s3', 'esp32p4-2.8', 'esp32p4-2.5'].includes(hardware)) {
+          sendJson(res, 400, { error: 'unknown firmware hardware' });
+          return;
+        }
         version = sanitizeVersion(version, extractVersionFromFilename(filePart.filename) || '0.1.0');
-        const fwName = `esp-baji-esp32s3-${version}.bin`;
+        const fwName = `esp-baji-${hardware}-${version}.bin`;
         const fwPath = path.join(firmwareDir, fwName);
         writeFileAtomicSync(fwPath, filePart.data);
 
@@ -1783,9 +1919,9 @@ function createApp(options = {}) {
         const baseUrl = getFirmwareBaseUrl(req);
         const fwUrl = `${baseUrl}/downloads/firmware/${encodeURIComponent(fwName)}`;
 
-        let history = loadJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
+        let history = loadHistoryJson(firmwareVersionsFile, defaultFirmwareVersionHistory);
         history = upsertHistoryItem(history, {
-          hardware: 'esp32s3',
+          hardware,
           version,
           filename: fwName,
           url: fwUrl,
@@ -1797,7 +1933,7 @@ function createApp(options = {}) {
         saveJson(firmwareVersionsFile, history);
 
         const manifests = loadJson(otaFile, defaultOta);
-        syncFirmwareManifestFromHistory(manifests, history, 'esp32s3');
+        syncFirmwareManifestFromHistory(manifests, history, hardware);
         saveJson(otaFile, manifests);
         sendJson(res, 200, manifests);
         return;
@@ -1901,15 +2037,203 @@ function createApp(options = {}) {
         return;
       }
 
+      /* ------------------------------------------------------------------
+       * Video transcoding: the phone uploads the source video + crop params,
+       * the server decodes/samples with FFmpeg and packs the EBAJ4 package,
+       * then the package enters the normal asset review flow (/api/assets).
+       * ------------------------------------------------------------------ */
+      if (req.method === 'POST' && url.pathname === '/api/transcode') {
+        let params = {};
+        let videoPart = null;
+        const contentType = String(req.headers['content-type'] || '');
+        const streamingUpload = !contentType.toLowerCase().startsWith('multipart/form-data');
+        if (streamingUpload) {
+          try {
+            params = readBase64JsonHeader(req, 'x-esp-baji-params');
+          } catch (error) {
+            sendJson(res, error.status || 400, { error: error.message });
+            return;
+          }
+          videoPart = {
+            filename: sanitizeName(req.headers['x-esp-baji-filename'] || 'source.mp4'),
+            data: null,
+          };
+        } else {
+          const parts = await readMultipart(req);
+          videoPart = parts.find((part) => part.filename);
+          const paramsPart = parts.find((part) => part.name === 'params');
+          if (paramsPart) {
+            try {
+              params = JSON.parse(paramsPart.data.toString('utf8'));
+            } catch (error) {
+              sendJson(res, 400, { error: 'invalid params JSON' });
+              return;
+            }
+          }
+        }
+        if (!videoPart || (videoPart.data && !videoPart.data.length)) {
+          sendJson(res, 400, { error: 'video file missing' });
+          return;
+        }
+        const requestedMaxFps = Number(params.maxFps ?? params.fps) || 80;
+        const streamSize = Number(params.streamSize) === 240 ? 240 : 480;
+        const crop = {
+          scale: Number((params.crop && params.crop.scale)) || 1,
+          offsetX: Number((params.crop && params.crop.offsetX)) || 0,
+          offsetY: Number((params.crop && params.crop.offsetY)) || 0,
+        };
+        const name = sanitizeName(params.name) || '用户素材';
+        const userId = String(params.userId || 'anonymous');
+        let hardware;
+        try {
+          hardware = normalizeTranscodeHardware(params.hardware);
+        } catch (error) {
+          sendJson(res, 400, { error: error.message });
+          return;
+        }
+
+        const jobId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const jobDir = path.join(transcodesDir, jobId);
+        ensureDir(jobDir);
+        const srcPath = path.join(jobDir, `source${path.extname(videoPart.filename) || '.mp4'}`);
+        if (streamingUpload) {
+          await streamRequestToFile(req, srcPath);
+        } else {
+          fs.writeFileSync(srcPath, videoPart.data);
+        }
+        const job = {
+          id: jobId,
+          status: 'transcoding',
+          name,
+          userId,
+          hardware,
+          fps: 0,
+          requestedMaxFps,
+          streamSize,
+          crop,
+          assetId: null,
+          error: null,
+        };
+        transcodeJobs.set(jobId, job);
+
+        (async () => {
+          try {
+            const info = await ffprobeVideo(srcPath).catch(() => ({ width: 0, height: 0, durationSec: 0 }));
+            if (info.width === 0 || info.height === 0) {
+              throw new Error('无法解析视频');
+            }
+            const fps = selectOutputFps(info.fps, requestedMaxFps);
+            job.fps = fps;
+            const outputPath = path.join(jobDir, 'package.ebaj');
+            const result = await transcodeToEbaj({
+              inputPath: srcPath, outputPath, fps, streamSize, crop, hardware,
+            });
+
+            const packageBytes = fs.readFileSync(outputPath);
+            const packageSha256 = computeBufferSha256(packageBytes);
+            const packageSize = packageBytes.length;
+            const crc32 = String(computeBufferCrc32(packageBytes) >>> 0);
+            const items = loadJson(metadataFile, []);
+            const duplicate = findDuplicateAsset(
+              items, packageSha256, crc32, packageSize, hardware,
+            );
+            if (duplicate && duplicate.packagePath &&
+                fs.existsSync(path.join(dataDir, duplicate.packagePath))) {
+              job.status = 'done';
+              job.assetId = duplicate.id;
+              return;
+            }
+
+            /* Generate a static preview (first frame) for the review page. */
+            let previewPath = null;
+            let previewMime = null;
+            const previewFile = path.join(previewsDir, `${jobId}.png`);
+            const previewVf = `scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2`;
+            const previewResult = await new Promise((resolve) => {
+              const child = spawn('ffmpeg', [
+                '-v', 'error', '-i', srcPath, '-frames:v', '1',
+                '-vf', previewVf, '-y', previewFile,
+              ]);
+              child.on('error', () => resolve(false));
+              child.on('exit', (code) => resolve(code === 0));
+            });
+            if (previewResult && fs.existsSync(previewFile)) {
+              previewPath = path.relative(dataDir, previewFile);
+              previewMime = 'image/png';
+            }
+
+            /* Enter the standard asset review flow. */
+            const id = crypto.randomUUID();
+            const packagePath = path.join(packagesDir, `${id}.eb4`);
+            fs.copyFileSync(outputPath, packagePath);
+            const item = {
+              id,
+              status: 'pending',
+              name,
+              userId,
+              hardware,
+              crc32,
+              packageSha256,
+              packageSize,
+              frameCount: Number(result.frameCount) || 0,
+              fps: Number(result.fps) || fps,
+              packagePath: path.relative(dataDir, packagePath),
+              previewPath,
+              previewMime,
+              submittedAt: new Date().toISOString(),
+            };
+            items.unshift(item);
+            saveJson(metadataFile, items);
+
+            job.status = 'done';
+            job.assetId = id;
+          } catch (error) {
+            job.status = 'failed';
+            job.error = error.message || String(error);
+          } finally {
+            fs.rmSync(srcPath, { force: true });
+          }
+        })();
+
+        sendJson(res, 202, { jobId, status: 'transcoding' });
+        return;
+      }
+
+      const transcodeStatusMatch = url.pathname.match(/^\/api\/transcode\/([^/]+)$/);
+      if (req.method === 'GET' && transcodeStatusMatch) {
+        const job = transcodeJobs.get(transcodeStatusMatch[1]);
+        if (!job) {
+          sendJson(res, 404, { error: 'job not found' });
+          return;
+        }
+        sendJson(res, 200, {
+          jobId: job.id,
+          status: job.status,
+          assetId: job.assetId,
+          fps: job.fps,
+          error: job.error,
+        });
+        return;
+      }
+
       if (req.method === 'POST' && url.pathname === '/api/assets') {
         const body = await readJsonBody(req);
-        const name = sanitizeName(body.name);
         const packageBytes = decodeBase64(body.packageBase64, 'packageBase64');
         const packageSha256 = computeBufferSha256(packageBytes);
         const packageSize = Number(body.packageSize) || packageBytes.length;
         const crc32 = String(body.crc32 || '');
+        const name = sanitizeName(body.name) || '用户素材';
+        let hardware;
+        try {
+          hardware = normalizeTranscodeHardware(body.hardware || 'esp32s3');
+        } catch (error) {
+          sendJson(res, 400, { error: error.message });
+          return;
+        }
         const items = loadJson(metadataFile, []);
-        const duplicate = findDuplicateAsset(items, packageSha256, crc32, packageSize);
+        const duplicate = findDuplicateAsset(
+          items, packageSha256, crc32, packageSize, hardware,
+        );
         if (duplicate) {
           const nextPreviewMime = sanitizePreviewMime(body.previewMime);
           const hasIncomingPreview = typeof body.previewBase64 === 'string' && body.previewBase64.length > 0;
@@ -1945,6 +2269,7 @@ function createApp(options = {}) {
           status: 'pending',
           name,
           userId: String(body.userId || 'anonymous'),
+          hardware,
           crc32,
           packageSha256,
           packageSize,
@@ -1967,6 +2292,30 @@ function createApp(options = {}) {
         const items = loadJson(metadataFile, []);
         const item = items.find((asset) => asset.id === id);
         sendJson(res, item ? 200 : 404, item ? publicAsset(item) : { error: 'asset not found' });
+        return;
+      }
+
+      /* Public preview for the app's history grid (no admin token). */
+      const assetPreviewMatch = url.pathname.match(/^\/api\/assets\/([^/]+)\/preview$/);
+      if (req.method === 'GET' && assetPreviewMatch) {
+        const id = assetPreviewMatch[1];
+        const items = loadJson(metadataFile, []);
+        const item = items.find((asset) => asset.id === id);
+        if (!item || !item.previewPath) {
+          sendJson(res, 404, { error: 'preview not found' });
+          return;
+        }
+        const file = path.join(dataDir, item.previewPath);
+        if (!fs.existsSync(file)) {
+          sendJson(res, 404, { error: 'preview not found' });
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': item.previewMime || 'application/octet-stream',
+          'content-length': fs.statSync(file).size,
+          'cache-control': 'no-store',
+        });
+        fs.createReadStream(file).pipe(res);
         return;
       }
 
@@ -2004,6 +2353,17 @@ function createApp(options = {}) {
         const item = items.find((asset) => asset.id === id);
         if (!item || item.status !== 'approved') {
           sendJson(res, item ? 403 : 404, { error: item ? 'asset not approved' : 'asset not found' });
+          return;
+        }
+        const requestedHardware = String(
+          url.searchParams.get('hardware') || 'esp32s3',
+        ).toLowerCase();
+        const assetHardware = String(item.hardware || 'esp32s3').toLowerCase();
+        if (requestedHardware !== assetHardware) {
+          sendJson(res, 409, {
+            error: 'asset package hardware mismatch',
+            expected: assetHardware,
+          });
           return;
         }
         const file = path.join(dataDir, item.packagePath);
@@ -2104,4 +2464,4 @@ function createApp(options = {}) {
   };
 }
 
-module.exports = { createApp };
+module.exports = { createApp, findDuplicateAsset };

@@ -20,16 +20,25 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
 
     expect(source, contains('ESP_BAJI_API_BASE'));
-    expect(source, contains("defaultValue: 'http://60.205.122.153'"));
+    expect(source, contains("defaultValue: ''"));
+    final failover = File('lib/backend_failover.dart').readAsStringSync();
+    expect(failover, contains("primaryBackendBase = 'http://47.108.204.22'"));
+    expect(failover, contains("fallbackBackendBase = 'http://60.205.122.153'"));
     expect(source, contains('_checkRemoteVersion'));
     expect(source, contains('/api/version'));
-    expect(source, contains("final storeUrl = _readNullableString(manifest['storeUrl']);"));
+    expect(
+      source,
+      contains("final storeUrl = _readNullableString(manifest['storeUrl']);"),
+    );
     expect(source, contains('_showUpdateSnack'));
     expect(source, contains("'openUrl'"));
     expect(source, contains('_submitAssetForReview'));
     expect(source, contains('_guessMimeFromPath'));
     expect(source, contains('_preferredReviewPreviewPath'));
-    expect(source, contains("'previewMime': _guessMimeFromPath(reviewPreviewPath)"));
+    expect(
+      source,
+      contains("'previewMime': _guessMimeFromPath(reviewPreviewPath)"),
+    );
     expect(source, contains('/api/assets'));
     expect(source, contains("reviewStatus: 'pending'"));
     expect(source, contains("reviewStatus: 'approved'"));
@@ -44,32 +53,47 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.18';"));
-    expect(pubspec, contains('version: 1.0.18+20'));
+    expect(source, contains("static const _appVersion = '1.0.22';"));
+    expect(pubspec, contains('version: 1.0.22+24'));
   });
 
   test('firmware project version is aligned with OTA release version', () {
-    final cmake = File('../ESP32-S3-LCD-2.8C-Test/CMakeLists.txt').readAsStringSync();
-    final mainCmake = File('../ESP32-S3-LCD-2.8C-Test/main/CMakeLists.txt').readAsStringSync();
+    final cmake = File(
+      '../ESP32-S3-LCD-2.8C-Test/CMakeLists.txt',
+    ).readAsStringSync();
+    final mainCmake = File(
+      '../ESP32-S3-LCD-2.8C-Test/main/CMakeLists.txt',
+    ).readAsStringSync();
 
-    expect(cmake, contains('set(PROJECT_VER "0.1.47")'));
+    expect(cmake, contains('set(PROJECT_VER "0.1.51")'));
     expect(
       mainCmake,
-      contains(r'target_compile_definitions(${COMPONENT_LIB} PRIVATE BADGE_FW_VERSION=\"${PROJECT_VER}\")'),
+      contains(
+        r'target_compile_definitions(${COMPONENT_LIB} PRIVATE BADGE_FW_VERSION=\"${PROJECT_VER}\")',
+      ),
     );
   });
 
-  test('maker save submits review before storing history and shows policy hint', () {
-    final source = File('lib/main.dart').readAsStringSync();
-    final saveStart = source.indexOf('Future<void> _saveMakerAsset()');
-    final submitAtSave = source.indexOf('_submitAssetForReview(asset)', saveStart);
-    final insertHistory = source.indexOf('_history.insert(0, entry)', saveStart);
+  test(
+    'maker save submits review before storing history and shows policy hint',
+    () {
+      final source = File('lib/main.dart').readAsStringSync();
+      final saveStart = source.indexOf('Future<void> _saveMakerAsset()');
+      final submitAtSave = source.indexOf(
+        '_submitAssetForReview(asset)',
+        saveStart,
+      );
+      final insertHistory = source.indexOf(
+        '_history.insert(0, entry)',
+        saveStart,
+      );
 
-    expect(source, contains('素材需审核，请勿上传非法素材'));
-    expect(submitAtSave, greaterThan(saveStart));
-    expect(insertHistory, greaterThan(submitAtSave));
-    expect(source, contains('素材已保存，已提交审核'));
-  });
+      expect(source, contains('素材需审核，请勿上传非法素材'));
+      expect(submitAtSave, greaterThan(saveStart));
+      expect(insertHistory, greaterThan(submitAtSave));
+      expect(source, contains('素材已保存，已提交审核'));
+    },
+  );
 
   test('video review waits for animated preview before moderation upload', () {
     final source = File('lib/main.dart').readAsStringSync();
@@ -78,7 +102,10 @@ void main() {
       '_withReviewPreviewReady(asset)',
       saveStart,
     );
-    final submitAtSave = source.indexOf('_submitAssetForReview(asset)', saveStart);
+    final submitAtSave = source.indexOf(
+      '_submitAssetForReview(asset)',
+      saveStart,
+    );
 
     expect(source, contains('Map<String, Completer<String?>>'));
     expect(source, contains('Future<PreparedAsset> _withReviewPreviewReady'));
@@ -101,46 +128,68 @@ void main() {
       source,
       contains("reviewStatus: (map['reviewStatus'] as String?) ?? 'local'"),
     );
-    expect(androidNative, contains('"reviewId" to item.optString("reviewId", null)'));
-    expect(androidNative, contains('"reviewStatus" to item.optString("reviewStatus", "local")'));
+    expect(
+      androidNative,
+      contains('"reviewId" to item.optString("reviewId", null)'),
+    );
+    expect(
+      androidNative,
+      contains('"reviewStatus" to item.optString("reviewStatus", "local")'),
+    );
     expect(androidNative, contains('item.put("reviewId", reviewId)'));
-    expect(androidNative, contains('item.put("reviewStatus", reviewStatus ?: "local")'));
+    expect(
+      androidNative,
+      contains('item.put("reviewStatus", reviewStatus ?: "local")'),
+    );
   });
 
   test('firmware holds single-frame assets instead of loop-rendering them', () {
-    final display = File('../ESP32-S3-LCD-2.8C-Test/main/Badge/BadgeDisplay.c').readAsStringSync();
+    final display = File(
+      '../ESP32-S3-LCD-2.8C-Test/main/Badge/BadgeDisplay.c',
+    ).readAsStringSync();
 
     expect(display, contains('BADGE_PLAYER_YIELD_EVERY_FRAMES'));
     expect(display, contains('BADGE_STATIC_FRAME_HOLD_POLL_MS'));
     expect(display, contains('badge_player_yield_if_needed'));
     expect(display, contains('vTaskDelay(pdMS_TO_TICKS(1))'));
     expect(display, contains('asset->header.frame_count == 1'));
-    expect(display, contains('single-frame asset rendered once; holding framebuffer'));
+    expect(
+      display,
+      contains('single-frame asset rendered once; holding framebuffer'),
+    );
     expect(display, isNot(contains('esp_freertos_hooks.h')));
     expect(display, isNot(contains('esp_register_freertos_idle_hook')));
     expect(display, isNot(contains('static_hold_prevent_waiti')));
   });
 
-  test('history grid visually distinguishes unreviewed and rejected assets', () {
-    final source = File('lib/main.dart').readAsStringSync();
+  test(
+    'history grid visually distinguishes unreviewed and rejected assets',
+    () {
+      final source = File('lib/main.dart').readAsStringSync();
 
-    expect(source, contains('_reviewOverlayColor'));
-    expect(source, contains('_reviewStatusLabel'));
-    expect(source, contains("return '违规';"));
-    expect(source, contains("return '未审核';"));
-    expect(source, contains("entry.reviewStatus == 'approved'"));
-    expect(source, contains('Colors.redAccent.withValues'));
-  });
+      expect(source, contains('_reviewOverlayColor'));
+      expect(source, contains('_reviewStatusLabel'));
+      expect(source, contains("return '违规';"));
+      expect(source, contains("return '未审核';"));
+      expect(source, contains("entry.reviewStatus == 'approved'"));
+      expect(source, contains('Colors.redAccent.withValues'));
+    },
+  );
 
   test('pending review statuses refresh while the app stays open', () {
     final source = File('lib/main.dart').readAsStringSync();
     final timerStart = source.indexOf('void _restartConnectionTimer()');
-    final timerEnd = source.indexOf('Future<void> _handleNativeCall', timerStart);
+    final timerEnd = source.indexOf(
+      'Future<void> _handleNativeCall',
+      timerStart,
+    );
 
     expect(timerStart, isNot(-1));
     expect(timerEnd, isNot(-1));
     final timerSource = source.substring(timerStart, timerEnd);
-    final reviewRefresh = timerSource.indexOf('_refreshHistoryReviewStatuses()');
+    final reviewRefresh = timerSource.indexOf(
+      '_refreshHistoryReviewStatuses()',
+    );
     final connectionRefresh = timerSource.indexOf('_refreshConnectionState()');
 
     expect(source, contains('bool _reviewRefreshInFlight = false;'));

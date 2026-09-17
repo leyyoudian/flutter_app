@@ -12,6 +12,7 @@ import 'package:video_player/video_player.dart';
 import 'factory_catalog_sync.dart';
 import 'device_asset_delete.dart';
 import 'transcode_policy.dart';
+import 'backend_failover.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -70,11 +71,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   static const _channel = MethodChannel('esp_baji/native');
   static const _privacyPolicyUrl =
       'https://leyyoudian.github.io/flutter_app/privacy.html';
-  static const _backendBaseUrl = String.fromEnvironment(
+  static const _backendBaseOverride = String.fromEnvironment(
     'ESP_BAJI_API_BASE',
-    defaultValue: 'http://10.25.140.205:8787',
+    defaultValue: '',
   );
-  static const _appVersion = '1.0.21';
+  static const _appVersion = '1.0.22';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -102,6 +103,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   double _uploadProgress = 0;
   String _status = '未连接';
   String? _connectedAddress;
+  String _connectedHardware = 'esp32s3';
   SelectedMedia? _media;
   PreparedAsset? _asset;
   CropTransform _cropTransform = const CropTransform();
@@ -206,17 +208,22 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         break;
       case 'connectionState':
         final wasConnected = _connected;
+        final previousHardware = _connectedHardware;
         setState(() {
           _connected = event['connected'] == true;
           _connecting = event['connecting'] == true;
           _sdAvailable = event['sdAvailable'] == true;
           _connectedAddress = event['address'] as String?;
+          _connectedHardware = _normalizeHardware(event['hardware']);
           _status =
               (event['message'] as String?) ?? (_connected ? '已连接' : '未连接');
         });
         if (_connected && !wasConnected) {
           unawaited(_refreshRandomMode());
           unawaited(_reconcilePendingDeviceDeletes());
+        }
+        if (_connected && previousHardware != _connectedHardware) {
+          unawaited(_loadFactoryAnimations());
         }
         break;
       case 'status':
@@ -313,9 +320,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         return;
       }
       final synced = await FactoryCatalogSync.syncOnce(
-        backendBase: Uri.parse(_backendBaseUrl),
+        backendBases: _backendBases,
         cacheRoot: Directory(cacheRoot),
         builtIn: builtIn,
+        hardware: _connectedHardware,
       );
       if (!mounted) return;
       setState(() {
@@ -654,10 +662,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
     final state = _asStringMap(result);
     final wasConnected = _connected;
+    final previousHardware = _connectedHardware;
     setState(() {
       _connected = state['connected'] == true;
       _sdAvailable = state['sdAvailable'] == true;
       _connectedAddress = state['address'] as String?;
+      _connectedHardware = _normalizeHardware(state['hardware']);
       _status =
           (state['message'] as String?) ??
           (_connected ? '已连接' : (wasConnected ? '断开连接' : '未连接'));
@@ -665,6 +675,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     if (_connected && !wasConnected) {
       unawaited(_refreshRandomMode());
       unawaited(_reconcilePendingDeviceDeletes());
+    }
+    if (_connected && previousHardware != _connectedHardware) {
+      unawaited(_loadFactoryAnimations());
     }
   }
 
@@ -772,20 +785,23 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     try {
       final useServerTranscode = _isVideoMime(media.mime);
       if (useServerTranscode) {
-        /* Server-side transcoding (P4): the phone only uploads the source
-         * video + crop params; the server decodes and packs the EBAJ4
-         * package, which then enters the normal review flow. */
+        /* Server-side transcoding: the phone only uploads the source video
+         * and crop params. The server selects the S3 indexed or P4 JPEG
+         * EBAJ4 payload from the connected hardware. */
         setState(() => _status = '上传服务器解码');
         final transcodeResult =
-            await _invokeNative<Map<dynamic, dynamic>>('transcodeOnServer', {
-              'uri': media.uri,
-              'name': media.name,
-              'maxFps': p4MaxTranscodeFps,
-              'cropScale': _cropTransform.scale,
-              'cropOffsetX': _cropTransform.offset.dx,
-              'cropOffsetY': _cropTransform.offset.dy,
-              'backendBase': _backendBaseUrl,
-            });
+            await _invokeBackendNative<Map<dynamic, dynamic>>(
+              'transcodeOnServer',
+              {
+                'uri': media.uri,
+                'name': media.name,
+                'maxFps': p4MaxTranscodeFps,
+                'cropScale': _cropTransform.scale,
+                'cropOffsetX': _cropTransform.offset.dx,
+                'cropOffsetY': _cropTransform.offset.dy,
+                'hardware': _connectedHardware,
+              },
+            );
         if (!mounted || transcodeResult == null) {
           return;
         }
@@ -923,12 +939,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
      * the backend before pushing to the device. */
     if (approvedAsset.assetPath.isEmpty && approvedAsset.reviewId != null) {
       setState(() => _status = '下载素材包');
-      final downloadResult = await _invokeNative<Map<dynamic, dynamic>>(
+      final downloadResult = await _invokeBackendNative<Map<dynamic, dynamic>>(
         'downloadApprovedPackage',
         {
           'assetId': approvedAsset.reviewId,
           'name': approvedAsset.name,
-          'backendBase': _backendBaseUrl,
+          'hardware': _connectedHardware,
         },
       );
       if (!mounted || downloadResult == null) {
@@ -1031,41 +1047,59 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
-  Uri _backendUri(String path) {
-    final base = Uri.parse(_backendBaseUrl);
-    return base.resolve(path);
+  List<Uri> get _backendBases =>
+      backendBaseCandidates(overrideBase: _backendBaseOverride);
+
+  bool _retryBackendError(Object error) {
+    if (error is BackendRequestException) return error.retryable;
+    return error is SocketException ||
+        error is TimeoutException ||
+        error is HandshakeException ||
+        error is PlatformException;
   }
 
   Future<Map<String, dynamic>?> _getBackendJson(String path) async {
-    final client = HttpClient();
-    try {
-      final request = await client.getUrl(_backendUri(path));
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-      final response = await request.close();
-      final text = await response.transform(utf8.decoder).join();
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException(text, uri: _backendUri(path));
-      }
-      return _asStringMap(json.decode(text));
-    } finally {
-      client.close(force: true);
-    }
+    return withBackendFailover<Map<String, dynamic>?>(
+      _backendBases,
+      (base) => _requestBackendJson(base.resolve(path)),
+      shouldRetry: _retryBackendError,
+    );
   }
 
   Future<Map<String, dynamic>?> _postBackendJson(
     String path,
     Map<String, Object?> body,
   ) async {
-    final client = HttpClient();
+    return withBackendFailover<Map<String, dynamic>?>(
+      _backendBases,
+      (base) => _requestBackendJson(base.resolve(path), body: body),
+      shouldRetry: _retryBackendError,
+    );
+  }
+
+  Future<Map<String, dynamic>> _requestBackendJson(
+    Uri uri, {
+    Map<String, Object?>? body,
+  }) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
     try {
-      final request = await client.postUrl(_backendUri(path));
-      request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      final request = body == null
+          ? await client.getUrl(uri)
+          : await client.postUrl(uri);
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-      request.write(json.encode(body));
-      final response = await request.close();
+      if (body != null) {
+        request.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+        request.write(json.encode(body));
+      }
+      final response = await request.close().timeout(
+        const Duration(seconds: 15),
+      );
       final text = await response.transform(utf8.decoder).join();
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException(text, uri: _backendUri(path));
+        throw BackendRequestException(
+          text.isEmpty ? 'HTTP ${response.statusCode}' : text,
+          retryable: response.statusCode >= 500,
+        );
       }
       return _asStringMap(json.decode(text));
     } finally {
@@ -1140,6 +1174,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       'packageSize': asset.packageSize,
       'frameCount': asset.frameCount,
       'fps': asset.fps,
+      'hardware': _connectedHardware,
     });
     final reviewId = _readNullableString(result?['id']);
     final reviewStatus = _readNullableString(result?['status']);
@@ -1304,6 +1339,20 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     } on MissingPluginException {
       return null;
     }
+  }
+
+  Future<T?> _invokeBackendNative<T>(
+    String method,
+    Map<String, Object?> arguments,
+  ) {
+    return withBackendFailover<T?>(
+      _backendBases,
+      (base) => _invokeNative<T>(method, {
+        ...arguments,
+        'backendBase': base.toString(),
+      }),
+      shouldRetry: _retryBackendError,
+    );
   }
 
   Future<void> _openPrivacyPolicyUrl() async {
@@ -3766,6 +3815,10 @@ String? _readNullableString(Object? value) {
     return value;
   }
   return null;
+}
+
+String _normalizeHardware(Object? value) {
+  return value?.toString().toLowerCase() == 'esp32p4' ? 'esp32p4' : 'esp32s3';
 }
 
 bool _hasPreviewPath(String? path) =>

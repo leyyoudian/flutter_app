@@ -95,6 +95,7 @@ class MainActivity : FlutterActivity() {
     @Volatile private var isUploading = false
     @Volatile private var badgeWifiNetwork: Network? = null
     @Volatile private var badgeSdAvailable = false
+    @Volatile private var badgeHardware = "esp32s3"
     @Volatile private var badgeWifiManagedRequest = false
     @Volatile private var badgeDirectIpMode = false
     @Volatile private var activeBadgeHost = BADGE_AP_HOST
@@ -113,6 +114,11 @@ class MainActivity : FlutterActivity() {
     private data class DiscoveredBadge(
         val host: String,
         val status: String,
+    )
+
+    private data class TranscodeJobResult(
+        val assetId: String,
+        val fps: Int,
     )
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -277,11 +283,52 @@ class MainActivity : FlutterActivity() {
                 }
                 uploadAsset(assetPath, result)
             }
+            "transcodeOnServer" -> {
+                val uri = call.argument<String>("uri")
+                if (uri.isNullOrBlank()) {
+                    result.error("bad_uri", "素材地址为空", null)
+                    return
+                }
+                val name = call.argument<String>("name") ?: "asset"
+                val maxFps = (call.argument<Int>("maxFps") ?: 80).coerceIn(1, 80)
+                val crop = CropTransform(
+                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(1.0, 4.0),
+                    offsetX = (call.argument<Double>("cropOffsetX") ?: 0.0).coerceIn(-1.5, 1.5),
+                    offsetY = (call.argument<Double>("cropOffsetY") ?: 0.0).coerceIn(-1.5, 1.5),
+                )
+                val backendBase = call.argument<String>("backendBase")
+                    ?: "http://47.108.204.22"
+                val hardware = normalizeBadgeHardware(call.argument<String>("hardware"))
+                transcodeOnServer(uri, name, maxFps, crop, hardware, backendBase, result)
+            }
+            "downloadApprovedPackage" -> {
+                val assetId = call.argument<String>("assetId")
+                if (assetId.isNullOrBlank()) {
+                    result.error("bad_asset", "素材 ID 为空", null)
+                    return
+                }
+                val name = call.argument<String>("name") ?: "asset"
+                val backendBase = call.argument<String>("backendBase")
+                    ?: "http://47.108.204.22"
+                val hardware = normalizeBadgeHardware(call.argument<String>("hardware"))
+                downloadApprovedPackage(assetId, name, hardware, backendBase, result)
+            }
             "loadHistory" -> loadHistory(result)
             "saveHistory" -> {
                 val items = call.arguments as? List<*> ?: emptyList<Any>()
                 saveHistory(items)
                 result.success(null)
+            }
+            "loadPendingDeviceDeletes" -> {
+                result.success(loadPendingDeviceDeletes())
+            }
+            "savePendingDeviceDeletes" -> {
+                val items = call.arguments as? List<*> ?: emptyList<Any>()
+                if (savePendingDeviceDeletes(items)) {
+                    result.success(null)
+                } else {
+                    result.error("delete_queue_save_failed", "删除队列保存失败", null)
+                }
             }
             "deleteAssetFiles" -> {
                 val map = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
@@ -309,7 +356,31 @@ class MainActivity : FlutterActivity() {
                     result.error("bad_id", "素材ID为空", null)
                     return
                 }
-                switchToAsset(id, result)
+                switchToAsset(id, call.argument<String>("crc32"), result)
+            }
+            "getDeviceIdentity" -> {
+                runDeviceCommand("IDENTITY\n", "identity_failed", result) { response ->
+                    parseDeviceKey(response)
+                        ?: throw IllegalStateException(response.ifBlank { "设备身份读取失败" })
+                }
+            }
+            "statDeviceAsset" -> {
+                val id = call.argument<String>("id")
+                val crc32 = call.argument<String>("crc32")
+                if (!validUserDeviceCommand(id, crc32)) {
+                    result.error("bad_asset_identity", "素材身份无效", null)
+                    return
+                }
+                runDeviceCommand("STAT $id $crc32\n", "asset_stat_failed", result) { it }
+            }
+            "deleteDeviceAsset" -> {
+                val id = call.argument<String>("id")
+                val crc32 = call.argument<String>("crc32")
+                if (!validUserDeviceCommand(id, crc32)) {
+                    result.error("bad_asset_identity", "素材身份无效", null)
+                    return
+                }
+                runDeviceCommand("DELETE $id $crc32\n", "asset_delete_failed", result) { it }
             }
             "setRandomMode" -> {
                 val enabled = call.argument<Boolean>("enabled") == true
@@ -915,9 +986,15 @@ class MainActivity : FlutterActivity() {
                 val packageInfo = preparePackageForUpload(file)
                 sendEvent(mapOf("type" to "uploadProgress", "progress" to 0.0, "message" to "发送到设备"))
                 val assignedId = uploadAssetWithRetry(packageInfo)
+                val deviceKey = if (assignedId != null) {
+                    runCatching { readDeviceIdentity() }.getOrNull()
+                } else {
+                    null
+                }
                 sendEvent(mapOf("type" to "uploadProgress", "progress" to 1.0, "message" to "已切换显示"))
                 val resultMap = mutableMapOf<String, Any?>()
                 if (assignedId != null) resultMap["assignedId"] = assignedId
+                if (deviceKey != null) resultMap["deviceKey"] = deviceKey
                 mainHandler.post { result.success(resultMap.ifEmpty { null }) }
             } catch (error: Exception) {
                 if (connectedAddress == null || badgeWifiNetwork == null) {
@@ -946,6 +1023,248 @@ class MainActivity : FlutterActivity() {
         runCatching {
             stopService(Intent(this, UploadKeepAliveService::class.java))
         }
+    }
+
+    /* ------------------------------------------------------------------
+     * Server-side transcoding flow (P4 devices):
+     *   upload source video + crop params  ->  POST /api/transcode
+     *   poll job status                    ->  GET  /api/transcode/:jobId
+     *   poll review status                 ->  GET  /api/assets/:assetId
+     *   download approved package          ->  GET  /api/assets/:assetId/package
+     *   push the package to the badge      ->  existing uploadAsset flow
+     * ------------------------------------------------------------------ */
+
+    private fun transcodeOnServer(
+        uriText: String,
+        name: String,
+        maxFps: Int,
+        crop: CropTransform,
+        hardware: String,
+        backendBase: String,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                sendEvent(mapOf("type" to "transcodeProgress", "stage" to "upload", "message" to "上传素材到服务器"))
+                val uri = Uri.parse(uriText)
+                val mime = normalizeMime(contentResolver.getType(uri), name)
+                val size = querySize(uri)
+                if (isVideoMime(mime) && size > MAX_VIDEO_INPUT_BYTES) {
+                    throw IllegalArgumentException("视频文件过大")
+                }
+
+                val backend = backendBase.trimEnd('/')
+                val params = JSONObject()
+                    .put("name", name)
+                    .put("maxFps", maxFps)
+                    .put("streamSize", 480)
+                    .put("userId", userIdForUpload())
+                    .put("hardware", hardware)
+                    .put("crop", JSONObject()
+                        .put("scale", crop.scale)
+                        .put("offsetX", crop.offsetX)
+                        .put("offsetY", crop.offsetY))
+
+                val jobId = postTranscodeJob(backend, uri, params)
+                if (jobId.isNullOrBlank()) {
+                    throw IllegalStateException("服务器未接受转码任务")
+                }
+                android.util.Log.i("BadgeTranscode", "job submitted: $jobId")
+
+                sendEvent(mapOf("type" to "transcodeProgress", "stage" to "transcoding", "message" to "服务器解码中"))
+                val transcodeJob = waitTranscodeDone(backend, jobId)
+                val assetId = transcodeJob.assetId
+
+                /* Pull the review preview so the history grid has a
+                 * thumbnail for server-transcoded assets too. */
+                val directory = persistentAssetDirectory("ebaj")
+                val stem = "${System.currentTimeMillis()}_${safeFileName(name)}"
+                val previewFile = File(directory, "$stem.png")
+                val previewPath = if (downloadAssetPreview(backend, assetId, previewFile)) {
+                    previewFile.absolutePath
+                } else {
+                    null
+                }
+
+                val response = mapOf(
+                    "reviewId" to assetId,
+                    "reviewStatus" to "pending",
+                    "fps" to transcodeJob.fps,
+                    "previewPath" to previewPath,
+                )
+                mainHandler.post { result.success(response) }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("transcode_failed", error.message ?: "服务器转码失败", null)
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadApprovedPackage(
+        assetId: String,
+        name: String,
+        hardware: String,
+        backendBase: String,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                val backend = backendBase.trimEnd('/')
+                sendEvent(mapOf("type" to "transcodeProgress", "stage" to "download", "message" to "下载素材包"))
+                val directory = persistentAssetDirectory("ebaj")
+                val file = File(directory, "${System.currentTimeMillis()}_${safeFileName(name)}.ebaj")
+                if (!downloadAssetPackage(backend, assetId, hardware, file)) {
+                    throw IllegalStateException("素材包下载失败")
+                }
+                android.util.Log.i("BadgeTranscode", "downloaded ${file.length()} bytes to ${file.absolutePath}")
+                val response = mapOf("assetPath" to file.absolutePath)
+                mainHandler.post { result.success(response) }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("download_failed", error.message ?: "素材包下载失败", null)
+                }
+            }
+        }.start()
+    }
+
+    private fun userIdForUpload(): String {
+        return android.provider.Settings.Secure.getString(
+            contentResolver, android.provider.Settings.Secure.ANDROID_ID,
+        ) ?: "android-user"
+    }
+
+    private fun postTranscodeJob(backend: String, uri: Uri, params: JSONObject): String? {
+        val url = URL("$backend/api/transcode")
+        val connection = url.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
+        connection.readTimeout = HTTP_READ_TIMEOUT_MS
+        connection.doOutput = true
+        val mime = contentResolver.getType(uri) ?: "application/octet-stream"
+        val filename = "source.${mime.substringAfterLast('/').takeIf { it.isNotBlank() } ?: "mp4"}"
+        connection.setRequestProperty("Content-Type", mime)
+        connection.setRequestProperty("X-Esp-Baji-Filename", filename)
+        connection.setRequestProperty(
+            "X-Esp-Baji-Params",
+            android.util.Base64.encodeToString(
+                params.toString().toByteArray(Charsets.UTF_8),
+                android.util.Base64.NO_WRAP,
+            ),
+        )
+        val contentLength = querySize(uri)
+        if (contentLength in 1..Int.MAX_VALUE.toLong()) {
+            connection.setFixedLengthStreamingMode(contentLength)
+        } else {
+            connection.setChunkedStreamingMode(64 * 1024)
+        }
+        connection.outputStream.use { output ->
+            val buffered = BufferedOutputStream(output, 64 * 1024)
+            contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    buffered.write(buffer, 0, read)
+                }
+            } ?: throw IllegalArgumentException("无法读取素材")
+            buffered.flush()
+        }
+
+        val responseCode = connection.responseCode
+        val body = readResponseBody(connection)
+        connection.disconnect()
+        if (responseCode !in 200..299) {
+            android.util.Log.e("BadgeTranscode", "POST /api/transcode failed $responseCode: $body")
+            return null
+        }
+        return runCatching { JSONObject(body).optString("jobId") }.getOrNull()
+    }
+
+    private fun readResponseBody(connection: HttpURLConnection): String {
+        return runCatching {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        }.getOrElse {
+            connection.errorStream?.bufferedReader()?.use { reader -> reader.readText() } ?: ""
+        }
+    }
+
+    private fun waitTranscodeDone(backend: String, jobId: String): TranscodeJobResult {
+        val deadline = System.currentTimeMillis() + 10 * 60 * 1000L
+        while (System.currentTimeMillis() < deadline) {
+            val url = URL("$backend/api/transcode/$jobId")
+            val connection = url.openConnection() as HttpURLConnection
+            connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
+            connection.readTimeout = HTTP_READ_TIMEOUT_MS
+            val body = readResponseBody(connection)
+            connection.disconnect()
+            val payload = runCatching { JSONObject(body) }.getOrNull() ?: JSONObject()
+            val status = payload.optString("status")
+            when (status) {
+                "done" -> {
+                    val assetId = payload.optString("assetId").takeIf { it.isNotBlank() }
+                        ?: throw IllegalStateException("转码结果缺失")
+                    val fps = payload.optInt("fps", 60).takeIf { it in 1..80 } ?: 60
+                    return TranscodeJobResult(assetId, fps)
+                }
+                "failed" -> throw IllegalStateException(
+                    payload.optString("error").ifBlank { "服务器转码失败" },
+                )
+            }
+            Thread.sleep(1000)
+        }
+        throw IllegalStateException("转码超时")
+    }
+
+    private fun downloadAssetPackage(
+        backend: String,
+        assetId: String,
+        hardware: String,
+        target: File,
+    ): Boolean {
+        val url = URL("$backend/api/assets/$assetId/package?hardware=$hardware")
+        val connection = url.openConnection() as HttpURLConnection
+        connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
+        connection.readTimeout = HTTP_READ_TIMEOUT_MS
+        return runCatching {
+            connection.inputStream.use { input ->
+                target.outputStream().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            connection.disconnect()
+            target.length() > 0
+        }.getOrDefault(false)
+    }
+
+    private fun downloadAssetPreview(backend: String, assetId: String, target: File): Boolean {
+        val url = URL("$backend/api/assets/$assetId/preview")
+        val connection = url.openConnection() as HttpURLConnection
+        connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
+        connection.readTimeout = HTTP_READ_TIMEOUT_MS
+        return runCatching {
+            if (connection.responseCode != 200) {
+                connection.disconnect()
+                return@runCatching false
+            }
+            connection.inputStream.use { input ->
+                target.outputStream().use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            connection.disconnect()
+            target.length() > 0
+        }.getOrDefault(false)
     }
 
     private fun preparePackageForUpload(file: File): UploadPackageInfo {
@@ -1006,7 +1325,7 @@ class MainActivity : FlutterActivity() {
             return "素材没有可用帧，请重新导入生成"
         }
         if (fps < MIN_DEVICE_FPS || fps > MAX_DEVICE_FPS) {
-            return "历史素材帧率不是25-30fps，请重新导入生成"
+            return "历史素材帧率不在设备支持范围（1-80fps），请重新导入生成"
         }
         if (paletteEntries != PALETTE_ENTRIES || !isValidStreamSize(streamWidth, streamHeight)) {
             return "素材编码和当前固件不匹配，请重新导入生成"
@@ -1578,12 +1897,16 @@ class MainActivity : FlutterActivity() {
         return socket
     }
 
-    private fun switchToAsset(id: String, result: MethodChannel.Result) {
+    private fun switchToAsset(id: String, crc32: String?, result: MethodChannel.Result) {
         Thread {
             try {
                 acquireUploadWifiLock()
                 val network = activeBadgeNetworkForRequest(fastUpload = true)
-                val response = sendSwitchCommandWithRetry(network, id)
+                val response = if (crc32.isNullOrBlank()) {
+                    sendSwitchCommandWithRetry(network, id)
+                } else {
+                    sendSwitchCommandWithRetry(network, id, crc32)
+                }
                 when {
                     response.startsWith("OK") -> {
                         sendEvent(mapOf("type" to "switchResult", "id" to id, "success" to true))
@@ -1638,10 +1961,14 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun sendSwitchCommandWithRetry(network: Network?, id: String): String {
+        return sendSwitchCommandWithRetry(network, id, null)
+    }
+
+    private fun sendSwitchCommandWithRetry(network: Network?, id: String, crc32: String?): String {
         var lastError: Exception? = null
         repeat(SWITCH_TCP_ATTEMPTS) { attempt ->
             try {
-                return sendSwitchCommand(network, id)
+                return sendSwitchCommand(network, id, crc32)
             } catch (error: Exception) {
                 lastError = error
                 if (attempt + 1 < SWITCH_TCP_ATTEMPTS) {
@@ -1653,13 +1980,13 @@ class MainActivity : FlutterActivity() {
         throw lastError ?: IllegalStateException("切换失败")
     }
 
-    private fun sendSwitchCommand(network: Network?, id: String): String {
+    private fun sendSwitchCommand(network: Network?, id: String, crc32: String?): String {
         val socket = network?.socketFactory?.createSocket() as? Socket ?: Socket()
         socket.use { s ->
             s.tcpNoDelay = true
             s.soTimeout = UPLOAD_TCP_CONNECT_TIMEOUT_MS
             s.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
-            val cmd = "SWITCH $id\n"
+            val cmd = if (crc32.isNullOrBlank()) "SWITCH $id\n" else "SWITCH $id $crc32\n"
             s.getOutputStream().write(cmd.toByteArray())
             s.getOutputStream().flush()
             return s.getInputStream().bufferedReader().readLine().orEmpty()
@@ -1692,6 +2019,51 @@ class MainActivity : FlutterActivity() {
             s.getOutputStream().flush()
             return s.getInputStream().bufferedReader().readLine().orEmpty()
         }
+    }
+
+    private fun validUserDeviceCommand(id: String?, crc32: String?): Boolean {
+        return id != null && Regex("^U\\d{3}$").matches(id) &&
+            crc32 != null && Regex("^[0-9a-fA-F]{8}$").matches(crc32)
+    }
+
+    private fun parseDeviceKey(response: String): String? {
+        val value = response.trim().removePrefix("OK DEVICE ")
+        return value.takeIf { Regex("^P4-[0-9A-Fa-f]{12}$").matches(it) }
+    }
+
+    private fun readDeviceIdentity(): String {
+        acquireUploadWifiLock()
+        try {
+            val network = activeBadgeNetworkForRequest(fastUpload = true)
+            val response = sendRawTcpCommandWithRetry(network, "IDENTITY\n")
+            return parseDeviceKey(response)
+                ?: throw IllegalStateException(response.ifBlank { "设备身份读取失败" })
+        } finally {
+            releaseUploadWifiLock(keepIfConnected = true)
+        }
+    }
+
+    private fun <T> runDeviceCommand(
+        command: String,
+        errorCode: String,
+        result: MethodChannel.Result,
+        transform: (String) -> T,
+    ) {
+        Thread {
+            try {
+                acquireUploadWifiLock()
+                val network = activeBadgeNetworkForRequest(fastUpload = true)
+                val response = sendRawTcpCommandWithRetry(network, command)
+                val value = transform(response)
+                mainHandler.post { result.success(value) }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error(errorCode, error.message ?: "设备命令失败", null)
+                }
+            } finally {
+                releaseUploadWifiLock(keepIfConnected = true)
+            }
+        }.start()
     }
 
     private fun requestNewUserId(result: MethodChannel.Result) {
@@ -1806,8 +2178,21 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun parseSdAvailable(status: String): Boolean {
+        badgeHardware = parseBadgeHardware(status)
         return status.split(' ', '\n', '\r', '\t')
             .any { token -> token.equals("sd=1", ignoreCase = true) || token.equals("storage=sd", ignoreCase = true) }
+    }
+
+    private fun parseBadgeHardware(status: String): String {
+        val token = status.split(' ', '\n', '\r', '\t')
+            .firstOrNull { it.startsWith("hardware=", ignoreCase = true) }
+            ?.substringAfter('=')
+            ?.lowercase()
+        return if (token == "esp32p4") "esp32p4" else "esp32s3"
+    }
+
+    private fun normalizeBadgeHardware(value: String?): String {
+        return if (value.equals("esp32p4", ignoreCase = true)) "esp32p4" else "esp32s3"
     }
 
     private fun resolveBadgePackageBudget(sdAvailable: Boolean): Int {
@@ -1922,6 +2307,7 @@ class MainActivity : FlutterActivity() {
                         "connected" to true,
                         "address" to address,
                         "sdAvailable" to badgeSdAvailable,
+                        "hardware" to badgeHardware,
                         "message" to "已连接",
                     )
                 } else {
@@ -1933,6 +2319,7 @@ class MainActivity : FlutterActivity() {
                                     "connected" to true,
                                     "address" to address,
                                     "sdAvailable" to badgeSdAvailable,
+                                    "hardware" to badgeHardware,
                                     "message" to "连接检查重试中",
                                 ),
                             )
@@ -1987,6 +2374,7 @@ class MainActivity : FlutterActivity() {
                 "connecting" to connecting,
                 "address" to address,
                 "sdAvailable" to badgeSdAvailable,
+                "hardware" to badgeHardware,
                 "message" to message,
             ),
         )
@@ -2144,6 +2532,40 @@ class MainActivity : FlutterActivity() {
         return output
     }
 
+    private fun loadPendingDeviceDeletes(): List<Map<String, Any?>> {
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PENDING_DEVICE_DELETES_KEY, "[]") ?: "[]"
+        val array = runCatching { JSONArray(raw) }.getOrElse { return emptyList() }
+        val output = mutableListOf<Map<String, Any?>>()
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            output += mapOf(
+                "deviceKey" to item.optString("deviceKey", null),
+                "deviceAssetId" to item.optString("deviceAssetId", null),
+                "crc32" to item.optLong("crc32"),
+                "createdAt" to item.optLong("createdAt"),
+            )
+        }
+        return output
+    }
+
+    private fun savePendingDeviceDeletes(items: List<*>): Boolean {
+        val array = JSONArray()
+        items.forEach { entry ->
+            val map = entry as? Map<*, *> ?: return@forEach
+            val item = JSONObject()
+            item.put("deviceKey", map["deviceKey"])
+            item.put("deviceAssetId", map["deviceAssetId"])
+            item.put("crc32", map["crc32"])
+            item.put("createdAt", map["createdAt"])
+            array.put(item)
+        }
+        return getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(PENDING_DEVICE_DELETES_KEY, array.toString())
+            .commit()
+    }
+
     private fun historyMap(item: JSONObject): Map<String, Any?> {
         return mapOf(
                 "assetPath" to item.optString("assetPath"),
@@ -2161,6 +2583,7 @@ class MainActivity : FlutterActivity() {
                 "cropOffsetX" to item.optDouble("cropOffsetX", 0.0),
                 "cropOffsetY" to item.optDouble("cropOffsetY", 0.0),
                 "deviceId" to item.optString("deviceId", null),
+                "deviceKey" to item.optString("deviceKey", null),
                 "reviewId" to item.optString("reviewId", null),
                 "reviewStatus" to item.optString("reviewStatus", "local"),
             )
@@ -2281,6 +2704,7 @@ class MainActivity : FlutterActivity() {
             item.put("cropOffsetX", map["cropOffsetX"])
             item.put("cropOffsetY", map["cropOffsetY"])
             item.put("deviceId", map["deviceId"])
+            item.put("deviceKey", map["deviceKey"])
             val reviewId = map["reviewId"] as? String
             if (!reviewId.isNullOrBlank()) {
                 item.put("reviewId", reviewId)
@@ -3396,12 +3820,15 @@ class MainActivity : FlutterActivity() {
         private const val MAX_HISTORY_ITEMS = 20
         private const val PREFS_NAME = "esp_baji"
         private const val HISTORY_KEY = "history"
+        private const val PENDING_DEVICE_DELETES_KEY = "pending_device_deletes_v1"
 
         private const val WIDTH = 480
         private const val HEIGHT = 480
-        private const val MIN_DEVICE_FPS = 25
+        /* Server-transcoded P4 assets preserve source cadence up to 80 fps.
+         * The local/S3 encoder remains at 40 fps. */
+        private const val MIN_DEVICE_FPS = 1
         private const val DEVICE_FPS = 40
-        private const val MAX_DEVICE_FPS = 40
+        private const val MAX_DEVICE_FPS = 80
         private const val PREVIEW_SIZE = 320
         private const val VIDEO_PREVIEW_GIF_SIZE = 192
         private const val VIDEO_PREVIEW_GIF_FPS = 25

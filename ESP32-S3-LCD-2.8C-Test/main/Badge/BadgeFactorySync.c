@@ -20,12 +20,11 @@
 
 static const char *TAG = "BadgeFactorySync";
 
-#ifndef BADGE_FACTORY_BASE_URL
-#define BADGE_FACTORY_BASE_URL "http://60.205.122.153"
+#ifndef BADGE_FACTORY_PRIMARY_BASE_URL
+#define BADGE_FACTORY_PRIMARY_BASE_URL "http://47.108.204.22"
 #endif
-
-#ifndef BADGE_FACTORY_CATALOG_URL
-#define BADGE_FACTORY_CATALOG_URL BADGE_FACTORY_BASE_URL "/api/factory-catalog"
+#ifndef BADGE_FACTORY_FALLBACK_BASE_URL
+#define BADGE_FACTORY_FALLBACK_BASE_URL "http://60.205.122.153"
 #endif
 
 #define BADGE_FACTORY_TASK_STACK 12288u
@@ -48,6 +47,7 @@ typedef struct {
 
 static bool s_sync_started;
 static bool s_sync_running;
+static const char *s_factory_base_url = BADGE_FACTORY_PRIMARY_BASE_URL;
 
 static bool starts_with(const char *value, const char *prefix)
 {
@@ -158,16 +158,16 @@ static esp_err_t build_url(const char *catalog_url, char *out, size_t out_size)
         return ESP_OK;
     }
     if (catalog_url[0] == '/') {
-        snprintf(out, out_size, "%s%s", BADGE_FACTORY_BASE_URL, catalog_url);
+        snprintf(out, out_size, "%s%s", s_factory_base_url, catalog_url);
         return ESP_OK;
     }
     return ESP_ERR_INVALID_ARG;
 }
 
-static esp_err_t fetch_catalog(char *buffer, size_t buffer_size)
+static esp_err_t fetch_catalog_url(const char *url, char *buffer, size_t buffer_size)
 {
     esp_http_client_config_t config = {
-        .url = BADGE_FACTORY_CATALOG_URL,
+        .url = url,
         .timeout_ms = BADGE_FACTORY_HTTP_TIMEOUT_MS,
         .keep_alive_enable = false,
         .buffer_size = BADGE_FACTORY_HTTP_BUFFER_SIZE,
@@ -204,6 +204,24 @@ static esp_err_t fetch_catalog(char *buffer, size_t buffer_size)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return (ret == ESP_OK && total > 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t fetch_catalog(char *buffer, size_t buffer_size)
+{
+    const char *bases[] = {BADGE_FACTORY_PRIMARY_BASE_URL, BADGE_FACTORY_FALLBACK_BASE_URL};
+    char url[160];
+    esp_err_t ret = ESP_FAIL;
+    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); ++i) {
+        snprintf(url, sizeof(url), "%s/api/factory-catalog?hardware=esp32s3", bases[i]);
+        buffer[0] = '\0';
+        ret = fetch_catalog_url(url, buffer, buffer_size);
+        if (ret == ESP_OK) {
+            s_factory_base_url = bases[i];
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "factory catalog endpoint failed: %s (%s)", url, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static bool sha256_hex_file(const char *path, char out_hex[65])
