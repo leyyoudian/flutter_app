@@ -44,7 +44,8 @@ class ThirdHalfTransitionTests(unittest.TestCase):
                      ("F006", Path("F006.mp4")),
                  ]), \
                  patch.object(encode_factory, "discover_factory_loop_sources", return_value=[]), \
-                 patch.object(encode_factory, "process"), \
+                 patch.object(encode_factory, "process_for_s3_and_p4"), \
+                 patch.object(encode_factory, "preview_from_sources"), \
                  patch.object(encode_factory, "preview"), \
                  patch.object(encode_factory, "make_dial_mp4"):
                 encode_factory.main()

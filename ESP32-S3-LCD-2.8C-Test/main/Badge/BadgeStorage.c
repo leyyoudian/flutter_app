@@ -146,17 +146,29 @@ static esp_err_t begin_sd_upload_locked(uint32_t total_size)
     }
 
     unlink(BADGE_SD_TEMP_PATH);
-    FILE *file = fopen(BADGE_SD_TEMP_PATH, "wb");
+
+    /* Allocate one contiguous FAT chain without zero-filling the file.
+     * Growing a large upload one socket-sized write at a time makes FatFS
+     * update the chain in the hot path and collapses throughput.  The
+     * contiguous allocator only reserves the clusters; every byte is still
+     * overwritten by the upload and verified by the final CRC/header checks. */
+    int64_t expand_start_us = esp_timer_get_time();
+    esp_err_t expand_ret = esp_vfs_fat_create_contiguous_file(
+        BADGE_SD_MOUNT_POINT, BADGE_SD_TEMP_PATH, total_size, true);
+    int64_t expand_us = esp_timer_get_time() - expand_start_us;
+    bool contiguous = expand_ret == ESP_OK;
+    if (contiguous) {
+        ESP_LOGI(TAG, "allocated contiguous upload file: size=%" PRIu32 " in %lldms",
+                 total_size, (long long)(expand_us / 1000));
+    } else {
+        ESP_LOGW(TAG,
+                 "contiguous upload allocation failed after %lldms: %s errno=%d; using normal growth",
+                 (long long)(expand_us / 1000), esp_err_to_name(expand_ret), errno);
+    }
+
+    FILE *file = fopen(BADGE_SD_TEMP_PATH, contiguous ? "r+b" : "wb");
     if (file == NULL) {
         ESP_LOGW(TAG, "open SD temp failed");
-        mark_sd_failed_locked();
-        return ESP_FAIL;
-    }
-    int fd = fileno(file);
-    if (fd < 0 || ftruncate(fd, (off_t)total_size) != 0) {
-        ESP_LOGW(TAG, "preallocate SD temp failed");
-        fclose(file);
-        unlink(BADGE_SD_TEMP_PATH);
         mark_sd_failed_locked();
         return ESP_FAIL;
     }
@@ -183,7 +195,9 @@ static esp_err_t begin_sd_upload_locked(uint32_t total_size)
     }
 
     s_upload.sd_file = file;
-    ESP_LOGI(TAG, "begin upload to SD temp, size=%" PRIu32 " sd width=%u", total_size, s_sd_width);
+    ESP_LOGI(TAG,
+             "begin upload to SD temp, size=%" PRIu32 " sd width=%u file_buf=%u contiguous=%u",
+             total_size, s_sd_width, (unsigned)file_buf_size, contiguous ? 1u : 0u);
     return ESP_OK;
 }
 
@@ -193,13 +207,34 @@ static esp_err_t write_sd_chunk_locked(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    size_t written = fwrite(data, 1, len, s_upload.sd_file);
-    if (written != len) {
-        ESP_LOGW(TAG, "SD write failed at %" PRIu32, s_upload.received_size);
-        mark_sd_failed_locked();
+    int fd = fileno(s_upload.sd_file);
+    if (fd < 0) {
         return ESP_FAIL;
     }
-    return ESP_OK;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ssize_t written = write(fd, data, len);
+        if (written == (ssize_t)len) {
+            return ESP_OK;
+        }
+
+        int write_errno = errno;
+        ESP_LOGW(TAG,
+                 "SD write failed at %" PRIu32 " (attempt %d/3, errno=%d); retrying",
+                 s_upload.received_size, attempt + 1, write_errno);
+        if (written > 0 && written < (ssize_t)len) {
+            off_t back = (off_t)(len - (size_t)written);
+            if (lseek(fd, -back, SEEK_CUR) == (off_t)-1) {
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    ESP_LOGE(TAG, "SD write failed at %" PRIu32 " after 3 attempts; unmounting card",
+             s_upload.received_size);
+    mark_sd_failed_locked();
+    return ESP_FAIL;
 }
 
 static esp_err_t read_header_from_file(FILE *file, badge_ebaj_header_t *header)
@@ -594,25 +629,32 @@ esp_err_t badge_storage_read_asset(badge_asset_t *asset, uint32_t offset, void *
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (asset->sd_file_pos != offset) {
-        if (fseek(asset->file, (long)offset, SEEK_SET) != 0) {
-            return ESP_FAIL;
-        }
-        asset->sd_file_pos = offset;
-    }
+    asset->sd_file_pos = offset;
+    asset->sd_read_buf_valid = 0;
 
     uint8_t *dst = (uint8_t *)buffer;
     size_t remaining = len;
     while (remaining > 0) {
-        size_t chunk = remaining > asset->sd_read_buf_size ? asset->sd_read_buf_size : remaining;
-        size_t read_len = fread(asset->sd_read_buf, 1, chunk, asset->file);
-        if (read_len != chunk) {
-            return ESP_ERR_INVALID_SIZE;
+        if (asset->sd_read_buf_valid == 0 ||
+            asset->sd_file_pos < asset->sd_read_buf_offset ||
+            asset->sd_file_pos >= asset->sd_read_buf_offset + asset->sd_read_buf_valid) {
+            if (fseek(asset->file, (long)asset->sd_file_pos, SEEK_SET) != 0) {
+                return ESP_FAIL;
+            }
+            asset->sd_read_buf_offset = asset->sd_file_pos;
+            asset->sd_read_buf_valid = fread(asset->sd_read_buf, 1, asset->sd_read_buf_size, asset->file);
+            if (asset->sd_read_buf_valid == 0) {
+                return ESP_ERR_INVALID_SIZE;
+            }
         }
-        memcpy(dst, asset->sd_read_buf, chunk);
+
+        size_t cache_offset = (size_t)(asset->sd_file_pos - asset->sd_read_buf_offset);
+        size_t available = asset->sd_read_buf_valid - cache_offset;
+        size_t chunk = remaining < available ? remaining : available;
+        memcpy(dst, asset->sd_read_buf + cache_offset, chunk);
         dst += chunk;
         remaining -= chunk;
-        asset->sd_file_pos += chunk;
+        asset->sd_file_pos += (uint32_t)chunk;
     }
 
     return ESP_OK;
@@ -631,15 +673,26 @@ esp_err_t badge_storage_read_asset_sequential(badge_asset_t *asset, void *buffer
     uint8_t *dst = (uint8_t *)buffer;
     size_t remaining = len;
     while (remaining > 0) {
-        size_t chunk = remaining > asset->sd_read_buf_size ? asset->sd_read_buf_size : remaining;
-        size_t read_len = fread(asset->sd_read_buf, 1, chunk, asset->file);
-        if (read_len != chunk) {
-            return ESP_ERR_INVALID_SIZE;
+        if (asset->sd_read_buf_valid == 0 ||
+            asset->sd_file_pos < asset->sd_read_buf_offset ||
+            asset->sd_file_pos >= asset->sd_read_buf_offset + asset->sd_read_buf_valid) {
+            if (fseek(asset->file, (long)asset->sd_file_pos, SEEK_SET) != 0) {
+                return ESP_FAIL;
+            }
+            asset->sd_read_buf_offset = asset->sd_file_pos;
+            asset->sd_read_buf_valid = fread(asset->sd_read_buf, 1, asset->sd_read_buf_size, asset->file);
+            if (asset->sd_read_buf_valid == 0) {
+                return ESP_ERR_INVALID_SIZE;
+            }
         }
-        memcpy(dst, asset->sd_read_buf, chunk);
+
+        size_t cache_offset = (size_t)(asset->sd_file_pos - asset->sd_read_buf_offset);
+        size_t available = asset->sd_read_buf_valid - cache_offset;
+        size_t chunk = remaining < available ? remaining : available;
+        memcpy(dst, asset->sd_read_buf + cache_offset, chunk);
         dst += chunk;
         remaining -= chunk;
-        asset->sd_file_pos += chunk;
+        asset->sd_file_pos += (uint32_t)chunk;
     }
 
     return ESP_OK;

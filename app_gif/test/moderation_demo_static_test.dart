@@ -13,7 +13,7 @@ void main() {
     expect(source, contains('审核演示'));
     expect(source, contains('_simulateDemoUpload'));
     expect(source, contains('_simulateDemoScan'));
-    expect(source, contains('Demo ESP-BAJI'));
+    expect(source, contains('Demo DotLoop'));
   });
 
   test('app has backend version checks and moderation upload gating', () {
@@ -53,8 +53,8 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.22';"));
-    expect(pubspec, contains('version: 1.0.22+24'));
+    expect(source, contains("static const _appVersion = '1.0.23';"));
+    expect(pubspec, contains('version: 1.0.23+25'));
   });
 
   test('firmware project version is aligned with OTA release version', () {
@@ -65,7 +65,7 @@ void main() {
       '../ESP32-S3-LCD-2.8C-Test/main/CMakeLists.txt',
     ).readAsStringSync();
 
-    expect(cmake, contains('set(PROJECT_VER "0.1.51")'));
+    expect(cmake, contains('set(PROJECT_VER "0.1.53")'));
     expect(
       mainCmake,
       contains(
@@ -79,13 +79,10 @@ void main() {
     () {
       final source = File('lib/main.dart').readAsStringSync();
       final saveStart = source.indexOf('Future<void> _saveMakerAsset()');
-      final submitAtSave = source.indexOf(
-        '_submitAssetForReview(asset)',
-        saveStart,
-      );
+      final submitAtSave = source.indexOf('_submitAssetForReview(asset)', saveStart);
       final insertHistory = source.indexOf(
         '_history.insert(0, entry)',
-        saveStart,
+        submitAtSave,
       );
 
       expect(source, contains('素材需审核，请勿上传非法素材'));

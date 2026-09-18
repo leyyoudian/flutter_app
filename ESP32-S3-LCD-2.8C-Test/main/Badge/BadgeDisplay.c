@@ -14,6 +14,7 @@
 #include "ST7701S.h"
 
 #include "esp_check.h"
+#include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_rgb.h"
 #include "esp_log.h"
@@ -30,8 +31,14 @@
 #define BADGE_STATUS_PERIOD_MS 250u
 #define BADGE_FB_COUNT 3u
 #define BADGE_STREAM_PREFILL_FRAMES 16u
+#define BADGE_STREAM_TRANSITION_PREFILL_FRAMES 4u
+#define BADGE_STREAM_PREFILL_TIMEOUT_MS 500u
+#define BADGE_STREAM_FRAME_READ_TIMEOUT_MS 3u
 #define BADGE_PLAYER_YIELD_EVERY_FRAMES 8u
 #define BADGE_STATIC_FRAME_HOLD_POLL_MS 20u
+#define BADGE_SECOND_HALF_FRAME_DELAY_NUMERATOR 2u
+#define BADGE_SECOND_HALF_FRAME_DELAY_DENOMINATOR 3u
+#define BADGE_SECOND_HALF_MIN_FRAME_DELAY_US 1000LL
 #define BADGE_LCD_SWAP_VSYNC_TIMEOUT_MS 80u
 #define BADGE_LCD_STARTUP_SYNC_VSYNCS 3u
 #define BADGE_FPS_OVERLAY_ENABLED 0u
@@ -197,6 +204,16 @@ static void log_frame_codec_summary(const badge_asset_t *asset, const badge_ebaj
              tile,
              repeat,
              other);
+}
+
+static uint16_t trim_trailing_repeat_frames(const badge_ebaj_frame_t *frames,
+                                            uint16_t frame_count)
+{
+    while (frame_count > 1u &&
+           frames[frame_count - 1u].codec == BADGE_FRAME_INDEXED_REPEAT) {
+        --frame_count;
+    }
+    return frame_count;
 }
 
 static void reset_playback_perf_counter(void)
@@ -492,6 +509,17 @@ static void switch_panel_to_fb(int fb_index, int64_t *out_display_us, int64_t *o
 {
     uint8_t *fb = (uint8_t *)s_fb[fb_index];
     int64_t display_start_us = esp_timer_get_time();
+    /* RGB DMA reads the PSRAM backing store, while the renderer writes via
+       the CPU cache. The shared RGB driver intentionally skips this sync for
+       the P4 path, so the S3 application must publish the completed frame
+       before changing the scanout buffer. Without it, decoded frames remain
+       in cache and the panel appears to freeze until an unrelated eviction. */
+    esp_err_t sync_ret = esp_cache_msync(fb, BADGE_EBAJ_FRAME_BYTES,
+                                         ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                                         ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    if (sync_ret != ESP_OK) {
+        ESP_LOGW(TAG, "framebuffer cache sync failed: %s", esp_err_to_name(sync_ret));
+    }
     esp_err_t draw_ret = esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, BADGE_EBAJ_WIDTH, BADGE_EBAJ_HEIGHT, fb);
     int64_t done_us = esp_timer_get_time();
     if (draw_ret != ESP_OK) {
@@ -571,6 +599,7 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
 {
     /* Snapshot play mode to prevent race with WiFi task changing s_play_mode */
     badge_play_mode_t entry_mode = s_play_mode;
+    int64_t startup_start_us = esp_timer_get_time();
 
     badge_ebaj_frame_t *frames = NULL;
     esp_err_t ret = load_frame_table(asset, &frames);
@@ -583,6 +612,15 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
     xEventGroupClearBits(s_events, BADGE_STOPPED_BIT);
     log_frame_codec_summary(asset, frames);
 
+    uint16_t playback_frame_count = asset->header.frame_count;
+    if (entry_mode == BADGE_PLAY_MODE_SECOND_HALF) {
+        playback_frame_count = trim_trailing_repeat_frames(frames, playback_frame_count);
+        if (playback_frame_count < asset->header.frame_count) {
+            ESP_LOGI(TAG, "second_half trimmed trailing repeat frames: %u -> %u",
+                     asset->header.frame_count, playback_frame_count);
+        }
+    }
+
     badge_indexed_t indexed = {0};
     ret = badge_indexed_init(&indexed, asset->header.stream_width, asset->header.stream_height);
     if (ret != ESP_OK) {
@@ -591,17 +629,33 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
     }
 
     badge_stream_t *stream = NULL;
-    ret = badge_stream_start(asset, frames, asset->header.frame_count, 0, &stream);
+    ret = badge_stream_start(asset, frames, playback_frame_count, 0,
+                             entry_mode == BADGE_PLAY_MODE_LOOP, &stream);
     if (ret != ESP_OK) {
         badge_indexed_deinit(&indexed);
         heap_caps_free(frames);
         return ret;
     }
 
-    esp_err_t prefill_ret = badge_stream_wait_prefill(stream, BADGE_STREAM_PREFILL_FRAMES, 1200);
+    int64_t prefill_start_us = esp_timer_get_time();
+    const uint32_t prefill_limit = entry_mode == BADGE_PLAY_MODE_LOOP
+                                       ? BADGE_STREAM_PREFILL_FRAMES
+                                       : BADGE_STREAM_TRANSITION_PREFILL_FRAMES;
+    uint32_t prefill_frames = playback_frame_count < prefill_limit
+                                  ? playback_frame_count
+                                  : prefill_limit;
+    esp_err_t prefill_ret = badge_stream_wait_prefill(
+        stream, prefill_frames, BADGE_STREAM_PREFILL_TIMEOUT_MS);
     if (prefill_ret != ESP_OK) {
         ESP_LOGW(TAG, "stream prefill partial: %s", esp_err_to_name(prefill_ret));
     }
+
+    int64_t startup_elapsed_us = esp_timer_get_time() - startup_start_us;
+    int64_t prefill_elapsed_us = esp_timer_get_time() - prefill_start_us;
+    ESP_LOGI(TAG, "asset startup: total=%" PRId64 "ms prefill=%" PRId64 "ms result=%s",
+             startup_elapsed_us / 1000,
+             prefill_elapsed_us / 1000,
+             esp_err_to_name(prefill_ret));
 
     ESP_LOGI(TAG, "playing storage=sd format=ebaj4 frames=%u fps=%u stream=%ux%u",
              asset->header.frame_count,
@@ -616,6 +670,23 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
         badge_indexed_deinit(&indexed);
         heap_caps_free(frames);
         return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (entry_mode == BADGE_PLAY_MODE_SECOND_HALF) {
+        /*
+         * Keep every exit frame, but present the transition at 1.5x speed.
+         * The animation manager must wait for this sequence to finish before
+         * starting the requested asset, so the original frame interval made
+         * factory-to-factory switches feel unnecessarily serialized.  A lower
+         * bound avoids a zero/too-tight delay for unusually high-fps assets.
+         */
+        frame_delay_us = (frame_delay_us * BADGE_SECOND_HALF_FRAME_DELAY_NUMERATOR) /
+                         BADGE_SECOND_HALF_FRAME_DELAY_DENOMINATOR;
+        if (frame_delay_us < BADGE_SECOND_HALF_MIN_FRAME_DELAY_US) {
+            frame_delay_us = BADGE_SECOND_HALF_MIN_FRAME_DELAY_US;
+        }
+        ESP_LOGI(TAG, "second_half timing: source=%ums effective=%" PRId64 "us",
+                 badge_protocol_frame_delay_ms(asset->header.fps), frame_delay_us);
     }
 
     int64_t next_tick_us = esp_timer_get_time();
@@ -670,7 +741,17 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
 
         bool rendered_new_frame = false;
         badge_stream_frame_t stream_frame = {0};
-        ret = badge_stream_read_frame(stream, &stream_frame, 0);
+        ret = badge_stream_read_frame(stream, &stream_frame,
+                                      BADGE_STREAM_FRAME_READ_TIMEOUT_MS);
+        if (ret == ESP_ERR_TIMEOUT) {
+            /* A slow SD read should not consume a presentation deadline. Keep
+               the current framebuffer and retry immediately so a single
+               producer hiccup does not become a visible skipped frame. */
+            ++s_perf_underrun;
+            next_tick_us = esp_timer_get_time();
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
         if (ret == ESP_OK) {
             ++frames_consumed;
             s_perf_read_us += stream_frame.read_us;
@@ -720,7 +801,7 @@ static esp_err_t player_loop_asset(badge_asset_t *asset)
         next_tick_us += frame_delay_us;
 
         /* Break after one full play-through for non-loop modes */
-        if (entry_mode != BADGE_PLAY_MODE_LOOP && frames_consumed >= asset->header.frame_count) {
+        if (entry_mode != BADGE_PLAY_MODE_LOOP && frames_consumed >= playback_frame_count) {
             break;
         }
 
@@ -787,9 +868,15 @@ static void player_task(void *arg)
                 xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
             }
         } else {
-            ESP_LOGE(TAG, "open asset failed: %s", esp_err_to_name(ret));
-            render_status_if_needed(ret);
-            xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(500));
+            if (ret == ESP_ERR_NOT_FOUND) {
+                ESP_LOGW(TAG, "no asset available; waiting for sync or upload");
+                render_status_if_needed(ret);
+                xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+            } else {
+                ESP_LOGE(TAG, "open asset failed: %s", esp_err_to_name(ret));
+                render_status_if_needed(ret);
+                xEventGroupWaitBits(s_events, BADGE_RELOAD_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(500));
+            }
         }
     }
 }

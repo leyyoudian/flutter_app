@@ -1,3 +1,8 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+
 const primaryBackendBase = 'http://47.108.204.22';
 const fallbackBackendBase = 'http://60.205.122.153';
 
@@ -25,6 +30,25 @@ class BackendRequestException implements Exception {
 
   @override
   String toString() => message;
+}
+
+bool isRetryableBackendError(Object error) {
+  if (error is BackendRequestException) return error.retryable;
+  if (error is SocketException ||
+      error is TimeoutException ||
+      error is HandshakeException) {
+    return true;
+  }
+  if (error is PlatformException) {
+    return const <String>{
+      'network_unavailable',
+      'connection_failed',
+      'wifi_connect',
+      'timeout',
+      'handshake_failed',
+    }.contains(error.code);
+  }
+  return false;
 }
 
 Future<T> withBackendFailover<T>(

@@ -72,7 +72,7 @@ def main() -> None:
     require(cmake, "app_update", "app update component dependency")
     require(cmake, "json", "JSON component dependency for OTA manifest")
     require(cmake, 'EMBED_FILES "assets/upload_480_rgb565.bin"', "OTA upload image embedded in firmware")
-    require(root_cmake, 'set(PROJECT_VER "0.1.51")', "firmware project version")
+    require(root_cmake, 'set(PROJECT_VER "0.1.53")', "firmware project version")
     require(cmake, 'BADGE_FW_VERSION=\\"${PROJECT_VER}\\"', "firmware version comes from project version")
     if "Button_Driver/Button_Driver.c" in cmake or "Button_Driver/multi_button.c" in cmake:
         raise AssertionError("GPIO0 button driver must not be compiled for provisioning reset")

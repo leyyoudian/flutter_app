@@ -83,7 +83,10 @@ void main() {
       ),
     );
     expect(uploadSource, contains('if (isStaleBadgeNetworkError(tcpError))'));
-    expect(uploadSource, contains('if (isStaleBadgeNetworkError(error) && !badgeDirectIpMode)'));
+    expect(
+      uploadSource,
+      contains('if (isStaleBadgeNetworkError(error) && !badgeDirectIpMode)'),
+    );
     expect(
       uploadSource,
       contains('releaseUploadWifiLock(keepIfConnected = true)'),
@@ -96,7 +99,9 @@ void main() {
     expect(source, contains('releaseUploadWifiLock(keepIfConnected = false)'));
     expect(
       source,
-      contains('if (keepIfConnected && (badgeWifiNetwork != null || badgeDirectIpMode))'),
+      contains(
+        'if (keepIfConnected && (badgeWifiNetwork != null || badgeDirectIpMode))',
+      ),
     );
     expect(source, contains('"已复用 \$BADGE_WIFI_SSID Wi-Fi"'));
     expect(
@@ -284,7 +289,10 @@ void main() {
     expect(switchEnd, isNot(-1));
     final switchSource = source.substring(switchStart, switchEnd);
 
-    expect(switchSource, contains('sendSwitchCommandWithRetry(network, id)'));
+    expect(
+      switchSource,
+      contains('sendSwitchCommandWithRetry(network, id, generation)'),
+    );
     expect(switchSource, isNot(contains(', 2500)')));
 
     final requestIdStart = source.indexOf('    private fun requestNewUserId');
@@ -295,83 +303,117 @@ void main() {
     expect(requestIdStart, isNot(-1));
     expect(requestIdEnd, isNot(-1));
     final requestIdSource = source.substring(requestIdStart, requestIdEnd);
-    expect(
-      requestIdSource,
-      contains('sendSwitchCommandWithRetry(network, "NEWID")'),
-    );
+    expect(requestIdSource, contains('sendRawTcpCommandWithRetry(network, "NEWID\\n")'));
 
-    final retryStart = source.indexOf('    private fun sendSwitchCommandWithRetry');
-    final retryEnd = source.indexOf('    private fun sendSwitchCommand', retryStart + 1);
+    final retryStart = source.indexOf(
+      '    private fun sendSwitchCommandWithRetry(network: Network?, id: String, crc32: String?, generation: Long)',
+    );
+    final retryEnd = source.indexOf(
+      '    private fun sendSwitchCommand',
+      retryStart + 1,
+    );
     expect(retryStart, isNot(-1));
     expect(retryEnd, isNot(-1));
     final retrySource = source.substring(retryStart, retryEnd);
-    expect(retrySource, contains('repeat(SWITCH_TCP_ATTEMPTS)'));
-    expect(retrySource, contains('Thread.sleep(SWITCH_TCP_RETRY_DELAY_MS)'));
+    expect(retrySource, contains('repeat(SWITCH_COMMAND_ATTEMPTS)'));
+    expect(retrySource, contains('Thread.sleep(SWITCH_COMMAND_RETRY_DELAY_MS)'));
   });
 
-  test('Android connects discovered LAN IPs without opening the system Wi-Fi picker', () {
-    final source = File(
-      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
-    ).readAsStringSync();
+  test(
+    'Android connects discovered LAN IPs without opening the system Wi-Fi picker',
+    () {
+      final source = File(
+        'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+      ).readAsStringSync();
 
-    final connectStart = source.indexOf('    private fun connect(address: String)');
-    final connectEnd = source.indexOf('    @SuppressLint("MissingPermission")\n    private fun disconnect()', connectStart);
-    expect(connectStart, isNot(-1));
-    expect(connectEnd, isNot(-1));
-    final connectSource = source.substring(connectStart, connectEnd);
+      final connectStart = source.indexOf(
+        '    private fun connect(address: String)',
+      );
+      final connectEnd = source.indexOf('    private fun disconnect()', connectStart);
+      expect(connectStart, isNot(-1));
+      expect(connectEnd, isNot(-1));
+      final connectSource = source.substring(connectStart, connectEnd);
 
-    expect(connectSource, contains('waitForDirectBadge(address)'));
-    expect(connectSource, contains('return@Thread'));
+      expect(connectSource, contains('waitForDirectBadge(address)'));
+      expect(connectSource, contains('return@Thread'));
 
-    final ipv4Branch = connectSource.substring(
-      connectSource.indexOf('if (isIpv4Address(address))'),
-      connectSource.indexOf('val network = ensureBadgeWifiNetwork()'),
-    );
-    expect(ipv4Branch, isNot(contains('ensureBadgeWifiNetwork')));
-    expect(ipv4Branch, contains('badgeDirectIpMode = true'));
-    expect(ipv4Branch, contains('rememberDiscoveredBadge(direct, directIpMode = true)'));
+      final ipv4Branch = connectSource.substring(
+        connectSource.indexOf('if (isIpv4Address(address))'),
+        connectSource.indexOf('val network = ensureBadgeWifiNetwork()'),
+      );
+      expect(ipv4Branch, isNot(contains('ensureBadgeWifiNetwork')));
+      expect(ipv4Branch, contains('badgeDirectIpMode = true'));
+      expect(
+        ipv4Branch,
+        contains('rememberDiscoveredBadge(direct, directIpMode = true)'),
+      );
 
-    expect(
-      source,
-      contains('private fun waitForDirectBadge(host: String): DiscoveredBadge'),
-    );
-    final directStart = source.indexOf('    private fun waitForDirectBadge');
-    final directEnd = source.indexOf('    private fun probeBadgeHost', directStart);
-    expect(directStart, isNot(-1));
-    expect(directEnd, isNot(-1));
-    final directSource = source.substring(directStart, directEnd);
-    expect(directSource, contains('requestBadgeText(null, badgeUrl("/status", host), FAST_BADGE_STATUS_TIMEOUT_MS)'));
-    expect(directSource, contains('DIRECT_BADGE_CONNECT_TIMEOUT_MS'));
-    expect(directSource, isNot(contains('ensureBadgeWifiNetwork')));
-    expect(directSource, isNot(contains('requestNetwork')));
-  });
+      expect(
+        source,
+        contains(
+          'private fun waitForDirectBadge(host: String): DiscoveredBadge',
+        ),
+      );
+      final directStart = source.indexOf('    private fun waitForDirectBadge');
+      final directEnd = source.indexOf(
+        '    private fun probeBadgeHost',
+        directStart,
+      );
+      expect(directStart, isNot(-1));
+      expect(directEnd, isNot(-1));
+      final directSource = source.substring(directStart, directEnd);
+      expect(
+        directSource,
+        contains(
+          'requestBadgeText(null, badgeUrl("/status", host), FAST_BADGE_STATUS_TIMEOUT_MS)',
+        ),
+      );
+      expect(directSource, contains('DIRECT_BADGE_CONNECT_TIMEOUT_MS'));
+      expect(directSource, isNot(contains('ensureBadgeWifiNetwork')));
+      expect(directSource, isNot(contains('requestNetwork')));
+    },
+  );
 
-  test('Android connection state keeps LAN session through short status misses', () {
-    final source = File(
-      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
-    ).readAsStringSync();
+  test(
+    'Android connection state keeps LAN session through short status misses',
+    () {
+      final source = File(
+        'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+      ).readAsStringSync();
 
-    expect(source, contains('@Volatile private var connectionStatusMisses = 0'));
-    expect(source, contains('private const val CONNECTION_STATUS_MISS_LIMIT = 3'));
+      expect(
+        source,
+        contains('@Volatile private var connectionStatusMisses = 0'),
+      );
+      expect(
+        source,
+        contains('private const val CONNECTION_STATUS_MISS_LIMIT = 3'),
+      );
 
-    final readStart = source.indexOf('    private fun readConnectionState');
-    final readEnd = source.indexOf(
-      '    private fun sendConnectionEvent',
-      readStart,
-    );
-    expect(readStart, isNot(-1));
-    expect(readEnd, isNot(-1));
-    final readSource = source.substring(readStart, readEnd);
+      final readStart = source.indexOf('    private fun readConnectionState');
+      final readEnd = source.indexOf(
+        '    private fun sendConnectionEvent',
+        readStart,
+      );
+      expect(readStart, isNot(-1));
+      expect(readEnd, isNot(-1));
+      final readSource = source.substring(readStart, readEnd);
 
-    expect(readSource, contains('connectionStatusMisses = 0'));
-    expect(readSource, contains('connectionStatusMisses += 1'));
-    expect(readSource, contains('if (connectionStatusMisses < CONNECTION_STATUS_MISS_LIMIT)'));
-    expect(readSource, contains('"连接检查重试中"'));
-    expect(
-      readSource.indexOf('if (connectionStatusMisses < CONNECTION_STATUS_MISS_LIMIT)'),
-      lessThan(readSource.indexOf('connectedAddress = null')),
-    );
-  });
+      expect(readSource, contains('connectionStatusMisses = 0'));
+      expect(readSource, contains('connectionStatusMisses += 1'));
+      expect(
+        readSource,
+        contains('if (connectionStatusMisses < CONNECTION_STATUS_MISS_LIMIT)'),
+      );
+      expect(readSource, contains('"连接检查重试中"'));
+      expect(
+        readSource.indexOf(
+          'if (connectionStatusMisses < CONNECTION_STATUS_MISS_LIMIT)',
+        ),
+        lessThan(readSource.indexOf('connectedAddress = null')),
+      );
+    },
+  );
 
   test('Android upload streams packages from disk without whole-file buffers', () {
     final source = File(
@@ -427,7 +469,9 @@ void main() {
     final httpSource = source.substring(httpStart, httpEnd);
     expect(
       httpSource,
-      contains('(network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection'),
+      contains(
+        '(network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection',
+      ),
     );
     expect(
       httpSource,
@@ -469,5 +513,27 @@ void main() {
     expect(loadSource, isNot(contains('repairHistoryItem')));
     expect(loadSource, isNot(contains('EbajEncoder')));
     expect(loadSource, isNot(contains('buildVideoAnimatedPreview')));
+  });
+
+  test('Android exposes crash-safe device asset deletion bridge', () {
+    final source = File(
+      'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
+    ).readAsStringSync();
+
+    for (final method in <String>[
+      '"loadPendingDeviceDeletes"',
+      '"savePendingDeviceDeletes"',
+      '"getDeviceIdentity"',
+      '"statDeviceAsset"',
+      '"deleteDeviceAsset"',
+    ]) {
+      expect(source, contains(method), reason: method);
+    }
+    expect(source, contains('PENDING_DEVICE_DELETES_KEY'));
+    expect(source, contains(r'"IDENTITY\n"'));
+    expect(source, contains(r'"STAT $id $crc32\n"'));
+    expect(source, contains(r'"DELETE $id $crc32\n"'));
+    expect(source, contains(r'"SWITCH $id $crc32\n"'));
+    expect(source, contains('resultMap["deviceKey"]'));
   });
 }

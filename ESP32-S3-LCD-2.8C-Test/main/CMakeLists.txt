@@ -18,7 +18,7 @@ idf_component_register(
                                      "./LCD_Driver"
                                      "./Wireless"
                                      "."
-                        REQUIRES esp_lcd esp_timer esp_partition heap nvs_flash spi_flash esp_wifi esp_http_server esp_netif esp_event esp_https_ota esp_http_client app_update mbedtls json fatfs sdmmc esp_driver_sdmmc driver esp_driver_gpio esp_driver_ledc esp_driver_spi
+                        REQUIRES esp_lcd esp_mm esp_timer esp_partition heap nvs_flash spi_flash esp_wifi esp_http_server esp_netif esp_event esp_https_ota esp_http_client app_update mbedtls json fatfs sdmmc esp_driver_sdmmc driver esp_driver_gpio esp_driver_ledc esp_driver_spi
                         EMBED_FILES "assets/upload_480_rgb565.bin"
                         )
 

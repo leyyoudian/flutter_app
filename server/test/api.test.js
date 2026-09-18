@@ -6,7 +6,11 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-const { createApp, findDuplicateAsset } = require('../src/app');
+const {
+  createApp,
+  findDuplicateAsset,
+  assetReviewStatusForTransfer,
+} = require('../src/app');
 
 test('transcoded package reuse prefers an existing approved asset', () => {
   const items = [
@@ -23,6 +27,11 @@ test('package reuse never crosses the S3 and P4 hardware formats', () => {
   ];
   assert.equal(findDuplicateAsset(items, 'same', '123', 456, 'esp32s3').id, 's3');
   assert.equal(findDuplicateAsset(items, 'same', '123', 456, 'esp32p4').id, 'p4');
+});
+
+test('direct device transfers are immediately approved while offline review stays pending', () => {
+  assert.equal(assetReviewStatusForTransfer(true), 'approved');
+  assert.equal(assetReviewStatusForTransfer(false), 'pending');
 });
 
 const crcTable = Array.from({ length: 256 }, (_, index) => {

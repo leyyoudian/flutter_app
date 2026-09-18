@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:app_gif/backend_failover.dart';
+import 'package:flutter/services.dart';
 
 void main() {
   test(
@@ -58,5 +59,26 @@ void main() {
       throwsA(isA<BackendRequestException>()),
     );
     expect(attempts, 1);
+  });
+
+  test('native business errors do not fall back to the old server', () {
+    expect(
+      isRetryableBackendError(
+        PlatformException(code: 'download_failed', message: 'asset missing'),
+      ),
+      isFalse,
+    );
+    expect(
+      isRetryableBackendError(
+        PlatformException(code: 'transcode_failed', message: 'invalid video'),
+      ),
+      isFalse,
+    );
+    expect(
+      isRetryableBackendError(
+        PlatformException(code: 'network_unavailable', message: 'offline'),
+      ),
+      isTrue,
+    );
   });
 }

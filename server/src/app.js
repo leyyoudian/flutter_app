@@ -3,7 +3,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
 const { spawn } = require('node:child_process');
-const { transcodeToEbaj, ffprobeVideo, normalizeTranscodeHardware, selectOutputFps } = require('./transcode');
+const {
+  transcodeToEbaj,
+  ffprobeVideo,
+  normalizeTranscodeHardware,
+  selectOutputFps,
+  MAX_OUTPUT_FPS,
+  MAX_S3_OUTPUT_FPS,
+} = require('./transcode');
 
 const defaultVersions = {
   android: {
@@ -660,6 +667,10 @@ function previewMimeRank(mime) {
 
 function shouldReplacePreview(existingMime, nextMime) {
   return previewMimeRank(nextMime) > previewMimeRank(existingMime);
+}
+
+function assetReviewStatusForTransfer(directDeviceTransfer) {
+  return directDeviceTransfer ? 'approved' : 'pending';
 }
 
 function removeRelativeFile(dataDir, relativePath) {
@@ -2113,6 +2124,8 @@ function createApp(options = {}) {
           crop,
           assetId: null,
           error: null,
+          directDeviceTransfer: params.deviceTransfer === true,
+          reviewStatus: null,
         };
         transcodeJobs.set(jobId, job);
 
@@ -2122,7 +2135,8 @@ function createApp(options = {}) {
             if (info.width === 0 || info.height === 0) {
               throw new Error('无法解析视频');
             }
-            const fps = selectOutputFps(info.fps, requestedMaxFps);
+            const hardwareFpsCap = hardware === 'esp32s3' ? MAX_S3_OUTPUT_FPS : MAX_OUTPUT_FPS;
+            const fps = selectOutputFps(info.fps, Math.min(requestedMaxFps, hardwareFpsCap));
             job.fps = fps;
             const outputPath = path.join(jobDir, 'package.ebaj');
             const result = await transcodeToEbaj({
@@ -2139,8 +2153,35 @@ function createApp(options = {}) {
             );
             if (duplicate && duplicate.packagePath &&
                 fs.existsSync(path.join(dataDir, duplicate.packagePath))) {
+              if ((!duplicate.previewPath ||
+                   !fs.existsSync(path.join(dataDir, duplicate.previewPath))) &&
+                  fs.existsSync(srcPath)) {
+                const duplicatePreviewFile = path.join(previewsDir, `${duplicate.id}.png`);
+                const duplicatePreviewVf =
+                  'scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2';
+                const previewResult = await new Promise((resolve) => {
+                  const child = spawn('ffmpeg', [
+                    '-v', 'error', '-i', srcPath, '-frames:v', '1',
+                    '-vf', duplicatePreviewVf, '-y', duplicatePreviewFile,
+                  ]);
+                  child.on('error', () => resolve(false));
+                  child.on('exit', (code) => resolve(code === 0));
+                });
+                if (previewResult && fs.existsSync(duplicatePreviewFile)) {
+                  duplicate.previewPath = path.relative(dataDir, duplicatePreviewFile);
+                  duplicate.previewMime = 'image/png';
+                  saveJson(metadataFile, items);
+                }
+              }
+              if (job.directDeviceTransfer && duplicate.status !== 'approved') {
+                duplicate.status = 'approved';
+                duplicate.reviewedAt = new Date().toISOString();
+                duplicate.reviewer = 'device-direct';
+                saveJson(metadataFile, items);
+              }
               job.status = 'done';
               job.assetId = duplicate.id;
+              job.reviewStatus = duplicate.status;
               return;
             }
 
@@ -2166,9 +2207,10 @@ function createApp(options = {}) {
             const id = crypto.randomUUID();
             const packagePath = path.join(packagesDir, `${id}.eb4`);
             fs.copyFileSync(outputPath, packagePath);
+            const directDeviceTransfer = job.directDeviceTransfer;
             const item = {
               id,
-              status: 'pending',
+              status: assetReviewStatusForTransfer(directDeviceTransfer),
               name,
               userId,
               hardware,
@@ -2182,11 +2224,16 @@ function createApp(options = {}) {
               previewMime,
               submittedAt: new Date().toISOString(),
             };
+            if (directDeviceTransfer) {
+              item.reviewedAt = item.submittedAt;
+              item.reviewer = 'device-direct';
+            }
             items.unshift(item);
             saveJson(metadataFile, items);
 
             job.status = 'done';
             job.assetId = id;
+            job.reviewStatus = item.status;
           } catch (error) {
             job.status = 'failed';
             job.error = error.message || String(error);
@@ -2211,6 +2258,7 @@ function createApp(options = {}) {
           status: job.status,
           assetId: job.assetId,
           fps: job.fps,
+          reviewStatus: job.reviewStatus,
           error: job.error,
         });
         return;
@@ -2464,4 +2512,4 @@ function createApp(options = {}) {
   };
 }
 
-module.exports = { createApp, findDuplicateAsset };
+module.exports = { createApp, findDuplicateAsset, assetReviewStatusForTransfer };

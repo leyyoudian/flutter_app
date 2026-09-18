@@ -1,4 +1,5 @@
 const int p4MaxTranscodeFps = 80;
+const int s3MaxTranscodeFps = 40;
 const int p4FallbackTranscodeFps = 60;
 
 int resolveServerTranscodeFps(Object? value) {

@@ -16,6 +16,8 @@ typedef struct {
     uint8_t *sd_read_buf;
     size_t sd_read_buf_size;
     uint32_t sd_file_pos;
+    uint32_t sd_read_buf_offset;
+    size_t sd_read_buf_valid;
     badge_ebaj_header_t header;
 } badge_asset_t;
 

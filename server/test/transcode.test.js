@@ -7,6 +7,7 @@ const {
   parseFrameRate,
   normalizeTranscodeHardware,
   selectOutputFps,
+  MAX_S3_OUTPUT_FPS,
   splitJpegFrames,
 } = require('../src/transcode');
 
@@ -36,6 +37,11 @@ test('selectOutputFps falls back to 60 fps and never accepts a cap above 80', ()
   assert.equal(selectOutputFps(0, 80), 60);
   assert.equal(selectOutputFps(Number.NaN, 80), 60);
   assert.equal(selectOutputFps(120, 120), 80);
+});
+
+test('S3 transcode cap keeps packages within the firmware 40 fps limit', () => {
+  assert.equal(selectOutputFps(60, MAX_S3_OUTPUT_FPS), 40);
+  assert.equal(selectOutputFps(30, MAX_S3_OUTPUT_FPS), 30);
 });
 
 test('splitJpegFrames extracts each complete MJPEG image', () => {

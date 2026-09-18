@@ -75,7 +75,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.22';
+  static const _appVersion = '1.0.23';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -114,6 +114,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   String? _activeFactoryId; // currently playing on dial
   List<String> _videoQueue = []; // pending video sequence
   int _videoIndex = 0;
+  int _switchGeneration = 0;
 
   bool get _previewActive => _appActive && !_preparing;
   bool get _hasPendingReviewStatuses => _history.any(
@@ -337,15 +338,17 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _switchToFactory(FactoryAnimation anim) async {
-    setState(() {
-      _selectedFactoryId = anim.id;
-      _asset = null;
-    });
+    final switchGeneration = ++_switchGeneration;
+    // The device switches from a user asset directly to the factory first
+    // half; there is no factory exit animation to preview in that case.
+    final leavingUserAsset = _asset != null;
     // Build video sequence: current exit/third_half + target entrance.
     final queue = <String>[];
     bool isThirdHalf = false;
     final targetIsLoop = anim.isLoop;
-    if (_activeFactoryId != null && _activeFactoryId != anim.id) {
+    if (!leavingUserAsset &&
+        _activeFactoryId != null &&
+        _activeFactoryId != anim.id) {
       final current = _factoryAnims.cast<FactoryAnimation?>().firstWhere(
         (a) => a?.id == _activeFactoryId,
         orElse: () => null,
@@ -362,7 +365,16 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     } else if (!isThirdHalf && anim.firstVideo != null) {
       queue.add(anim.firstVideo!);
     }
+
+    // Dispatch the device command before rebuilding the video preview.  The
+    // preview can tear down/create video controllers and hold the Flutter
+    // event loop long enough to make the physical switch feel delayed.
+    final dispatchSwitch = !_demoMode && _connected
+        ? _invokeNative<dynamic>('switchToAsset', {'id': anim.id})
+        : null;
     setState(() {
+      _selectedFactoryId = anim.id;
+      _asset = null;
       _videoQueue = queue;
       _videoIndex = 0;
       _activeFactoryId = anim.id;
@@ -372,21 +384,24 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       return;
     }
     // Send switch command to device
-    if (!_connected) return;
+    if (dispatchSwitch == null) return;
     setState(() => _status = '切换中...');
     try {
-      final result = await _invokeNative<dynamic>('switchToAsset', {
-        'id': anim.id,
-      });
-      if (!mounted) return;
+      final result = await dispatchSwitch;
+      if (!mounted || switchGeneration != _switchGeneration) return;
       if (result == true) {
         setState(() => _status = '已切换');
+      } else if (result is Map && result['pending'] == true) {
+        // The device accepts SWITCH before its exit/entry animation completes.
+        // Treat the accepted command as success so a slow animation does not
+        // surface as a false timeout in the app.
+        setState(() => _status = '切换已提交');
       } else if (result is Map && result['needsUpload'] == true) {
         _showSnack('设备缺少该素材，需先上传');
         setState(() => _status = '素材缺失');
       }
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || switchGeneration != _switchGeneration) return;
       _showSnack('切换失败: $e');
     }
   }
@@ -772,6 +787,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _saveMakerAsset() async {
+    if (_preparing || _uploading) {
+      return;
+    }
     final media = _media;
     if (media == null) {
       _showSnack('请先导入 GIF、图片或视频');
@@ -795,11 +813,18 @@ class _BadgeHomePageState extends State<BadgeHomePage>
               {
                 'uri': media.uri,
                 'name': media.name,
-                'maxFps': p4MaxTranscodeFps,
+                'maxFps': _connectedHardware == 'esp32s3'
+                    ? s3MaxTranscodeFps
+                    : p4MaxTranscodeFps,
                 'cropScale': _cropTransform.scale,
                 'cropOffsetX': _cropTransform.offset.dx,
                 'cropOffsetY': _cropTransform.offset.dy,
                 'hardware': _connectedHardware,
+                // A user import is intended for a device even when the
+                // device is offline right now. The package remains local
+                // until a device is connected, but the server must produce
+                // and approve the hardware-specific payload immediately.
+                'deviceTransfer': !_demoMode,
               },
             );
         if (!mounted || transcodeResult == null) {
@@ -825,7 +850,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           cropOffsetX: _cropTransform.offset.dx,
           cropOffsetY: _cropTransform.offset.dy,
           reviewId: reviewId,
-          reviewStatus: 'pending',
+          reviewStatus:
+              _readNullableString(transcodeResult['reviewStatus']) ?? 'pending',
         );
         final entry = HistoryEntry.fromAsset(
           asset,
@@ -841,9 +867,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           if (_history.length > 20) {
             _history.removeRange(20, _history.length);
           }
-          _status = '待审核';
+          _status = asset.reviewStatus == 'approved' ? '已转码，可上传' : '待审核';
         });
-        _showSnack('已提交服务器转码，等待审核');
+        _showSnack(
+          asset.reviewStatus == 'approved' ? '素材已转码，可直接上传' : '已提交服务器转码，等待审核',
+        );
         unawaited(_saveHistory());
         return;
       }
@@ -926,28 +954,61 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       setState(() => _pageIndex = 0);
       return;
     }
+    // Mark the whole operation busy before review/package download. This
+    // prevents a second tap from starting another backend/device transfer and
+    // makes the spinner cover the actual waiting period.
+    setState(() {
+      _uploading = true;
+      _uploadProgress = 0;
+      _status = '准备上传';
+    });
     await _pendingDeviceDeletesLoad;
-    await _reconcilePendingDeviceDeletes();
+    // Deletion tombstones are durable and retried on every connection. They
+    // must not block a user-initiated upload behind identity/delete retries.
+    if (_pendingDeviceDeletes.isNotEmpty) {
+      unawaited(_reconcilePendingDeviceDeletes());
+    }
     if (!mounted) {
       return;
     }
     var approvedAsset = await _ensureAssetApproved(asset);
     if (!mounted || approvedAsset == null) {
+      if (mounted) {
+        setState(() => _uploading = false);
+      }
       return;
     }
     /* Server-transcoded assets hold no local package yet: download it from
      * the backend before pushing to the device. */
     if (approvedAsset.assetPath.isEmpty && approvedAsset.reviewId != null) {
       setState(() => _status = '下载素材包');
-      final downloadResult = await _invokeBackendNative<Map<dynamic, dynamic>>(
-        'downloadApprovedPackage',
-        {
-          'assetId': approvedAsset.reviewId,
-          'name': approvedAsset.name,
-          'hardware': _connectedHardware,
-        },
-      );
+      Map<dynamic, dynamic>? downloadResult;
+      try {
+        downloadResult = await _invokeBackendNative<Map<dynamic, dynamic>>(
+          'downloadApprovedPackage',
+          {
+            'assetId': approvedAsset.reviewId,
+            'name': approvedAsset.name,
+            'hardware': _connectedHardware,
+          },
+        );
+      } on PlatformException catch (error) {
+        if (mounted) {
+          setState(() {
+            _uploading = false;
+            _status = '下载失败';
+          });
+          _showSnack(error.message ?? '素材包下载失败');
+        }
+        return;
+      }
       if (!mounted || downloadResult == null) {
+        if (mounted) {
+          setState(() {
+            _uploading = false;
+            _status = '下载失败';
+          });
+        }
         return;
       }
       final downloadedPath = _readNullableString(downloadResult['assetPath']);
@@ -980,11 +1041,6 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         return;
       }
     }
-    setState(() {
-      _uploading = true;
-      _uploadProgress = 0;
-      _status = '准备上传';
-    });
     try {
       final uploadTarget = approvedAsset;
       final result = _demoMode
@@ -1051,11 +1107,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       backendBaseCandidates(overrideBase: _backendBaseOverride);
 
   bool _retryBackendError(Object error) {
-    if (error is BackendRequestException) return error.retryable;
-    return error is SocketException ||
-        error is TimeoutException ||
-        error is HandshakeException ||
-        error is PlatformException;
+    return isRetryableBackendError(error);
   }
 
   Future<Map<String, dynamic>?> _getBackendJson(String path) async {
@@ -1415,36 +1467,52 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
     // If already uploaded, just switch to it
     if (entry.deviceId != null && _connected) {
-      await _pendingDeviceDeletesLoad;
-      await _reconcilePendingDeviceDeletes();
-      if (!mounted) {
+      final switchGeneration = ++_switchGeneration;
+      // Tombstone cleanup is best-effort background work. It must not delay
+      // the user-selected asset switch behind identity/delete network calls.
+      if (_pendingDeviceDeletes.isNotEmpty) {
+        unawaited(_reconcilePendingDeviceDeletes());
+      }
+      if (!mounted || switchGeneration != _switchGeneration) {
         return;
       }
-      final reviewed = await _ensureAssetApproved(
-        PreparedAsset(
-          assetPath: entry.assetPath,
-          previewPath: entry.previewPath,
-          animatedPreviewPath: entry.animatedPreviewPath,
-          sourceUri: entry.sourceUri,
-          mime: entry.mime,
-          name: entry.name,
-          packageSize: entry.packageSize,
-          frameCount: entry.frameCount,
-          fps: entry.fps,
-          crc32: entry.crc32,
-          cropScale: entry.cropScale,
-          cropOffsetX: entry.cropOffsetX,
-          cropOffsetY: entry.cropOffsetY,
-          reviewId: entry.reviewId,
-          reviewStatus: entry.reviewStatus,
-        ),
+      // A deviceId proves that this exact package was already accepted by
+      // the device. Do not poll the backend review endpoint before sending a
+      // local SWITCH command; if the device no longer has it, the command
+      // returns NEED_UPLOAD and the normal upload path below takes over.
+      final reviewed = PreparedAsset(
+        assetPath: entry.assetPath,
+        previewPath: entry.previewPath,
+        animatedPreviewPath: entry.animatedPreviewPath,
+        sourceUri: entry.sourceUri,
+        mime: entry.mime,
+        name: entry.name,
+        packageSize: entry.packageSize,
+        frameCount: entry.frameCount,
+        fps: entry.fps,
+        crc32: entry.crc32,
+        cropScale: entry.cropScale,
+        cropOffsetX: entry.cropOffsetX,
+        cropOffsetY: entry.cropOffsetY,
+        reviewId: entry.reviewId,
+        reviewStatus: entry.reviewStatus,
       );
-      if (!mounted || reviewed == null) {
-        return;
-      }
+      final previousAsset = _asset;
+      // Start the local device switch before updating the preview state.  A
+      // large user preview can otherwise delay the native TCP command.
+      final dispatchSwitch = _demoMode
+          ? null
+          : _invokeNative<dynamic>('switchToAsset', {
+              'id': entry.deviceId,
+              'crc32': crc32Hex(entry.crc32),
+            });
       setState(() {
         _status = '切换中...';
         _selectedFactoryId = null;
+        // Reflect the selected history item immediately. The device command
+        // is asynchronous because it may still be finishing a factory exit
+        // animation; waiting for its ACK made the grid feel unresponsive.
+        _asset = reviewed;
       });
       if (_demoMode) {
         setState(() {
@@ -1454,14 +1522,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         return;
       }
       try {
-        final switchResult = await _invokeNative<dynamic>('switchToAsset', {
-          'id': entry.deviceId,
-          'crc32': crc32Hex(entry.crc32),
-        });
-        if (!mounted) return;
+        final switchResult = await dispatchSwitch;
+        if (!mounted || switchGeneration != _switchGeneration) return;
+        final switchPending =
+            switchResult is Map && switchResult['pending'] == true;
         if (!switchResultNeedsUpload(switchResult)) {
           setState(() {
-            _status = '已切换';
+            _status = switchPending ? '切换已提交' : '已切换';
             _asset = PreparedAsset(
               assetPath: entry.assetPath,
               previewPath: entry.previewPath,
@@ -1481,7 +1548,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         }
         setState(() => _status = '设备缺少素材，重新上传');
       } catch (e) {
-        if (!mounted) return;
+        if (!mounted || switchGeneration != _switchGeneration) return;
+        setState(() => _asset = previousAsset);
         _showSnack('切换失败: $e');
         setState(() => _status = '切换失败');
         return;
@@ -3818,7 +3886,10 @@ String? _readNullableString(Object? value) {
 }
 
 String _normalizeHardware(Object? value) {
-  return value?.toString().toLowerCase() == 'esp32p4' ? 'esp32p4' : 'esp32s3';
+  // P4 support stays in the package/backend for a later opt-in release.
+  // The current UI intentionally exposes one target and always requests the
+  // S3 EBAJ4 package, even if a stale device status reports another target.
+  return 'esp32s3';
 }
 
 bool _hasPreviewPath(String? path) =>

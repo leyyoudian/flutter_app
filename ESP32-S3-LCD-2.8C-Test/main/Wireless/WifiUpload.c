@@ -76,14 +76,14 @@
 #define BADGE_TCP_RCVBUF_BYTES (128u * 1024u)
 #define BADGE_UPLOAD_BUF_FALLBACK_BYTES (32u * 1024u)
 #define BADGE_UPLOAD_BUF_MIN_BYTES (16u * 1024u)
-#define BADGE_UPLOAD_WRITE_COALESCE_BYTES (64u * 1024u)
-#define BADGE_UPLOAD_WRITE_COALESCE_FALLBACK_BYTES (32u * 1024u)
-#define BADGE_UPLOAD_WRITE_COALESCE_MIN_BYTES (16u * 1024u)
+#define BADGE_UPLOAD_WRITE_COALESCE_BYTES (512u * 1024u)
+#define BADGE_UPLOAD_WRITE_COALESCE_FALLBACK_BYTES (128u * 1024u)
+#define BADGE_UPLOAD_WRITE_COALESCE_MIN_BYTES (32u * 1024u)
 #define BADGE_UPLOAD_DIAG_STEP_BYTES (64u * 1024u)
 #define BADGE_UPLOAD_DISPLAY_STOP_TIMEOUT_MS 1500u
 #define BADGE_HTTP_CRC_HEADER "X-EBAJ-CRC32"
 #define BADGE_TCP_TASK_STACK 6144u
-#define BADGE_TCP_TASK_PRIORITY 7u
+#define BADGE_TCP_TASK_PRIORITY 10u
 #define BADGE_OTA_TASK_STACK 12288u
 #define BADGE_OTA_URL_MAX 512u
 #define BADGE_OTA_MANIFEST_MAX 2048u
@@ -626,6 +626,7 @@ static void delayed_disable_provisioning_ap(void *arg)
         if (was_fallback_ap) {
             schedule_lcd_resync_after_wireless();
         }
+        badge_factory_sync_start_once();
         start_auto_ota_check();
     }
     s_ap_shutdown_pending = false;
@@ -902,6 +903,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 schedule_disable_provisioning_ap(ap_hold_ms);
             }
         } else {
+            badge_factory_sync_start_once();
             start_auto_ota_check();
         }
     }
@@ -1516,7 +1518,14 @@ static esp_err_t begin_upload_session(badge_upload_session_t *session,
 
     ret = badge_storage_begin_upload(total_size, expected_crc);
     if (ret != ESP_OK) {
-        badge_display_exit_upload_mode();
+        /* ESP_ERR_INVALID_STATE means another transport already owns the
+         * upload session. Do not release its display pause or abort its SD
+         * file from this rejected fallback request. */
+        if (ret == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "upload busy; rejecting concurrent session");
+        } else {
+            badge_display_exit_upload_mode();
+        }
     }
     return ret;
 }
@@ -1582,6 +1591,20 @@ static esp_err_t append_upload_data(badge_upload_session_t *session, const uint8
     while (remaining > 0) {
         if (session->coalesce == NULL || session->coalesce_size == 0) {
             return write_upload_direct(session, src, remaining);
+        }
+
+        /* A socket receive may yield a complete staging block.  When the
+         * staging buffer is empty, commit that block directly instead of
+         * copying it into the staging buffer and immediately copying it back
+         * through the storage layer. */
+        if (session->coalesce_len == 0 && remaining >= session->coalesce_size) {
+            esp_err_t ret = write_upload_session(session, src, session->coalesce_size);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            src += session->coalesce_size;
+            remaining -= session->coalesce_size;
+            continue;
         }
 
         size_t free_len = session->coalesce_size - session->coalesce_len;
@@ -1688,7 +1711,12 @@ static esp_err_t alloc_upload_session_buffers(badge_upload_session_t *session)
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
         size_t size = candidates[i];
-        session->coalesce = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        /* Prefer PSRAM so the SD file layer and built-in Wi-Fi driver retain
+         * enough internal DMA memory for their own buffers. */
+        session->coalesce = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (session->coalesce == NULL) {
+            session->coalesce = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        }
         if (session->coalesce == NULL) {
             session->coalesce = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         }
@@ -2531,8 +2559,24 @@ static esp_err_t upload_handler(httpd_req_t *req)
        internal DMA memory to open the next SD asset. */
     badge_display_exit_upload_mode();
 
+    /* HTTP is only a recovery path for a TCP handshake failure.  Finish it
+     * like the TCP path: move the completed package into a stable user ID and
+     * return that ID so the app can switch back to it later. */
+    const char *user_id = badge_anim_mgr_alloc_user_id();
+    char user_path[72];
+    snprintf(user_path, sizeof(user_path), "/sdcard/user/%s.eb4", user_id);
+    unlink(user_path);
+    if (rename("/sdcard/badge.eb4", user_path) != 0) {
+        ESP_LOGW(TAG, "HTTP upload rename failed: errno=%d", errno);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "asset activation failed");
+        return ESP_FAIL;
+    }
+    (void)badge_anim_mgr_play(user_id, BADGE_PLAY_MODE_LOOP);
+
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
+    char response[64];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"assignedId\":\"%s\"}", user_id);
+    httpd_resp_sendstr(req, response);
     return ESP_OK;
 }
 
@@ -2672,6 +2716,13 @@ static esp_err_t handle_tcp_upload(int sock)
         while (len > 0 && (clean_id[len - 1] == '\n' || clean_id[len - 1] == '\r' || clean_id[len - 1] == ' ')) {
             clean_id[--len] = '\0';
         }
+        /* User switches may carry the package CRC32: "SWITCH U001 ab12cd34".
+         * The animation manager addresses assets by Uxxx only; discard the
+         * optional validation token before looking the asset up. */
+        char *id_end = strpbrk(clean_id, " \t");
+        if (id_end != NULL) {
+            *id_end = '\0';
+        }
         ESP_LOGI(TAG, "SWITCH command: %s", clean_id);
         if (strcmp(clean_id, "NEWID") == 0) {
             const char *new_id = badge_anim_mgr_alloc_user_id();
@@ -2706,25 +2757,17 @@ static esp_err_t handle_tcp_upload(int sock)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Send READY immediately �C the Android starts streaming data while we
-     * set up SD and allocate buffers.  The TCP receive window fills with
-     * in-flight data, keeping ACKs flowing and preventing congestion-window
-     * collapse once our recv() loop starts. */
-    ret = send_tcp_ready(sock);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     badge_upload_session_t session = {0};
     ret = begin_upload_session(&session, total_size, expected_crc);
     if (ret != ESP_OK) {
-        abort_upload_session();
+        send_tcp_status(sock, ret);
         return ret;
     }
     session.recv_us = header_recv_us;
     ret = alloc_upload_session_buffers(&session);
     if (ret != ESP_OK) {
         abort_upload_session();
+        send_tcp_status(sock, ret);
         return ret;
     }
 
@@ -2733,9 +2776,21 @@ static esp_err_t handle_tcp_upload(int sock)
     if (buffer == NULL) {
         free_upload_session_buffers(&session);
         abort_upload_session();
+        send_tcp_status(sock, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
     session.upload_buf_caps = upload_buffer_caps(buffer);
+
+    /* Only acknowledge READY after this request owns the SD session and all
+     * receive/write buffers.  The client must never stream bytes into a
+     * request that is going to be rejected as busy or out of memory. */
+    ret = send_tcp_ready(sock);
+    if (ret != ESP_OK) {
+        heap_caps_free(buffer);
+        free_upload_session_buffers(&session);
+        abort_upload_session();
+        return ret;
+    }
 
     uint32_t remaining = total_size;
     while (remaining > 0) {
@@ -2788,9 +2843,8 @@ static esp_err_t handle_tcp_upload(int sock)
             ESP_LOGI(TAG, "User upload saved as %s", user_path);
             /* Let anim mgr handle it so NVS persistence + state update works */
             badge_anim_mgr_play(user_id, BADGE_PLAY_MODE_LOOP);
-            /* Release upload buffers before waking the player.  Otherwise
-               the next asset open can fail with ESP_ERR_NO_MEM under
-               ESP-Hosted. */
+            /* Release upload buffers before waking the player so the next
+               asset open has enough memory for its stream buffers. */
             badge_display_exit_upload_mode();
             char response[64];
             snprintf(response, sizeof(response), "OK %s\n", user_id);
@@ -2848,9 +2902,24 @@ static void tcp_upload_task(void *arg)
         }
 
         esp_err_t ret = handle_tcp_upload(sock);
-        send_tcp_status(sock, ret);
+        /* Command and successful upload paths already emit their definitive
+         * response (OK/NEED_UPLOAD, or OK <assigned-id>). Sending a second
+         * generic OK leaves an extra line in the socket and makes the phone
+         * retry/close the request, which appears as duplicate SWITCH events.
+         * Keep the outer response only for failure paths that did not send
+         * their own diagnostic status. */
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "TCP upload failed: %s", esp_err_to_name(ret));
+            send_tcp_status(sock, ret);
+        }
+        if (ret != ESP_OK) {
+            /* A short-lived probe or a peer closing an idle socket is not an
+             * upload failure.  Keep it out of the error stream and reserve
+             * ERROR for an actual request/SD write failure. */
+            if (ret == ESP_FAIL) {
+                ESP_LOGW(TAG, "TCP peer closed before completing a request");
+            } else {
+                ESP_LOGE(TAG, "TCP request failed: %s", esp_err_to_name(ret));
+            }
         }
         shutdown(sock, SHUT_RDWR);
         close(sock);

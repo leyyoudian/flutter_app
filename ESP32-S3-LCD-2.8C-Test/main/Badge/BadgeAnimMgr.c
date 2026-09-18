@@ -1,6 +1,7 @@
 #include "BadgeAnimMgr.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -48,6 +49,7 @@ static const badge_anim_entry_t *s_current_entry;
 static char s_pending_id[BADGE_ANIM_ID_LEN];
 static bool s_switch_pending;
 static bool s_transition_lands_on_current;
+static uint32_t s_transition_started_ms;
 static bool s_random_enabled;
 static uint32_t s_random_next_switch_ms;
 static TaskHandle_t s_random_task;
@@ -73,6 +75,16 @@ static esp_err_t load_last_anim_id(char *out_id, size_t size)
     ret = nvs_get_str(handle, "last_id", out_id, &len);
     nvs_close(handle);
     return ret;
+}
+
+static void clear_last_anim_id(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(BADGE_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        (void)nvs_erase_key(handle, BADGE_NVS_LAST_ID_KEY);
+        (void)nvs_commit(handle);
+        nvs_close(handle);
+    }
 }
 
 static void save_random_enabled(bool enabled)
@@ -422,6 +434,7 @@ esp_err_t badge_anim_mgr_init(void)
 
     /* Try to resume last-played animation from NVS */
     char last_id[BADGE_ANIM_ID_LEN] = {0};
+    bool last_user_exists = false;
     if (!s_random_enabled &&
         load_last_anim_id(last_id, sizeof(last_id)) == ESP_OK && last_id[0] != '\0') {
         resume_entry = find_any(last_id);
@@ -432,7 +445,11 @@ esp_err_t badge_anim_mgr_init(void)
             FILE *f = fopen(user_path, "rb");
             if (f != NULL) {
                 fclose(f);
-                /* File exists � we'll play it by path below */
+                last_user_exists = true;
+            } else {
+                ESP_LOGW(TAG, "last user animation is missing; clearing saved id: %s", last_id);
+                clear_last_anim_id();
+                last_id[0] = '\0';
             }
         }
     }
@@ -444,7 +461,7 @@ esp_err_t badge_anim_mgr_init(void)
         ESP_LOGI(TAG, "%s animation: %s",
                  random_start ? "random start" : "resuming last",
                  resume_entry->id);
-    } else if (last_id[0] == 'U') {
+    } else if (last_user_exists) {
         /* User file not in scanned entries */
         strncpy(s_current_id, last_id, sizeof(s_current_id) - 1);
         s_current_entry = NULL;
@@ -664,6 +681,7 @@ esp_err_t badge_anim_mgr_switch_to(const char *new_id)
                 s_current_entry = new_entry;
                 s_play_mode = BADGE_PLAY_MODE_SECOND_HALF;
                 s_transition_lands_on_current = true;
+                s_transition_started_ms = now_ms();
                 save_last_anim_id(new_id);
                 ESP_LOGI(TAG, "playing F006/F007 third_half %s->%s: %s", old_id, new_id, third_path);
                 esp_err_t ret = badge_display_play_asset_file(third_path, BADGE_PLAY_MODE_SECOND_HALF);
@@ -678,6 +696,7 @@ esp_err_t badge_anim_mgr_switch_to(const char *new_id)
             s_switch_pending = true;
             s_play_mode = BADGE_PLAY_MODE_SECOND_HALF;
             s_transition_lands_on_current = false;
+            s_transition_started_ms = now_ms();
             ESP_LOGI(TAG, "playing second_half of %s before switch to %s", s_current_id, new_id);
             esp_err_t ret = badge_display_play_asset_file(second->file_path, BADGE_PLAY_MODE_SECOND_HALF);
             xSemaphoreGive(s_lock);
@@ -747,6 +766,12 @@ void badge_anim_mgr_notify_finished(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     ESP_LOGI(TAG, "animation finished, pending=%d", s_switch_pending);
+
+    if (s_play_mode == BADGE_PLAY_MODE_SECOND_HALF && s_transition_started_ms != 0) {
+        ESP_LOGI(TAG, "transition finished: elapsed=%" PRIu32 "ms pending=%d",
+                 now_ms() - s_transition_started_ms, s_switch_pending);
+        s_transition_started_ms = 0;
+    }
 
     bool transition_landed_on_current = (s_play_mode == BADGE_PLAY_MODE_SECOND_HALF &&
                                          s_transition_lands_on_current);

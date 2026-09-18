@@ -72,6 +72,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.CRC32
 import kotlin.math.max
@@ -101,6 +102,7 @@ class MainActivity : FlutterActivity() {
     @Volatile private var activeBadgeHost = BADGE_AP_HOST
     @Volatile private var connectionStatusMisses = 0
     private val preparingVideoUri = AtomicReference<String?>(null)
+    private val switchRequestGeneration = AtomicLong(0)
     private var badgeWifiCallback: ConnectivityManager.NetworkCallback? = null
     private var uploadWifiLock: WifiManager.WifiLock? = null
     private var tcpUploadSocket: Socket? = null
@@ -119,7 +121,11 @@ class MainActivity : FlutterActivity() {
     private data class TranscodeJobResult(
         val assetId: String,
         val fps: Int,
+        val reviewStatus: String?,
     )
+
+    private class SwitchRequestSupersededException : Exception()
+    private class SwitchResponseTimeoutException : Exception()
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -299,7 +305,8 @@ class MainActivity : FlutterActivity() {
                 val backendBase = call.argument<String>("backendBase")
                     ?: "http://47.108.204.22"
                 val hardware = normalizeBadgeHardware(call.argument<String>("hardware"))
-                transcodeOnServer(uri, name, maxFps, crop, hardware, backendBase, result)
+                val deviceTransfer = call.argument<Boolean>("deviceTransfer") ?: false
+                transcodeOnServer(uri, name, maxFps, crop, hardware, deviceTransfer, backendBase, result)
             }
             "downloadApprovedPackage" -> {
                 val assetId = call.argument<String>("assetId")
@@ -986,11 +993,10 @@ class MainActivity : FlutterActivity() {
                 val packageInfo = preparePackageForUpload(file)
                 sendEvent(mapOf("type" to "uploadProgress", "progress" to 0.0, "message" to "发送到设备"))
                 val assignedId = uploadAssetWithRetry(packageInfo)
-                val deviceKey = if (assignedId != null) {
-                    runCatching { readDeviceIdentity() }.getOrNull()
-                } else {
-                    null
-                }
+                /* S3 is the active release target.  Do not add a second
+                 * IDENTITY round trip after upload; S3 has no P4 device key
+                 * and that request used to keep the UI spinner alive. */
+                val deviceKey: String? = null
                 sendEvent(mapOf("type" to "uploadProgress", "progress" to 1.0, "message" to "已切换显示"))
                 val resultMap = mutableMapOf<String, Any?>()
                 if (assignedId != null) resultMap["assignedId"] = assignedId
@@ -1040,6 +1046,7 @@ class MainActivity : FlutterActivity() {
         maxFps: Int,
         crop: CropTransform,
         hardware: String,
+        deviceTransfer: Boolean,
         backendBase: String,
         result: MethodChannel.Result,
     ) {
@@ -1054,12 +1061,14 @@ class MainActivity : FlutterActivity() {
                 }
 
                 val backend = backendBase.trimEnd('/')
+                val operationStartMs = System.currentTimeMillis()
                 val params = JSONObject()
                     .put("name", name)
                     .put("maxFps", maxFps)
                     .put("streamSize", 480)
                     .put("userId", userIdForUpload())
                     .put("hardware", hardware)
+                    .put("deviceTransfer", deviceTransfer)
                     .put("crop", JSONObject()
                         .put("scale", crop.scale)
                         .put("offsetX", crop.offsetX)
@@ -1069,26 +1078,40 @@ class MainActivity : FlutterActivity() {
                 if (jobId.isNullOrBlank()) {
                     throw IllegalStateException("服务器未接受转码任务")
                 }
-                android.util.Log.i("BadgeTranscode", "job submitted: $jobId")
+                android.util.Log.i(
+                    "BadgeTranscode",
+                    "job submitted: $jobId elapsed=${System.currentTimeMillis() - operationStartMs}ms",
+                )
 
                 sendEvent(mapOf("type" to "transcodeProgress", "stage" to "transcoding", "message" to "服务器解码中"))
                 val transcodeJob = waitTranscodeDone(backend, jobId)
                 val assetId = transcodeJob.assetId
+                android.util.Log.i(
+                    "BadgeTranscode",
+                    "job done: $jobId asset=$assetId status=${transcodeJob.reviewStatus} elapsed=${System.currentTimeMillis() - operationStartMs}ms",
+                )
 
                 /* Pull the review preview so the history grid has a
                  * thumbnail for server-transcoded assets too. */
                 val directory = persistentAssetDirectory("ebaj")
                 val stem = "${System.currentTimeMillis()}_${safeFileName(name)}"
                 val previewFile = File(directory, "$stem.png")
+                // The device package and the grid thumbnail are independent.
+                // Keep the thumbnail for direct device transfers too; a small
+                // preview request must never block or fail the upload flow.
                 val previewPath = if (downloadAssetPreview(backend, assetId, previewFile)) {
                     previewFile.absolutePath
                 } else {
+                    android.util.Log.w(
+                        "BadgeTranscode",
+                        "preview unavailable asset=$assetId deviceTransfer=$deviceTransfer",
+                    )
                     null
                 }
 
                 val response = mapOf(
                     "reviewId" to assetId,
-                    "reviewStatus" to "pending",
+                    "reviewStatus" to transcodeJob.reviewStatus,
                     "fps" to transcodeJob.fps,
                     "previewPath" to previewPath,
                 )
@@ -1205,13 +1228,17 @@ class MainActivity : FlutterActivity() {
                     val assetId = payload.optString("assetId").takeIf { it.isNotBlank() }
                         ?: throw IllegalStateException("转码结果缺失")
                     val fps = payload.optInt("fps", 60).takeIf { it in 1..80 } ?: 60
-                    return TranscodeJobResult(assetId, fps)
+                    return TranscodeJobResult(
+                        assetId,
+                        fps,
+                        payload.optString("reviewStatus").takeIf { it.isNotBlank() },
+                    )
                 }
                 "failed" -> throw IllegalStateException(
                     payload.optString("error").ifBlank { "服务器转码失败" },
                 )
             }
-            Thread.sleep(1000)
+            Thread.sleep(250)
         }
         throw IllegalStateException("转码超时")
     }
@@ -1245,8 +1272,10 @@ class MainActivity : FlutterActivity() {
     private fun downloadAssetPreview(backend: String, assetId: String, target: File): Boolean {
         val url = URL("$backend/api/assets/$assetId/preview")
         val connection = url.openConnection() as HttpURLConnection
-        connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
-        connection.readTimeout = HTTP_READ_TIMEOUT_MS
+        // A thumbnail is optional metadata. Keep a broken/slow preview
+        // endpoint from holding the device upload behind a 60-second timeout.
+        connection.connectTimeout = PREVIEW_CONNECT_TIMEOUT_MS
+        connection.readTimeout = PREVIEW_READ_TIMEOUT_MS
         return runCatching {
             if (connection.responseCode != 200) {
                 connection.disconnect()
@@ -1368,10 +1397,26 @@ class MainActivity : FlutterActivity() {
             try {
                 acquireUploadWifiLock()
                 val network = activeBadgeNetworkForRequest(fastUpload = true)
+                android.util.Log.i(
+                    "BadgeUploadDiag",
+                    "attempt=${attempt + 1}/$HTTP_UPLOAD_ATTEMPTS host=$activeBadgeHost direct=$badgeDirectIpMode network=$network size=${packageInfo.size}",
+                )
                 try {
                     val assignedId = uploadAssetOverTcp(network, packageInfo)
                     if (assignedId != null) return assignedId
                 } catch (tcpError: Exception) {
+                    android.util.Log.e(
+                        "BadgeUploadDiag",
+                        "tcp failed host=$activeBadgeHost network=$network type=${tcpError::class.java.name} message=${tcpError.message}",
+                        tcpError,
+                    )
+                    if (tcpError is TcpUploadException && !tcpError.fallbackAllowed) {
+                        /* The device may already own an SD upload session.
+                         * Starting HTTP here would create a second writer and
+                         * make the first socket look like a reset. Retry the
+                         * same TCP transaction instead. */
+                        throw tcpError
+                    }
                     if (isStaleBadgeNetworkError(tcpError)) {
                         throw tcpError
                     }
@@ -1382,11 +1427,18 @@ class MainActivity : FlutterActivity() {
                             "message" to "TCP上传失败，回退HTTP",
                         ),
                     )
-                    uploadAssetOverHttp(network, packageInfo)
+                    val assignedId = uploadAssetOverHttp(network, packageInfo)
+                    if (assignedId != null) return assignedId
+                    throw IllegalStateException("设备未返回素材编号")
                 }
                 return null
             } catch (error: Exception) {
                 lastError = error
+                android.util.Log.e(
+                    "BadgeUploadDiag",
+                    "attempt failed host=$activeBadgeHost direct=$badgeDirectIpMode type=${error::class.java.name} message=${error.message}",
+                    error,
+                )
                 closeTcpSocket()
                 if (isStaleBadgeNetworkError(error) && !badgeDirectIpMode) {
                     releaseBadgeWifi()
@@ -1853,35 +1905,68 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun uploadAssetOverTcp(network: Network?, packageInfo: UploadPackageInfo): String? {
-        val active = ensureTcpSocket(network)
+        val startMs = System.currentTimeMillis()
+        var payloadStarted = false
+        try {
+            android.util.Log.i("BadgeUploadDiag", "tcp start host=$activeBadgeHost network=$network")
+            val active = ensureTcpSocket(network)
+            android.util.Log.i("BadgeUploadDiag", "tcp connected host=$activeBadgeHost elapsed=${System.currentTimeMillis() - startMs}ms")
 
-        val header = ByteArray(12)
-        writeLe32(header, 0, BADGE_TCP_UPLOAD_MAGIC.toLong())
-        writeLe32(header, 4, packageInfo.size.toLong())
-        writeLe32(header, 8, packageInfo.crc)
+            val header = ByteArray(12)
+            writeLe32(header, 0, BADGE_TCP_UPLOAD_MAGIC.toLong())
+            writeLe32(header, 4, packageInfo.size.toLong())
+            writeLe32(header, 8, packageInfo.crc)
 
-        val sockOut = active.getOutputStream()
-        val reader = active.getInputStream().bufferedReader()
-        active.soTimeout = UPLOAD_READY_TIMEOUT_MS
-        sockOut.write(header)
-        sockOut.flush()
-        val ready = reader.readLine().orEmpty()
-        if (!ready.startsWith("READY")) {
+            val sockOut = active.getOutputStream()
+            val reader = active.getInputStream().bufferedReader()
+            active.soTimeout = UPLOAD_READY_TIMEOUT_MS
+            sockOut.write(header)
+            sockOut.flush()
+            android.util.Log.i("BadgeUploadDiag", "tcp header sent waiting_ready timeout=${UPLOAD_READY_TIMEOUT_MS}ms")
+            val ready = reader.readLine().orEmpty()
+            android.util.Log.i("BadgeUploadDiag", "tcp ready response=${ready.take(80)} elapsed=${System.currentTimeMillis() - startMs}ms")
+            if (!ready.startsWith("READY")) {
+                closeTcpSocket()
+                throw TcpUploadException(ready.ifBlank { "设备未准备好上传" }, fallbackAllowed = false)
+            }
+            active.soTimeout = HTTP_READ_TIMEOUT_MS
+            payloadStarted = true
+            streamPackageToOutput(packageInfo, sockOut, "TCP上传")
+            sockOut.flush()
+            android.util.Log.i("BadgeUploadDiag", "tcp payload sent elapsed=${System.currentTimeMillis() - startMs}ms")
+
+            val response = reader.readLine().orEmpty()
+            android.util.Log.i("BadgeUploadDiag", "tcp final response=${response.take(80)} elapsed=${System.currentTimeMillis() - startMs}ms")
+            if (!response.startsWith("OK")) {
+                closeTcpSocket()
+                throw TcpUploadException(response.ifBlank { "TCP上传失败" }, fallbackAllowed = false)
+            }
             closeTcpSocket()
-            throw IllegalStateException(ready.ifBlank { "设备未准备好上传" })
+            // Extract assigned user ID: "OK U001" → "U001"
+            return response.removePrefix("OK").trim().ifEmpty { null }
+        } catch (error: TcpUploadException) {
+            throw error
+        } catch (error: Exception) {
+            throw TcpUploadException(
+                error.message ?: "TCP上传失败",
+                fallbackAllowed = !payloadStarted,
+                cause = error,
+            )
         }
-        active.soTimeout = HTTP_READ_TIMEOUT_MS
-        streamPackageToOutput(packageInfo, sockOut, "TCP上传")
-        sockOut.flush()
+    }
 
-        val response = reader.readLine().orEmpty()
-        if (!response.startsWith("OK")) {
-            closeTcpSocket()
-            throw IllegalStateException(response.ifBlank { "TCP上传失败" })
+    private fun cachedBadgeNetworkForSwitch(): Network? {
+        if (badgeDirectIpMode && isIpv4Address(activeBadgeHost)) {
+            return null
         }
-        closeTcpSocket()
-        // Extract assigned user ID: "OK U001" → "U001"
-        return response.removePrefix("OK").trim().ifEmpty { null }
+        // Keep switch sockets on the already validated Wi-Fi transport. The
+        // old IPv4 early-return forced a fresh default-route lookup for every
+        // tap, which added 1-2 seconds and could hit a stale network route.
+        badgeWifiNetwork?.let { return it }
+        if (connectedAddress != null && isIpv4Address(activeBadgeHost)) {
+            connectivityManager().activeNetwork?.let { return it }
+        }
+        return activeBadgeNetworkForRequest(fastUpload = true)
     }
 
     private fun ensureTcpSocket(network: Network?): Socket {
@@ -1892,21 +1977,34 @@ class MainActivity : FlutterActivity() {
         socket.tcpNoDelay = true
         socket.sendBufferSize = UPLOAD_IO_CHUNK_BYTES
         socket.soTimeout = UPLOAD_TCP_CONNECT_TIMEOUT_MS
+        val connectStartMs = System.currentTimeMillis()
+        android.util.Log.i("BadgeUploadDiag", "tcp connecting host=$activeBadgeHost port=$BADGE_UPLOAD_TCP_PORT network=$network")
         socket.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
+        android.util.Log.i("BadgeUploadDiag", "tcp connect ok elapsed=${System.currentTimeMillis() - connectStartMs}ms local=${socket.localAddress}:${socket.localPort}")
         tcpUploadSocket = socket
         return socket
     }
 
     private fun switchToAsset(id: String, crc32: String?, result: MethodChannel.Result) {
+        val generation = switchRequestGeneration.incrementAndGet()
         Thread {
+            val switchStartMs = System.currentTimeMillis()
             try {
                 acquireUploadWifiLock()
-                val network = activeBadgeNetworkForRequest(fastUpload = true)
+                val network = cachedBadgeNetworkForSwitch()
+                android.util.Log.i(
+                    "BadgeSwitchDiag",
+                    "begin id=$id host=$activeBadgeHost network=$network cached=$badgeWifiNetwork",
+                )
                 val response = if (crc32.isNullOrBlank()) {
-                    sendSwitchCommandWithRetry(network, id)
+                    sendSwitchCommandWithRetry(network, id, generation)
                 } else {
-                    sendSwitchCommandWithRetry(network, id, crc32)
+                    sendSwitchCommandWithRetry(network, id, crc32, generation)
                 }
+                android.util.Log.i(
+                    "BadgeSwitchDiag",
+                    "sent id=$id elapsed=${System.currentTimeMillis() - switchStartMs}ms response=$response",
+                )
                 when {
                     response.startsWith("OK") -> {
                         sendEvent(mapOf("type" to "switchResult", "id" to id, "success" to true))
@@ -1917,9 +2015,33 @@ class MainActivity : FlutterActivity() {
                             result.success(mapOf("needsUpload" to true, "id" to id))
                         }
                     }
+                    response.startsWith("SWITCH_SENT") -> {
+                        mainHandler.post {
+                            result.success(mapOf("pending" to true, "id" to id))
+                        }
+                    }
                     else -> {
                         throw IllegalStateException(response.ifBlank { "切换失败" })
                     }
+                }
+            } catch (_: SwitchRequestSupersededException) {
+                mainHandler.post {
+                    result.success(mapOf("superseded" to true, "id" to id))
+                }
+            } catch (_: SwitchResponseTimeoutException) {
+                // The device may have accepted SWITCH and be busy finishing
+                // an exit animation or opening a large SD asset. Do not show
+                // a false failure or send the command a second time.
+                mainHandler.post {
+                    result.success(mapOf("pending" to true, "id" to id))
+                }
+            } catch (_: SocketTimeoutException) {
+                // Older firmware/network paths can still surface a socket
+                // timeout while the command has already reached the device.
+                // Keep the UI optimistic; the next status refresh reconciles
+                // the selected tile with the device.
+                mainHandler.post {
+                    result.success(mapOf("pending" to true, "id" to id))
                 }
             } catch (error: Exception) {
                 mainHandler.post {
@@ -1960,36 +2082,49 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
-    private fun sendSwitchCommandWithRetry(network: Network?, id: String): String {
-        return sendSwitchCommandWithRetry(network, id, null)
+    private fun sendSwitchCommandWithRetry(network: Network?, id: String, generation: Long): String {
+        return sendSwitchCommandWithRetry(network, id, null, generation)
     }
 
-    private fun sendSwitchCommandWithRetry(network: Network?, id: String, crc32: String?): String {
+    private fun sendSwitchCommandWithRetry(network: Network?, id: String, crc32: String?, generation: Long): String {
         var lastError: Exception? = null
-        repeat(SWITCH_TCP_ATTEMPTS) { attempt ->
+        repeat(SWITCH_COMMAND_ATTEMPTS) { attempt ->
+            if (generation != switchRequestGeneration.get()) {
+                throw SwitchRequestSupersededException()
+            }
             try {
-                return sendSwitchCommand(network, id, crc32)
+                return sendSwitchCommand(network, id, crc32, generation)
+            } catch (_: SwitchResponseTimeoutException) {
+                throw SwitchResponseTimeoutException()
             } catch (error: Exception) {
                 lastError = error
-                if (attempt + 1 < SWITCH_TCP_ATTEMPTS) {
+                if (attempt + 1 < SWITCH_COMMAND_ATTEMPTS) {
                     closeTcpSocket()
-                    Thread.sleep(SWITCH_TCP_RETRY_DELAY_MS)
+                    Thread.sleep(SWITCH_COMMAND_RETRY_DELAY_MS)
                 }
             }
         }
         throw lastError ?: IllegalStateException("切换失败")
     }
 
-    private fun sendSwitchCommand(network: Network?, id: String, crc32: String?): String {
+    private fun sendSwitchCommand(network: Network?, id: String, crc32: String?, generation: Long): String {
         val socket = network?.socketFactory?.createSocket() as? Socket ?: Socket()
         socket.use { s ->
             s.tcpNoDelay = true
-            s.soTimeout = UPLOAD_TCP_CONNECT_TIMEOUT_MS
-            s.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), UPLOAD_TCP_CONNECT_TIMEOUT_MS)
+            s.soTimeout = SWITCH_TCP_RESPONSE_TIMEOUT_MS
+            s.connect(InetSocketAddress(activeBadgeHost, BADGE_UPLOAD_TCP_PORT), SWITCH_TCP_CONNECT_TIMEOUT_MS)
+            if (generation != switchRequestGeneration.get()) {
+                throw SwitchRequestSupersededException()
+            }
             val cmd = if (crc32.isNullOrBlank()) "SWITCH $id\n" else "SWITCH $id $crc32\n"
             s.getOutputStream().write(cmd.toByteArray())
             s.getOutputStream().flush()
-            return s.getInputStream().bufferedReader().readLine().orEmpty()
+            // SWITCH is asynchronous on the device: it may first play an
+            // exit animation and then open a large SD asset. Waiting for the
+            // device's final line makes a successful command look like a
+            // failure when the read deadline expires. A successful TCP write
+            // is the acknowledgement for this fire-and-forget command.
+            return "SWITCH_SENT"
         }
     }
 
@@ -2071,7 +2206,7 @@ class MainActivity : FlutterActivity() {
             try {
                 acquireUploadWifiLock()
                 val network = activeBadgeNetworkForRequest(fastUpload = true)
-                val response = sendSwitchCommandWithRetry(network, "NEWID")
+                val response = sendRawTcpCommandWithRetry(network, "NEWID\n")
                 if (response.startsWith("OK ")) {
                     val newId = response.substring(3).trim()
                     mainHandler.post { result.success(newId) }
@@ -2113,7 +2248,7 @@ class MainActivity : FlutterActivity() {
         tcpUploadSocket = null
     }
 
-    private fun uploadAssetOverHttp(network: Network?, packageInfo: UploadPackageInfo) {
+    private fun uploadAssetOverHttp(network: Network?, packageInfo: UploadPackageInfo): String? {
         val url = URL(badgeUrl("/upload"))
         val connection = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
         connection.requestMethod = "POST"
@@ -2136,7 +2271,10 @@ class MainActivity : FlutterActivity() {
                 throw IllegalStateException("HTTP $code ${errorText.ifBlank { "上传失败" }}")
             }
 
-            connection.inputStream?.close()
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            return runCatching {
+                JSONObject(body).optString("assignedId").takeIf { it.isNotBlank() }
+            }.getOrNull()
         } finally {
             connection.disconnect()
         }
@@ -2184,15 +2322,13 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun parseBadgeHardware(status: String): String {
-        val token = status.split(' ', '\n', '\r', '\t')
-            .firstOrNull { it.startsWith("hardware=", ignoreCase = true) }
-            ?.substringAfter('=')
-            ?.lowercase()
-        return if (token == "esp32p4") "esp32p4" else "esp32s3"
+        /* P4 remains implemented for a later opt-in release, but the current
+         * app deliberately exposes and packages only the S3 format. */
+        return "esp32s3"
     }
 
     private fun normalizeBadgeHardware(value: String?): String {
-        return if (value.equals("esp32p4", ignoreCase = true)) "esp32p4" else "esp32s3"
+        return "esp32s3"
     }
 
     private fun resolveBadgePackageBudget(sdAvailable: Boolean): Int {
@@ -3777,6 +3913,12 @@ class MainActivity : FlutterActivity() {
 
     private class PackageTooLargeException(message: String) : Exception(message)
 
+    private class TcpUploadException(
+        message: String,
+        val fallbackAllowed: Boolean,
+        cause: Throwable? = null,
+    ) : Exception(message, cause)
+
     companion object {
         private const val CHANNEL = "esp_baji/native"
         private const val BADGE_DEVICE_NAME = "DotLoop"
@@ -3791,7 +3933,13 @@ class MainActivity : FlutterActivity() {
         private const val WRITE_TIMEOUT_MS = 30000L
         private const val WIFI_CONNECT_TIMEOUT_MS = 45000L
         private const val HTTP_CONNECT_TIMEOUT_MS = 15000
+        private const val PREVIEW_CONNECT_TIMEOUT_MS = 3000
+        private const val PREVIEW_READ_TIMEOUT_MS = 5000
         private const val UPLOAD_TCP_CONNECT_TIMEOUT_MS = 6000
+        private const val SWITCH_TCP_CONNECT_TIMEOUT_MS = 800
+        private const val SWITCH_TCP_RESPONSE_TIMEOUT_MS = 3000
+        private const val SWITCH_COMMAND_ATTEMPTS = 2
+        private const val SWITCH_COMMAND_RETRY_DELAY_MS = 100L
         private const val SWITCH_TCP_ATTEMPTS = 6
         private const val SWITCH_TCP_RETRY_DELAY_MS = 1000L
         private const val CONNECTION_STATUS_MISS_LIMIT = 3

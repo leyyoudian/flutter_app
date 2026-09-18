@@ -10,11 +10,19 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define BADGE_STREAM_SLOT_COUNT 16u
+#define BADGE_STREAM_SLOT_COUNT 24u
 #define BADGE_STREAM_TASK_STACK 4096u
-#define BADGE_STREAM_TASK_PRIORITY 6u
+#define BADGE_STREAM_TASK_PRIORITY 8u
 #define BADGE_STREAM_QUEUE_POLL_MS 5u
 #define BADGE_STREAM_WHOLE_ASSET_CACHE_MAX_BYTES (4u * 1024u * 1024u)
+/* Small loop assets can be started directly from the 4-bit SD stream.  The
+ * whole-asset PSRAM copy is useful for long/heavy clips, but for a short user
+ * clip its fixed SD read dominates the transition latency. */
+#define BADGE_STREAM_FAST_LOOP_CACHE_MAX_BYTES (2u * 1024u * 1024u)
+/* A small package can still contain a few large JPEG frames. Those frames
+ * can consume the whole SD prefetch window and starve the renderer, so only
+ * use direct SD streaming when the largest frame is bounded as well. */
+#define BADGE_STREAM_FAST_LOOP_MAX_FRAME_BYTES (64u * 1024u)
 
 static const char *TAG = "BadgeStream";
 
@@ -193,16 +201,38 @@ esp_err_t badge_stream_start(badge_asset_t *asset,
         return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t cache_ret = try_load_whole_asset_cache(stream);
+    size_t max_payload = max_frame_payload_size(frames, frame_count);
+    bool fast_loop_start = loop &&
+                           asset->header.package_size <= BADGE_STREAM_FAST_LOOP_CACHE_MAX_BYTES &&
+                           max_payload <= BADGE_STREAM_FAST_LOOP_MAX_FRAME_BYTES;
+    /* Any non-looping asset is a transition/entrance path.  Never block its
+       first frame on a whole-package PSRAM copy; the SD producer fills the
+       queue asynchronously while the player starts rendering. */
+    bool fast_transition_start = !loop;
+    bool fast_sd_start = fast_loop_start || fast_transition_start;
+    ESP_LOGI(TAG, "stream policy: loop=%d package=%u max_frame=%u fast_sd=%d",
+             loop ? 1 : 0,
+             (unsigned)asset->header.package_size,
+             (unsigned)max_payload,
+             fast_sd_start ? 1 : 0);
+    esp_err_t cache_ret = fast_sd_start ? ESP_ERR_NOT_SUPPORTED
+                                        : try_load_whole_asset_cache(stream);
     if (cache_ret != ESP_OK && cache_ret != ESP_ERR_NOT_SUPPORTED && cache_ret != ESP_ERR_NO_MEM) {
         ESP_LOGW(TAG, "whole-asset cache load failed: %s; using SD stream", esp_err_to_name(cache_ret));
     } else if (cache_ret == ESP_ERR_NO_MEM) {
         ESP_LOGW(TAG, "whole-asset cache unavailable: no PSRAM; using SD stream");
     } else if (cache_ret == ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGD(TAG, "asset exceeds whole-asset cache limit; using SD stream");
+        if (fast_loop_start) {
+            ESP_LOGI(TAG, "fast loop start: using SD prefetch for small asset (%u bytes)",
+                     (unsigned)asset->header.package_size);
+        } else if (fast_transition_start) {
+            ESP_LOGI(TAG, "fast transition start: using SD prefetch for short asset (%u bytes)",
+                     (unsigned)asset->header.package_size);
+        } else {
+            ESP_LOGD(TAG, "asset exceeds whole-asset cache limit; using SD stream");
+        }
     }
 
-    size_t max_payload = max_frame_payload_size(frames, frame_count);
     for (uint32_t i = 0; i < BADGE_STREAM_SLOT_COUNT; ++i) {
         if (!stream->cache_active) {
             stream->slots[i].data = heap_caps_malloc(max_payload, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

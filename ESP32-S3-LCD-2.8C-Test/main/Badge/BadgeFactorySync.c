@@ -31,7 +31,7 @@ static const char *TAG = "BadgeFactorySync";
 #define BADGE_FACTORY_CATALOG_MAX 32768u
 #define BADGE_FACTORY_MAX_FILES 96u
 #define BADGE_FACTORY_HTTP_TIMEOUT_MS 12000u
-#define BADGE_FACTORY_HTTP_BUFFER_SIZE 4096u
+#define BADGE_FACTORY_HTTP_BUFFER_SIZE (32u * 1024u)
 #define BADGE_FACTORY_DIR "/sdcard/.factory"
 #define BADGE_FACTORY_SYNC_DIR "/sdcard/.factory_sync"
 #define BADGE_FACTORY_CATALOG_FILE "/sdcard/.factory/catalog.json"
@@ -106,7 +106,7 @@ static esp_err_t mkdir_recursive(const char *dir)
 
 static esp_err_t mkdir_parent_for_file(const char *file_path)
 {
-    char dir[128];
+    char dir[160];
     snprintf(dir, sizeof(dir), "%s", file_path);
     char *slash = strrchr(dir, '/');
     if (slash == NULL) {
@@ -309,10 +309,16 @@ static esp_err_t download_file(const char *url, const char *out_path, size_t exp
     if (status != 200) {
         ret = ESP_FAIL;
     }
+    uint8_t *buf = malloc(BADGE_FACTORY_HTTP_BUFFER_SIZE);
+    if (buf == NULL) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
     int total = 0;
-    char buf[BADGE_FACTORY_HTTP_BUFFER_SIZE];
     while (ret == ESP_OK) {
-        int n = esp_http_client_read(client, buf, sizeof(buf));
+        int n = esp_http_client_read(client, (char *)buf, BADGE_FACTORY_HTTP_BUFFER_SIZE);
         if (n < 0) {
             ret = ESP_FAIL;
             break;
@@ -325,10 +331,10 @@ static esp_err_t download_file(const char *url, const char *out_path, size_t exp
             break;
         }
         total += n;
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    free(buf);
     fclose(f);
     if (ret != ESP_OK || (size_t)total != expected_size || !file_matches(out_path, expected_size, expected_sha)) {
         unlink(out_path);
@@ -339,6 +345,36 @@ static esp_err_t download_file(const char *url, const char *out_path, size_t exp
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static void publish_bootstrap_file_if_empty(const factory_file_t *file,
+                                            int revision)
+{
+    if (file == NULL || badge_anim_mgr_factory_count() != 0 ||
+        strcmp(file->path, "first_half/F001.eb4") != 0) {
+        return;
+    }
+
+    char tmp_path[160];
+    char final_path[128];
+    snprintf(tmp_path, sizeof(tmp_path), BADGE_FACTORY_SYNC_DIR "/%d/%s",
+             revision, file->path);
+    snprintf(final_path, sizeof(final_path), "/sdcard/%s", file->path);
+
+    if (mkdir_parent_for_file(final_path) != ESP_OK ||
+        rename(tmp_path, final_path) != 0) {
+        ESP_LOGW(TAG, "bootstrap factory file publish failed: %s errno=%d",
+                 file->path, errno);
+        return;
+    }
+
+    esp_err_t ret = badge_anim_mgr_rescan();
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "bootstrap factory animation ready; background sync continues");
+    } else {
+        ESP_LOGW(TAG, "bootstrap factory animation rescan failed: %s",
+                 esp_err_to_name(ret));
+    }
 }
 
 static int installed_revision(void)
@@ -578,6 +614,7 @@ static void factory_sync_task(void *arg)
             vTaskDelete(NULL);
             return;
         }
+        publish_bootstrap_file_if_empty(&files[i], revision);
     }
 
     ret = commit_downloads(revision, files, file_count);

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Factory Animation Encoder - MP4 to EBAJ4 for ESP32 badge."""
+"""Factory animation encoder for ESP32-S3 (EBAJ4) and ESP32-P4 (EBAJ5)."""
 
 import os
 import json
@@ -14,8 +14,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "animation_comd"
 OUT_DIR = ROOT / "animation_sd"
+OUT_DIR_P4 = ROOT / "animation_sd_p4"
 
-FPS = 40
+S3_FPS = 40
+# P4 panel runs at exactly 90.0 Hz (pclk = 90 * H_TOTAL * V_TOTAL). Source
+# assets must be 90 fps so frames map 1:1 onto scanout; 100 fps assets beat
+# against the 90 Hz panel (frames alternate between one and two VSYNCs),
+# which reads as judder and vertical-shift tearing during switches.
+P4_FPS = 90
+FPS = S3_FPS
 WIDTH = 480
 HEIGHT = 480
 ZOOM = 1.1  # default scale-up factor
@@ -45,6 +52,8 @@ FRAME_ENTRY_SIZE = 16
 TILE_SIZE = 16
 MAGIC = 0x344A4142
 VERSION = 4
+MAGIC_P4 = 0x354A4142
+VERSION_P4 = 5
 CODEC_KEY = 0x10
 CODEC_TILE = 0x11
 CODEC_REPEAT = 0x12
@@ -52,6 +61,35 @@ FLAG_LZ4 = 0x80
 LZ4_MIN_MATCH = 4
 LZ4_HASH_LOG = 14
 LZ4_HASH_SIZE = 1 << LZ4_HASH_LOG
+
+TARGET_SPECS = {
+    "s3": {
+        "magic": MAGIC,
+        "version": VERSION,
+        "fps": S3_FPS,
+        "extension": ".eb4",
+    },
+    "p4": {
+        "magic": MAGIC_P4,
+        "version": VERSION_P4,
+        "fps": P4_FPS,
+        "extension": ".eb5",
+    },
+}
+
+
+def target_spec(target):
+    try:
+        return TARGET_SPECS[target]
+    except KeyError as exc:
+        raise ValueError(f"unsupported hardware target: {target}") from exc
+
+
+def target_output_paths(s3_root, p4_root, folder, asset_id):
+    return (
+        Path(s3_root) / folder / f"{asset_id}.eb4",
+        Path(p4_root) / folder / f"{asset_id}.eb5",
+    )
 
 
 def make_dial_mp4(mp4, out_mp4, size=480, fps=30, zoom=1.0):
@@ -221,7 +259,7 @@ def rgb888_to_rgb565(r, g, b):
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
 
-def mp4_to_palette_frames(mp4, tmp_dir, ss=480, zoom=ZOOM):
+def mp4_to_palette_frames(mp4, tmp_dir, ss=480, zoom=ZOOM, fps=FPS):
     """ffmpeg: optimal palette + Bayer-dithered frames with optional ZOOM crop."""
     palette_png = tmp_dir / "palette.png"
     if zoom != 1.0:
@@ -232,7 +270,7 @@ def mp4_to_palette_frames(mp4, tmp_dir, ss=480, zoom=ZOOM):
     subprocess.run([
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(mp4),
-        "-vf", f"fps={FPS},{scale_crop},palettegen=stats_mode=diff:max_colors={PALETTE_ENTRIES}",
+        "-vf", f"fps={fps},{scale_crop},palettegen=stats_mode=diff:max_colors={PALETTE_ENTRIES}",
         str(palette_png)
     ], check=True)
     subprocess.run([
@@ -240,23 +278,38 @@ def mp4_to_palette_frames(mp4, tmp_dir, ss=480, zoom=ZOOM):
         "-i", str(mp4),
         "-i", str(palette_png),
         "-lavfi",
-        f"fps={FPS},{scale_crop}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+        f"fps={fps},{scale_crop}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
         str(tmp_dir / "frame_%04d.png")
     ], check=True)
     return palette_png, sorted(tmp_dir.glob("frame_*.png"))
 
 
-def read_palette_rgb(palette_png):
-    """Read ffmpeg palette PNG, return list of (R,G,B) tuples + 512-byte RGB565 palette."""
+def encode_palette(colors, target="s3"):
+    """Encode an indexed palette for the selected hardware display bus."""
+    target_spec(target)
+    if target == "s3":
+        pal = bytearray(len(colors) * 2)
+        for i, (r, g, b) in enumerate(colors):
+            value = rgb888_to_rgb565(r, g, b)
+            struct.pack_into("<H", pal, i * 2, value)
+        return bytes(pal)
+
+    pal = bytearray(len(colors) * 3)
+    for i, (r, g, b) in enumerate(colors):
+        # esp_lcd's 24-bit framebuffer byte order is B, G, R. The panel uses
+        # the upper six bits from each byte on its 18 physical RGB data lines.
+        pal[i * 3] = b & 0xFC
+        pal[i * 3 + 1] = g & 0xFC
+        pal[i * 3 + 2] = r & 0xFC
+    return bytes(pal)
+
+
+def read_palette_rgb(palette_png, target="s3"):
+    """Read ffmpeg palette PNG and encode it for S3 RGB565 or P4 RGB666."""
     from PIL import Image
     img = Image.open(palette_png).convert("RGB")
     colors = list(img.getdata())[:PALETTE_ENTRIES]
-    pal = bytearray(PALETTE_BYTES)
-    for i, (r, g, b) in enumerate(colors):
-        v = rgb888_to_rgb565(r, g, b)
-        pal[i * 2] = v & 0xFF
-        pal[i * 2 + 1] = (v >> 8) & 0xFF
-    return colors, bytes(pal)
+    return colors, encode_palette(colors, target)
 
 
 def build_lut(palette_rgb):
@@ -310,10 +363,11 @@ def enc_tile(pal, idx, prev, ss):
             if ch:
                 dirty.append((ty * tc + tx, tx, ty))
     n = len(dirty)
-    out = bytearray(PALETTE_BYTES + 2 + n * (2 + TILE_SIZE * TILE_SIZE))
-    out[:PALETTE_BYTES] = pal
-    struct.pack_into('<H', out, PALETTE_BYTES, n)
-    off = PALETTE_BYTES + 2
+    palette_bytes = len(pal)
+    out = bytearray(palette_bytes + 2 + n * (2 + TILE_SIZE * TILE_SIZE))
+    out[:palette_bytes] = pal
+    struct.pack_into('<H', out, palette_bytes, n)
+    off = palette_bytes + 2
     for ti, tx, ty in dirty:
         struct.pack_into('<H', out, off, ti)
         off += 2
@@ -358,9 +412,65 @@ def lz4_compress(data):
     return bytes(o[:od])
 
 
+def badge_fw_lz4_decompress(src, dst_len):
+    """Python replica of the firmware badge_lz4_decompress (BadgeLz4.c).
+
+    Returns the decompressed bytes or None if the stream is undecodable.
+    Used to guarantee every compressed frame round-trips before shipping."""
+    ip = 0
+    iend = len(src)
+    out = bytearray()
+    while ip < iend:
+        token = src[ip]
+        ip += 1
+        literal_len = token >> 4
+        if literal_len == 15:
+            while True:
+                if ip >= iend:
+                    return None
+                s = src[ip]
+                ip += 1
+                literal_len += s
+                if s != 255:
+                    break
+        if iend - ip < literal_len or dst_len - len(out) < literal_len:
+            return None
+        out += src[ip:ip + literal_len]
+        ip += literal_len
+        if ip == iend:
+            break
+        if iend - ip < 2:
+            return None
+        match_offset = src[ip] | (src[ip + 1] << 8)
+        ip += 2
+        if match_offset == 0 or match_offset > len(out):
+            return None
+        match_len = token & 0x0F
+        if match_len == 15:
+            while True:
+                if ip >= iend:
+                    return None
+                s = src[ip]
+                ip += 1
+                match_len += s
+                if s != 255:
+                    break
+        match_len += LZ4_MIN_MATCH
+        if dst_len - len(out) < match_len:
+            return None
+        m = len(out) - match_offset
+        for _ in range(match_len):
+            out.append(out[m])
+            m += 1
+    return bytes(out) if len(out) == dst_len else None
+
+
 def cwrap(raw):
     c = lz4_compress(raw)
-    if len(c) + 4 < len(raw):
+    # Only ship the compressed form when the firmware decoder can fully
+    # round-trip it; otherwise fall back to raw storage. This guarantees no
+    # frame ever reaches the badge in an undecodable state.
+    if len(c) + 4 < len(raw) and badge_fw_lz4_decompress(c, len(raw)) is not None:
         return struct.pack('<I', len(raw)) + c, FLAG_LZ4
     return raw, 0
 
@@ -375,11 +485,72 @@ def enc_frame(pal, idx, prev, ss, fk=False):
     d,f=cwrap(key); return d,CODEC_KEY,f
 
 
-def pack_ebaj4(fd, fps, ss):
+def _verify_package(buf, spec):
+    """Replay the firmware decode path (predecode + per-codec layout checks)
+    against a packed asset. Raises RuntimeError on the first bad frame so
+    undecodable assets never reach the SD card."""
+    import struct as _struct
+    n = _struct.unpack_from('<H', buf, 12)[0]
+    fto = _struct.unpack_from('<I', buf, 16)[0]
+    version = _struct.unpack_from('<H', buf, 4)[0]
+    stream_w = _struct.unpack_from('<H', buf, 36)[0]
+    stream_h = _struct.unpack_from('<H', buf, 38)[0]
+    pal_entries = _struct.unpack_from('<H', buf, 40)[0]
+    pal_bytes = pal_entries * (3 if version >= 5 else 2)
+    frame_bytes = stream_w * stream_h
+    max_tiles = (stream_w // TILE_SIZE) * (stream_h // TILE_SIZE)
+    max_payload = 2 * 1024 * 1024
+    for i in range(n):
+        e = fto + i * FRAME_ENTRY_SIZE
+        data_offset = _struct.unpack_from('<I', buf, e)[0]
+        data_size = _struct.unpack_from('<I', buf, e + 4)[0]
+        codec = buf[e + 10]
+        flags = buf[e + 11]
+        stored = buf[data_offset:data_offset + data_size]
+        payload = b''
+        if (flags & FLAG_LZ4) and data_size >= 4:
+            header_len = _struct.unpack_from('<I', stored, 0)[0]
+            if header_len > max_payload:
+                raise RuntimeError(
+                    f"frame {i}: implausible LZ4 header {header_len}")
+            payload = badge_fw_lz4_decompress(stored[4:], header_len)
+            if payload is None:
+                raise RuntimeError(
+                    f"frame {i}: LZ4 stream fails firmware decode "
+                    f"(codec={codec:02X} stored={data_size})")
+        elif data_size > 0:
+            payload = stored
+        if codec == CODEC_KEY:
+            expected = pal_bytes + frame_bytes
+            if len(payload) < expected:
+                raise RuntimeError(
+                    f"frame {i}: KEY payload {len(payload)} < {expected}")
+        elif codec == CODEC_TILE:
+            if len(payload) < pal_bytes + 2:
+                raise RuntimeError(
+                    f"frame {i}: TILE payload {len(payload)} too small")
+            tile_count = _struct.unpack_from('<H', payload, pal_bytes)[0]
+            expected = pal_bytes + 2 + tile_count * (2 + TILE_SIZE * TILE_SIZE)
+            if len(payload) < expected:
+                raise RuntimeError(
+                    f"frame {i}: TILE payload {len(payload)} < {expected} "
+                    f"(n={tile_count})")
+            if tile_count > max_tiles:
+                raise RuntimeError(
+                    f"frame {i}: TILE n={tile_count} > {max_tiles}")
+        elif codec == CODEC_REPEAT:
+            pass
+        else:
+            raise RuntimeError(f"frame {i}: unknown codec {codec:02X}")
+    return n
+
+
+def pack_ebaj(fd, fps, ss, target="s3"):
+    spec = target_spec(target)
     n=len(fd); db=sum(len(f[0]) for f in fd)
     fto=HEADER_SIZE; fdo=HEADER_SIZE+n*FRAME_ENTRY_SIZE; ps=fdo+db
     buf=bytearray(ps)
-    struct.pack_into('<I',buf,0,MAGIC); struct.pack_into('<H',buf,4,VERSION)
+    struct.pack_into('<I',buf,0,spec["magic"]); struct.pack_into('<H',buf,4,spec["version"])
     struct.pack_into('<H',buf,6,HEADER_SIZE); struct.pack_into('<H',buf,8,WIDTH)
     struct.pack_into('<H',buf,10,HEIGHT); struct.pack_into('<H',buf,12,n)
     struct.pack_into('<H',buf,14,fps); struct.pack_into('<I',buf,16,fto)
@@ -397,17 +568,22 @@ def pack_ebaj4(fd, fps, ss):
     return bytes(buf)
 
 
-def process(mp4, out, ss=480, zoom=ZOOM):
+def pack_ebaj4(fd, fps, ss):
+    """Compatibility wrapper retained for existing S3 callers."""
+    return pack_ebaj(fd, fps, ss, "s3")
+
+
+def process(mp4, out, ss=480, zoom=ZOOM, target="s3", fps=None):
     import tempfile
-    print(f"  {mp4.name} -> {out.name} (zoom={zoom}x)")
+    spec = target_spec(target)
+    fps = spec["fps"] if fps is None else fps
+    print(f"  [{target.upper()}] {mp4.name} -> {out.name} ({fps} fps, zoom={zoom}x)")
     with tempfile.TemporaryDirectory() as tmp:
         td = Path(tmp)
-        palette_png, frames = mp4_to_palette_frames(mp4, td, ss, zoom=zoom)
+        palette_png, frames = mp4_to_palette_frames(mp4, td, ss, zoom=zoom, fps=fps)
         if not frames:
             raise RuntimeError("no frames")
-        if not frames:
-            raise RuntimeError("no frames")
-        palette_rgb, pal = read_palette_rgb(palette_png)
+        palette_rgb, pal = read_palette_rgb(palette_png, target)
         print(f"    building LUT for {len(palette_rgb)} colors...")
         lut = build_lut(palette_rgb)
         ef = []
@@ -417,10 +593,17 @@ def process(mp4, out, ss=480, zoom=ZOOM):
             d, c, f = enc_frame(pal, idx, prev, ss, i == 0)
             ef.append((d, c, f))
             prev = idx
-        eb4 = pack_ebaj4(ef, FPS, ss)
+        package = pack_ebaj(ef, fps, ss, target)
+        _verify_package(package, spec)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(eb4)
-        print(f"    {len(eb4)} bytes, {len(ef)} frames")
+        out.write_bytes(package)
+        print(f"    {len(package)} bytes, {len(ef)} frames, firmware-decode verified")
+
+
+def process_for_s3_and_p4(mp4, folder, asset_id, zoom=ZOOM):
+    s3_out, p4_out = target_output_paths(OUT_DIR, OUT_DIR_P4, folder, asset_id)
+    process(mp4, s3_out, zoom=zoom, target="s3", fps=S3_FPS)
+    process(mp4, p4_out, zoom=zoom, target="p4", fps=P4_FPS)
 
 
 def preview_frame_score(frame):
@@ -461,7 +644,7 @@ def preview(mp4, out, zoom=1.0):
 
 
 def main():
-    print("="*60); print("Factory Animation Encoder"); print("="*60)
+    print("="*60); print("Factory Animation Encoder (S3 + P4)"); print("="*60)
     try:
         subprocess.run(["ffmpeg","-version"],capture_output=True,check=True)
     except: print("ERROR: ffmpeg not found"); sys.exit(1)
@@ -473,20 +656,20 @@ def main():
     print("\nEncoding...")
     for pid,f1,f2 in pairs:
         z = get_zoom(pid)
-        process(f1, OUT_DIR/"first_half"/f"{pid}.eb4", zoom=z)
-        if f2: process(f2, OUT_DIR/"second_half"/f"{pid}.eb4", zoom=z)
+        process_for_s3_and_p4(f1, "first_half", pid, zoom=z)
+        if f2: process_for_s3_and_p4(f2, "second_half", pid, zoom=z)
     loops = discover_factory_loop_sources()
     if loops:
         print(f"\nFactory loop animations ({len(loops)}):")
         for pid, mp4 in loops:
-            process(mp4, OUT_DIR/"factory_loop"/f"{pid}.eb4", zoom=1.0)
+            process_for_s3_and_p4(mp4, "factory_loop", pid, zoom=1.0)
     # Special transition animations (third_half)
     third = find_third()
     if third:
         print(f"\nSpecial transitions ({len(third)}):")
         for eid, mp4 in third:
             z = get_third_zoom(eid)
-            process(mp4, OUT_DIR/"third_half"/f"{eid}.eb4", zoom=z)
+            process_for_s3_and_p4(mp4, "third_half", eid, zoom=z)
     print("\nPreviews...")
     pd=ROOT/"app_gif"/"assets"/"factory_previews"; pd.mkdir(parents=True,exist_ok=True)
     # Build transition map from third_half files
@@ -556,7 +739,8 @@ def main():
     if import_items:
         zip_path = write_factory_import_zip(import_items, OUT_DIR / "factory-import.zip")
         print(f"  {zip_path} ({len(import_items)} import candidate(s))")
-    print(f"\nDone! Output: {OUT_DIR}\nCopy to SD card.")
+    print(f"\nDone! S3 output: {OUT_DIR}")
+    print(f"P4 output: {OUT_DIR_P4}\nCopy the matching folder set to each SD card.")
 
 
 if __name__=="__main__": main()

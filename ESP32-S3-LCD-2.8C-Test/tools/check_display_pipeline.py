@@ -47,6 +47,9 @@ assert "esp_err_t draw_ret = esp_lcd_panel_draw_bitmap" in switch_body and "draw
 assert "badge_display_request_refresh()" in switch_body, (
     "refresh-on-demand RGB playback should explicitly request one panel refresh per new frame"
 )
+assert "esp_cache_msync" in switch_body and "ESP_CACHE_MSYNC_FLAG_DIR_C2M" in switch_body, (
+    "S3 must write CPU-rendered PSRAM framebuffers back before RGB DMA scans them"
+)
 assert "LCD_WaitForPreparedVsync" not in switch_body and "vsync wait after framebuffer refresh failed" not in switch_body, (
     "normal playback should request refresh without blocking every frame on VSYNC"
 )
@@ -62,9 +65,16 @@ assert main_source.index("ST7701S_PrepareBootCs()") < main_source.index("vTaskDe
 assert "BADGE_EBAJ_MAGIC_V4" in protocol_source, "protocol must define EBAJ4"
 assert "preload_asset_to_psram" not in display_source, "player must not preload full SD asset into PSRAM"
 assert "BadgeStream.h" in display_source, "display path must use streamed SD prefetch"
-assert "#define BADGE_STREAM_SLOT_COUNT 16u" in stream_source, "SD stream prefetch should keep more frames buffered"
-assert "#define BADGE_STREAM_PREFILL_FRAMES 16u" in display_source, "player should prefill the full stream queue before playback"
+assert "#define BADGE_STREAM_SLOT_COUNT 24u" in stream_source, "SD stream prefetch should keep more frames buffered"
+assert "#define BADGE_STREAM_PREFILL_FRAMES 16u" in display_source, "player should prefill enough frames for smooth playback"
+assert "#define BADGE_STREAM_PREFILL_TIMEOUT_MS 500u" in display_source, "player should bound switch startup prefill latency"
 assert "#define BADGE_SD_READ_STAGING_BYTES (256u * 1024u)" in storage_source, "SD reads should use a larger staging buffer when memory allows"
+assert "sd_read_buf_offset" in storage_source and "sd_read_buf_valid" in storage_source, (
+    "SD asset reads should keep a logical read-ahead window instead of issuing one fread per frame"
+)
+assert "fread(asset->sd_read_buf, 1, asset->sd_read_buf_size" in storage_source, (
+    "SD read-ahead should refill the staging window with a large sequential read"
+)
 assert "BadgeIndexed.h" in display_source, "display path must decode indexed EBAJ4 frames"
 assert "badge_stream_read_frame" in display_source, "player must consume prefetched frame payloads"
 assert "frame_delay_us = (int64_t)badge_protocol_frame_delay_ms(asset->header.fps) * 1000" in display_source, (

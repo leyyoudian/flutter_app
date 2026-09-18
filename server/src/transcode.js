@@ -13,6 +13,10 @@ const ebaj = require('./ebaj');
 
 const DEFAULT_OUTPUT_FPS = 60;
 const MAX_OUTPUT_FPS = 80;
+/* The original S3 player validates EBAJ4 fps against 25..40.  P4's JPEG
+ * path can use the general 80 fps ceiling, but an S3 package above 40 fps is
+ * rejected only after the entire upload has been received. */
+const MAX_S3_OUTPUT_FPS = 40;
 const P4_JPEG_QUALITY = 5;
 
 function normalizeTranscodeHardware(value) {
@@ -235,6 +239,7 @@ async function transcodeToEbaj({ inputPath, outputPath, fps, streamSize, crop, h
 module.exports = {
   DEFAULT_OUTPUT_FPS,
   MAX_OUTPUT_FPS,
+  MAX_S3_OUTPUT_FPS,
   ffmpegAvailable,
   ffprobeVideo,
   normalizeTranscodeHardware,
