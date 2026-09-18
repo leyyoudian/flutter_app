@@ -475,15 +475,21 @@ esp_err_t badge_storage_open_asset_path(const char *path, badge_asset_t *out)
     }
 
     /* Allocate DMA-capable read buffer for SD reads */
-    size_t read_buf_size = BADGE_SD_READ_STAGING_BYTES;
-    uint8_t *read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (read_buf == NULL) {
-        read_buf_size = BADGE_SD_READ_STAGING_FALLBACK_BYTES;
+    static const size_t read_buf_candidates[] = {
+        BADGE_SD_READ_STAGING_BYTES,
+        BADGE_SD_READ_STAGING_FALLBACK_BYTES,
+        BADGE_SD_READ_STAGING_MIN_BYTES,
+        32u * 1024u,
+        16u * 1024u,
+    };
+    size_t read_buf_size = 0;
+    uint8_t *read_buf = NULL;
+    for (size_t i = 0; i < sizeof(read_buf_candidates) / sizeof(read_buf_candidates[0]); ++i) {
+        read_buf_size = read_buf_candidates[i];
         read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    }
-    if (read_buf == NULL) {
-        read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES;
-        read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (read_buf != NULL) {
+            break;
+        }
     }
     if (read_buf == NULL) {
         fclose(file);
@@ -533,15 +539,21 @@ esp_err_t badge_storage_open_active_asset(badge_asset_t *out)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    size_t read_buf_size = BADGE_SD_READ_STAGING_BYTES;
-    uint8_t *read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (read_buf == NULL) {
-        read_buf_size = BADGE_SD_READ_STAGING_FALLBACK_BYTES;
+    static const size_t read_buf_candidates[] = {
+        BADGE_SD_READ_STAGING_BYTES,
+        BADGE_SD_READ_STAGING_FALLBACK_BYTES,
+        BADGE_SD_READ_STAGING_MIN_BYTES,
+        32u * 1024u,
+        16u * 1024u,
+    };
+    size_t read_buf_size = 0;
+    uint8_t *read_buf = NULL;
+    for (size_t i = 0; i < sizeof(read_buf_candidates) / sizeof(read_buf_candidates[0]); ++i) {
+        read_buf_size = read_buf_candidates[i];
         read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    }
-    if (read_buf == NULL) {
-        read_buf_size = BADGE_SD_READ_STAGING_MIN_BYTES;
-        read_buf = heap_caps_malloc(read_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (read_buf != NULL) {
+            break;
+        }
     }
     if (read_buf == NULL) {
         fclose(file);

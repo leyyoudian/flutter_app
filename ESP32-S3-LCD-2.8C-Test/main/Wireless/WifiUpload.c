@@ -1641,13 +1641,9 @@ static esp_err_t finish_upload_session(badge_upload_session_t *session, const ch
     esp_err_t ret = badge_storage_finish_upload();
     if (ret != ESP_OK) {
         badge_storage_abort_upload();
-        badge_display_exit_upload_mode();
         return ret;
     }
 
-    badge_display_exit_upload_mode();
-    /* Give the player task a chance to start before we block on recv. */
-    vTaskDelay(pdMS_TO_TICKS(10));
     badge_upload_perf_t perf = {0};
     badge_storage_get_last_upload_perf(&perf);
     int64_t total_us = session->recv_us + perf.storage_write_us + perf.crc_us + perf.finish_us;
@@ -2526,10 +2522,14 @@ static esp_err_t upload_handler(httpd_req_t *req)
     ret = finish_upload_session(&session, "HTTP");
     free_upload_session_buffers(&session);
     if (ret != ESP_OK) {
+        badge_display_exit_upload_mode();
         ESP_LOGE(TAG, "finish upload failed: %s", esp_err_to_name(ret));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ret));
         return ESP_FAIL;
     }
+    /* Release upload buffers before waking the player.  The player needs
+       internal DMA memory to open the next SD asset. */
+    badge_display_exit_upload_mode();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -2788,12 +2788,20 @@ static esp_err_t handle_tcp_upload(int sock)
             ESP_LOGI(TAG, "User upload saved as %s", user_path);
             /* Let anim mgr handle it so NVS persistence + state update works */
             badge_anim_mgr_play(user_id, BADGE_PLAY_MODE_LOOP);
+            /* Release upload buffers before waking the player.  Otherwise
+               the next asset open can fail with ESP_ERR_NO_MEM under
+               ESP-Hosted. */
+            badge_display_exit_upload_mode();
             char response[64];
             snprintf(response, sizeof(response), "OK %s\n", user_id);
             send_tcp_line(sock, response);
             return ESP_OK;
         }
         ESP_LOGW(TAG, "Failed to rename upload to user folder: errno=%d", errno);
+        ret = ESP_FAIL;
+    }
+    if (ret != ESP_OK) {
+        badge_display_exit_upload_mode();
     }
     return ret;
 }
