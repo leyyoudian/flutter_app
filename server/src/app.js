@@ -669,8 +669,8 @@ function shouldReplacePreview(existingMime, nextMime) {
   return previewMimeRank(nextMime) > previewMimeRank(existingMime);
 }
 
-function assetReviewStatusForTransfer(directDeviceTransfer) {
-  return directDeviceTransfer ? 'approved' : 'pending';
+function assetReviewStatusForTransfer() {
+  return 'pending';
 }
 
 function removeRelativeFile(dataDir, relativePath) {
@@ -2173,12 +2173,6 @@ function createApp(options = {}) {
                   saveJson(metadataFile, items);
                 }
               }
-              if (job.directDeviceTransfer && duplicate.status !== 'approved') {
-                duplicate.status = 'approved';
-                duplicate.reviewedAt = new Date().toISOString();
-                duplicate.reviewer = 'device-direct';
-                saveJson(metadataFile, items);
-              }
               job.status = 'done';
               job.assetId = duplicate.id;
               job.reviewStatus = duplicate.status;
@@ -2207,10 +2201,9 @@ function createApp(options = {}) {
             const id = crypto.randomUUID();
             const packagePath = path.join(packagesDir, `${id}.eb4`);
             fs.copyFileSync(outputPath, packagePath);
-            const directDeviceTransfer = job.directDeviceTransfer;
             const item = {
               id,
-              status: assetReviewStatusForTransfer(directDeviceTransfer),
+              status: assetReviewStatusForTransfer(),
               name,
               userId,
               hardware,
@@ -2224,10 +2217,6 @@ function createApp(options = {}) {
               previewMime,
               submittedAt: new Date().toISOString(),
             };
-            if (directDeviceTransfer) {
-              item.reviewedAt = item.submittedAt;
-              item.reviewer = 'device-direct';
-            }
             items.unshift(item);
             saveJson(metadataFile, items);
 

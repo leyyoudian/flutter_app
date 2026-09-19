@@ -29,8 +29,8 @@ test('package reuse never crosses the S3 and P4 hardware formats', () => {
   assert.equal(findDuplicateAsset(items, 'same', '123', 456, 'esp32p4').id, 'p4');
 });
 
-test('direct device transfers are immediately approved while offline review stays pending', () => {
-  assert.equal(assetReviewStatusForTransfer(true), 'approved');
+test('direct device transfers still require admin approval', () => {
+  assert.equal(assetReviewStatusForTransfer(true), 'pending');
   assert.equal(assetReviewStatusForTransfer(false), 'pending');
 });
 
