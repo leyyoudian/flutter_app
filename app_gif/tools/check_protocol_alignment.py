@@ -12,6 +12,12 @@ android_main = (
 ).read_text(encoding="utf-8")
 ios_delegate = (ROOT / "ios" / "Runner" / "AppDelegate.swift").read_text(encoding="utf-8")
 
+parse_sd_start = ios_delegate.index("private func parseSdAvailable(_ status: String) -> Bool")
+parse_sd_end = ios_delegate.index("private func parseBadgeHardware", parse_sd_start)
+assert "return status.split" in ios_delegate[parse_sd_start:parse_sd_end], (
+    "iOS SD status parser must explicitly return its Bool result"
+)
+
 assert "#define BADGE_EBAJ_MIN_FPS 25u" in firmware_protocol, "firmware protocol must reject packages below 25fps"
 assert "#define BADGE_EBAJ_DEFAULT_FPS 25u" in firmware_protocol, "firmware protocol must default to 25fps"
 assert "#define BADGE_EBAJ_MAX_FPS 30u" in firmware_protocol, "firmware protocol must accept up to 30fps"

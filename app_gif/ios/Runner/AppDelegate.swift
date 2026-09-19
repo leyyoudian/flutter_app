@@ -1917,7 +1917,7 @@ import UIKit
 
   private func parseSdAvailable(_ status: String) -> Bool {
     badgeHardware = parseBadgeHardware(status)
-    status.split { $0 == " " || $0 == "\n" || $0 == "\r" || $0 == "\t" }
+    return status.split { $0 == " " || $0 == "\n" || $0 == "\r" || $0 == "\t" }
       .contains { token in token.lowercased() == "sd=1" || token.lowercased() == "storage=sd" }
   }
 
