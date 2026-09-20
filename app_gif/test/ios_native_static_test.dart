@@ -309,6 +309,10 @@ void main() {
       expect(source, contains('randomCommandAttempts = 4'));
       expect(source, contains('randomCommandRetryDelayMs = 120'));
       expect(dartSource, contains('bool _randomUpdating = false;'));
+      expect(dartSource, contains('int _randomOperationGeneration = 0;'));
+      expect(dartSource, contains('final refreshGeneration = ++_randomOperationGeneration;'));
+      expect(dartSource, contains('refreshGeneration != _randomOperationGeneration'));
+      expect(dartSource, contains('++_randomOperationGeneration;'));
       expect(dartSource, contains('if (_randomUpdating)'));
       expect(dartSource, contains('onTap: updating ? null :'));
     },

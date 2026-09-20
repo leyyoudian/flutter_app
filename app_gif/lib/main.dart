@@ -96,6 +96,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   bool _reviewRefreshInFlight = false;
   bool _randomEnabled = false;
   bool _randomUpdating = false;
+  int _randomOperationGeneration = 0;
   bool _pendingDeviceDeletesLoaded = false;
   Completer<void>? _deviceDeleteSync;
   Future<void>? _pendingDeviceDeletesLoad;
@@ -410,9 +411,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     if (_demoMode || !_connected || _randomUpdating) {
       return;
     }
+    final refreshGeneration = ++_randomOperationGeneration;
     try {
       final enabled = await _invokeNative<bool>('getRandomMode');
-      if (!mounted || enabled == null) {
+      if (!mounted ||
+          enabled == null ||
+          _randomUpdating ||
+          refreshGeneration != _randomOperationGeneration) {
         return;
       }
       setState(() => _randomEnabled = enabled);
@@ -437,6 +442,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       return;
     }
     final previous = _randomEnabled;
+    final operationGeneration = ++_randomOperationGeneration;
     setState(() {
       _randomUpdating = true;
       _randomEnabled = enabled;
@@ -447,12 +453,15 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         'enabled': enabled,
       });
       if (!mounted) return;
-      if (deviceEnabled != null) {
+      if (deviceEnabled != null &&
+          operationGeneration == _randomOperationGeneration) {
         setState(() => _randomEnabled = deviceEnabled);
       }
     } catch (e) {
       if (!mounted) return;
-      setState(() => _randomEnabled = previous);
+      if (operationGeneration == _randomOperationGeneration) {
+        setState(() => _randomEnabled = previous);
+      }
       _showSnack('随机播放设置失败: $e');
     } finally {
       if (mounted) {
