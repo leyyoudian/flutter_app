@@ -61,6 +61,11 @@ void main() {
     expect(source, contains('endBackgroundTask'));
     expect(plist, contains('NSLocalNetworkUsageDescription'));
     expect(plist, contains('NSAppTransportSecurity'));
+    expect(plist, contains('<key>NSExceptionDomains</key>'));
+    expect(plist, contains('<key>47.108.204.22</key>'));
+    expect(plist, contains('<key>60.205.122.153</key>'));
+    expect(plist, contains('<key>NSExceptionAllowsInsecureHTTPLoads</key>'));
+    expect(plist, isNot(contains('<key>NSAllowsArbitraryLoads</key>\n\t\t<true/>')));
     expect(plist, contains('CFBundleDisplayName'));
     expect(plist, isNot(contains('<string>App Gif</string>')));
     expect(plist, isNot(contains('<string>app_gif</string>')));

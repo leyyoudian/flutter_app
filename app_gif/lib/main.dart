@@ -75,7 +75,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.23';
+  static const _appVersion = '1.0.25';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
