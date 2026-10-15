@@ -42,6 +42,13 @@ void main() {
     tester,
   ) async {
     final semantics = tester.ensureSemantics();
+    bool? selectedState(String label) => tester
+        .widgetList<Semantics>(
+          find.ancestor(of: find.text(label), matching: find.byType(Semantics)),
+        )
+        .singleWhere((widget) => widget.properties.selected != null)
+        .properties
+        .selected;
     final previousLanguage = LanguageSettings.current.value;
     LanguageSettings.current.value = AppLanguage.chinese;
     addTearDown(() => LanguageSettings.current.value = previousLanguage);
@@ -59,27 +66,14 @@ void main() {
         ),
       ),
     );
-    expect(
-      tester
-          .getSemantics(find.text('我的素材'))
-          .hasFlag(ui.SemanticsFlag.isSelected),
-      isTrue,
-    );
+    expect(tester.getSemantics(find.text('我的素材')).label, '我的素材');
+    expect(selectedState('我的素材'), isTrue);
     await tester.tap(find.text('出厂素材'));
     await tester.pumpAndSettle();
     expect(selected, 1);
-    expect(
-      tester
-          .getSemantics(find.text('出厂素材'))
-          .hasFlag(ui.SemanticsFlag.isSelected),
-      isTrue,
-    );
-    expect(
-      tester
-          .getSemantics(find.text('我的素材'))
-          .hasFlag(ui.SemanticsFlag.isSelected),
-      isFalse,
-    );
+    expect(tester.getSemantics(find.text('出厂素材')).label, '出厂素材');
+    expect(selectedState('出厂素材'), isTrue);
+    expect(selectedState('我的素材'), isFalse);
     semantics.dispose();
   });
   testWidgets('static preview detaches after frame zero and owns its image', (

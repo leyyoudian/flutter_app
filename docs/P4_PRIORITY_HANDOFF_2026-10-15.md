@@ -67,3 +67,9 @@ Windows 可构建 Android 与 ESP-IDF P4 固件；iOS 仅完成源代码合同�
 ## iOS / Android 一致性与 GitHub 交付追加
 
 用户随后要求互动、样式、素材上传等向当前 Android 对齐，并推送 GitHub 供 Codemagic 构建。后续目标版本已递增至 **1.0.30+32**；Android 手机上先前安装的仍是 1.0.29+31。修复范围、平台差异及云端版本策略见 `docs/IOS_ANDROID_PARITY_2026-10-15.md`。
+
+## Android 1.0.31 与 Codemagic 检查修复追加
+
+- 最新版本为 **1.0.31+33**，版本显示同步更新。修复云端检查中三处 `hasFlag` 弃用调用，保留素材分栏的选中状态验证，并把该测试加入两份 Codemagic 配置。分析检查仍严格执行。
+- Flutter 全量 **160 项通过**、`flutter analyze lib test` 无问题、iOS 构建号脚本 **5 项通过**；Android release APK 构建成功，签名与线上旧版一致。
+- Android APK 已发布到主备下载服务器；连接手机已覆盖安装成功并读回 1.0.31+33。本次不发布固件、不操作已寄出的 P4。发布与手机安装状态详见 `docs/IOS_ANDROID_PARITY_2026-10-15.md` 的 1.0.31 追加记录。
