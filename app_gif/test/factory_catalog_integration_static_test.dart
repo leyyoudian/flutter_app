@@ -7,6 +7,7 @@ void main() {
     'main screen starts factory catalog sync and supports file previews',
     () {
       final source = File('lib/main.dart').readAsStringSync();
+      final preview = File('lib/preview_player.dart').readAsStringSync();
 
       expect(source, contains("import 'factory_catalog_sync.dart';"));
       expect(source, contains("FactoryCatalogSync.syncOnce"));
@@ -16,8 +17,8 @@ void main() {
       expect(source, contains('anim.isLoop'));
       expect(source, contains('selectedFactory?.isLoop == true'));
       expect(source, contains('looping: selectedFactory?.isLoop == true'));
-      expect(source, contains('await c.setLooping(widget.looping)'));
-      expect(source, contains('if (widget.looping) return;'));
+      expect(preview, contains('await c.setLooping(widget.looping)'));
+      expect(preview, contains('if (widget.looping) return;'));
     },
   );
 

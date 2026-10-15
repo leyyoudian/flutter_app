@@ -53,7 +53,7 @@ void main() {
     expect(source, contains('codecIndexedTile = 0x11'));
     expect(source, contains('codecIndexedRepeat = 0x12'));
     expect(source, contains('videoPreviewGifSize = 192'));
-    expect(source, contains('videoPreviewGifFps = 30'));
+    expect(source, contains('videoPreviewGifFps = 25'));
     expect(source, contains('qualityStreamBytesPerSecond = 10 * 512 * 1024'));
     expect(source, contains('playbackStreamBytesPerSecond = 10 * 512 * 1024'));
     expect(source, contains('uploadChunkBytes = 256 * 1024'));
@@ -65,7 +65,10 @@ void main() {
     expect(plist, contains('<key>47.108.204.22</key>'));
     expect(plist, contains('<key>60.205.122.153</key>'));
     expect(plist, contains('<key>NSExceptionAllowsInsecureHTTPLoads</key>'));
-    expect(plist, isNot(contains('<key>NSAllowsArbitraryLoads</key>\n\t\t<true/>')));
+    expect(
+      plist,
+      isNot(contains('<key>NSAllowsArbitraryLoads</key>\n\t\t<true/>')),
+    );
     expect(plist, contains('CFBundleDisplayName'));
     expect(plist, isNot(contains('<string>App Gif</string>')));
     expect(plist, isNot(contains('<string>app_gif</string>')));
@@ -315,11 +318,19 @@ void main() {
       expect(source, contains('randomCommandRetryDelayMs = 120'));
       expect(dartSource, contains('bool _randomUpdating = false;'));
       expect(dartSource, contains('int _randomOperationGeneration = 0;'));
-      expect(dartSource, contains('final refreshGeneration = ++_randomOperationGeneration;'));
-      expect(dartSource, contains('refreshGeneration != _randomOperationGeneration'));
+      expect(
+        dartSource,
+        contains('final refreshGeneration = ++_randomOperationGeneration;'),
+      );
+      expect(
+        dartSource,
+        contains('refreshGeneration != _randomOperationGeneration'),
+      );
       expect(dartSource, contains('++_randomOperationGeneration;'));
       expect(dartSource, contains('if (_randomUpdating)'));
-      expect(dartSource, contains('onTap: updating ? null :'));
+      final modeUi = File('lib/reference_ui.dart').readAsStringSync();
+      expect(modeUi, contains('if (updating)'));
+      expect(modeUi, contains('Switch('));
     },
   );
 }

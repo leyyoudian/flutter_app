@@ -136,7 +136,7 @@ void main() {
     );
     expect(
       ensureSource,
-      contains('if (fastUpload && !badgeWifiManagedRequest)'),
+      contains('if (!forceAp && fastUpload && !badgeWifiManagedRequest)'),
     );
     expect(
       ensureSource,

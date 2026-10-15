@@ -1,41 +1,134 @@
 import 'dart:io';
 
 import 'package:app_gif/main.dart';
+import 'package:app_gif/reference_ui.dart';
+import 'package:app_gif/app_language.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  setUp(() => LanguageSettings.current.value = AppLanguage.chinese);
+  testWidgets(
+    'home keeps text navigation and its large preview fixed above the grid',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(400, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const BadgeApp());
+      await tester.pumpAndSettle();
+      expect(find.text('首页'), findsOneWidget);
+      expect(find.byTooltip('设置'), findsOneWidget);
+      expect(find.text('DotLoop'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('video-home-preview-card')),
+        findsNothing,
+      );
+      final navigationRect = tester.getRect(
+        find.byKey(const ValueKey('video-top-nav')),
+      );
+      final previewRect = tester.getRect(find.byKey(const ValueKey('fixed-home-preview')));
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, -160));
+      await tester.pumpAndSettle();
+      expect(
+        tester.getRect(find.byKey(const ValueKey('video-top-nav'))),
+        navigationRect,
+      );
+      expect(tester.getRect(find.byKey(const ValueKey('fixed-home-preview'))), previewRect);
+      expect(find.byKey(const ValueKey('preview-filter-frost')), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('nav-4')));
+      await tester.pumpAndSettle();
+      expect(find.text('设置与隐私'), findsOneWidget);
+    },
+  );
+
+  testWidgets('playback mode cannot send another toggle while updating', (
+    tester,
+  ) async {
+    var commands = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ReferenceLoopPage(
+            enabled: true,
+            updating: true,
+            factoryCount: 23,
+            onChanged: (_) => commands++,
+            onBack: () {},
+          ),
+        ),
+      ),
+    );
+    expect(find.byType(Switch), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(commands, 0);
+  });
   testWidgets('shows the badge GIF workspace', (tester) async {
     await tester.pumpWidget(const BadgeApp());
     await tester.pumpAndSettle();
 
     expect(find.text('ESP-BAJI'), findsNothing);
-    expect(find.byIcon(Icons.grid_view_rounded), findsWidgets);
-    expect(find.byIcon(Icons.add_photo_alternate_outlined), findsOneWidget);
+    expect(find.byKey(const ValueKey('nav-4')), findsOneWidget);
+    expect(find.byKey(const ValueKey('nav-1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('nav-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('find-animation')), findsOneWidget);
     expect(find.text('导入'), findsNothing);
   });
 
+  testWidgets(
+    'my library opens the import sheet and can close without picking media',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(400, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const BadgeApp());
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('我的素材'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('add-material')),
+        200,
+      );
+      await tester.tap(find.byKey(const ValueKey('add-material')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('video-upload-sheet')), findsOneWidget);
+      await tester.enterText(find.byKey(const ValueKey('maker-name')), '我的视频');
+      await tester.tap(find.byKey(const ValueKey('close-maker')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('video-upload-sheet')), findsNothing);
+      expect(find.byKey(const ValueKey('find-animation')), findsOneWidget);
+    },
+  );
+
   testWidgets('uses plain colored connection text without page crossfade', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(400, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(const BadgeApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('nav-0')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('连接设备'), findsOneWidget);
+    expect(find.text('已下载'), findsOneWidget);
+    expect(find.byKey(const ValueKey('device-alignment')), findsNothing);
+    expect(find.byType(AnimatedSwitcher), findsNothing);
+  });
+
+  testWidgets('keeps video navigation at the top and search at the bottom', (
     tester,
   ) async {
     await tester.pumpWidget(const BadgeApp());
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byIcon(Icons.wifi_find));
-    await tester.pumpAndSettle();
-
-    final status = tester.widget<Text>(find.text('未连接'));
-    expect(status.style?.color, const Color(0xffff5b5b));
-    expect(find.byType(AnimatedSwitcher), findsNothing);
-  });
-
-  testWidgets('uses a compact custom floating bottom bar', (tester) async {
-    await tester.pumpWidget(const BadgeApp());
-    await tester.pumpAndSettle();
-
     expect(find.byType(NavigationBar), findsNothing);
     expect(find.byType(NavigationDestination), findsNothing);
-    expect(find.byKey(const ValueKey('floating-bottom-nav')), findsOneWidget);
+    expect(find.byKey(const ValueKey('floating-bottom-nav')), findsNothing);
+    final nav = tester.getRect(find.byKey(const ValueKey('video-top-nav')));
+    final search = tester.getRect(find.byKey(const ValueKey('find-animation')));
+    expect(nav.bottom, lessThan(search.top));
+    await tester.tap(find.byKey(const ValueKey('find-animation')));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsOneWidget);
   });
 
   testWidgets('privacy policy link is on device page but not home page', (
@@ -46,9 +139,14 @@ void main() {
 
     expect(find.text('隐私政策'), findsNothing);
 
-    await tester.tap(find.byIcon(Icons.wifi_find));
+    await tester.tap(find.byKey(const ValueKey('nav-0')));
     await tester.pumpAndSettle();
 
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('privacy-policy-link')),
+      250,
+      scrollable: find.byType(Scrollable).last,
+    );
     expect(find.text('隐私政策'), findsOneWidget);
     expect(find.byKey(const ValueKey('privacy-policy-link')), findsOneWidget);
   });
@@ -125,8 +223,18 @@ void main() {
     expect(source, contains('AppLifecycleState.resumed'));
     expect(source, contains('_appActive'));
     expect(source, contains('_previewActive'));
-    expect(source, contains('bool get _previewActive => _appActive && !_preparing;'));
-    expect(source, isNot(contains('bool get _previewActive => _appActive && !_preparing && !_uploading;')));
+    expect(
+      source,
+      contains('bool get _previewActive => _appActive && !_preparing;'),
+    );
+    expect(
+      source,
+      isNot(
+        contains(
+          'bool get _previewActive => _appActive && !_preparing && !_uploading;',
+        ),
+      ),
+    );
     expect(source, contains('previewActive && _pageIndex == 1'));
     expect(source, contains('previewActive && _pageIndex == 2'));
     expect(source, isNot(contains('DevicePreview(')));
@@ -141,10 +249,13 @@ void main() {
       source,
       isNot(contains(r"key: ValueKey('history-video-${entry.assetPath}')")),
     );
-    expect(source, contains('if (active && _hasPreviewPath(entry.animatedPreviewPath))'));
+    expect(
+      source,
+      contains('child = StaticMaterialPreview('),
+    );
     expect(source, contains('_PreviewDial('));
     expect(source, contains('active: active'));
-    expect(source, contains('active: active && !preparing'));
+    expect(source, contains('active: widget.active && !widget.preparing'));
     expect(source, contains('active: active'));
     expect(source, isNot(contains('active: active && !uploading')));
     expect(source, isNot(contains('asset?.assetPath != entry.assetPath')));
@@ -154,12 +265,26 @@ void main() {
   test('animated image previews stay visible while upload disables taps', () {
     final source = File('lib/main.dart').readAsStringSync();
 
-    expect(source, contains('onTap: uploading ? null : () => onHistoryTap(entry)'));
+    expect(
+      source,
+      matches(RegExp(r'onTap:\s*uploading\s*\?\s*null\s*:\s*\(\) => onHistoryTap\(entry\)')),
+    );
     expect(source, contains('active: active'));
     expect(source, isNot(contains('active: active && !uploading')));
-    expect(source, contains('if (active && _hasPreviewPath(entry.animatedPreviewPath))'));
-    expect(source, contains('if (active && _hasPreviewPath(selected?.animatedPreviewPath))'));
-    expect(source, contains('else if (active && _hasPreviewPath(asset?.animatedPreviewPath))'));
+    expect(
+      source,
+      contains('child = StaticMaterialPreview('),
+    );
+    expect(
+      source,
+      contains('if (active && _hasPreviewPath(selected?.animatedPreviewPath))'),
+    );
+    expect(
+      source,
+      contains(
+        'else if (active && _hasPreviewPath(asset?.animatedPreviewPath))',
+      ),
+    );
   });
 
   test('history previews hide missing files instead of showing error icons', () {
@@ -169,14 +294,24 @@ void main() {
     expect(source, contains('bool _previewFileExists'));
     expect(source, contains("'deleteAssetFiles'"));
     expect(source, contains('_deleteNativeAssetFiles'));
-    expect(source, isNot(contains('bool _hasPreviewPath(String? path) => path != null && path.isNotEmpty;')));
+    expect(
+      source,
+      isNot(
+        contains(
+          'bool _hasPreviewPath(String? path) => path != null && path.isNotEmpty;',
+        ),
+      ),
+    );
   });
 
   test('privacy policy is public and opened through native url launcher', () {
     final source = File('lib/main.dart').readAsStringSync();
     final privacy = File('../docs/privacy.html').readAsStringSync();
 
-    expect(source, contains('https://leyyoudian.github.io/flutter_app/privacy.html'));
+    expect(
+      source,
+      contains('https://leyyoudian.github.io/flutter_app/privacy.html'),
+    );
     expect(source, contains("'openUrl'"));
     expect(source, contains('privacy-policy-link'));
     expect(privacy, contains('ESP Baji Privacy Policy'));

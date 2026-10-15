@@ -63,6 +63,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URL
+import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.util.LinkedHashSet
 import java.util.LinkedHashMap
@@ -96,7 +97,7 @@ class MainActivity : FlutterActivity() {
     @Volatile private var isUploading = false
     @Volatile private var badgeWifiNetwork: Network? = null
     @Volatile private var badgeSdAvailable = false
-    @Volatile private var badgeHardware = "esp32s3"
+    @Volatile private var badgeHardware = "esp32p4"
     @Volatile private var badgeWifiManagedRequest = false
     @Volatile private var badgeDirectIpMode = false
     @Volatile private var activeBadgeHost = BADGE_AP_HOST
@@ -106,6 +107,10 @@ class MainActivity : FlutterActivity() {
     private var badgeWifiCallback: ConnectivityManager.NetworkCallback? = null
     private var uploadWifiLock: WifiManager.WifiLock? = null
     private var tcpUploadSocket: Socket? = null
+    private val gameBluetooth by lazy { GameBluetoothController(this) }
+    private var pendingGamePermission: MethodChannel.Result? = null
+    private var pendingApPermission: MethodChannel.Result? = null
+    private class BackendUnavailable(message: String) : java.io.IOException(message)
 
     private data class UploadPackageInfo(
         val file: File,
@@ -139,6 +144,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        gameBluetooth.close()
         stopScan()
         stopUploadKeepAlive()
         releaseBadgeWifi()
@@ -210,6 +216,23 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 8104) {
+            val pending = pendingApPermission; pendingApPermission = null
+            if (pending != null) {
+                if (hasWifiPermissions()) joinDeviceAccessPoint(pending)
+                else pending.error("wifi_permission", "请允许附近 Wi-Fi／位置权限后重试", null)
+            }
+            return
+        }
+        if (requestCode == 8103) {
+            val pending = pendingGamePermission
+            pendingGamePermission = null
+            if (pending != null) {
+                if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) gameBluetooth.connect(pending)
+                else pending.error("bluetooth_permission", "请允许附近设备／蓝牙权限后重试", null)
+            }
+            return
+        }
         if (requestCode == REQUEST_BLE_PERMISSIONS) {
             sendEvent(
                 mapOf(
@@ -252,6 +275,78 @@ class MainActivity : FlutterActivity() {
                 val value = (call.argument<Int>("value") ?: 70).coerceIn(0, 100)
                 writeBrightness(value, result)
             }
+            "enterCalibration" -> calibrationCommand("enter", null, true, result)
+            "loadLanguage" -> result.success(getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString("app_language", "system"))
+            "saveLanguage" -> {
+                val value = call.argument<String>("language") ?: "system"
+                if (value !in listOf("system", "chinese", "english", "traditionalChinese", "japanese", "russian")) {
+                    result.error("invalid_language", "Invalid language", null)
+                } else {
+                    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putString("app_language", value).apply()
+                    result.success(null)
+                }
+            }
+            "ensureGameBluetooth", "ensureDeviceBluetooth" -> {
+                val permissions = if (Build.VERSION.SDK_INT >= 31) listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+                    else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                if (Build.VERSION.SDK_INT >= 23 && permissions.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+                    if (pendingGamePermission != null) result.error("bluetooth_busy", "正在等待蓝牙权限", null)
+                    else { pendingGamePermission = result; requestPermissions(permissions.toTypedArray(), 8103) }
+                } else gameBluetooth.connect(result)
+            }
+            "gameCommand" -> gameBluetooth.send(call.argument<String>("action") ?: "status", result)
+            "releaseGameBluetooth" -> { gameBluetooth.close(); result.success(null) }
+            "deviceBluetoothState" -> gameBluetooth.connectionInfo(result)
+            "deviceBluetoothCommand" -> gameBluetooth.sendDevice(call.argument<String>("command") ?: "", result)
+            "joinDeviceAccessPoint" -> {
+                if (!hasWifiPermissions()) {
+                    if (pendingApPermission != null) result.error("wifi_busy", "正在等待 Wi-Fi 权限", null)
+                    else { pendingApPermission = result; requestPermissions(requiredAppPermissions().toTypedArray(), 8104) }
+                } else joinDeviceAccessPoint(result)
+            }
+            "leaveDeviceAccessPoint" -> { releaseBadgeWifi(); result.success(null) }
+            "checkFirmwareUpdate", "downloadFirmware", "uploadFirmware" -> {
+                val method = call.method
+                val args = (call.arguments as? Map<*, *>)?.entries
+                    ?.associate { it.key.toString() to it.value } ?: emptyMap()
+                if (isUploading) { result.error("firmware_busy", "设备正在传输文件", null); return }
+                val uploadingFirmware = method == "uploadFirmware"
+                if (uploadingFirmware) isUploading = true
+                Thread {
+                    try {
+                        if (!uploadingFirmware) releaseBadgeWifi()
+                        val transfer = FirmwareTransfer(
+                            File(filesDir, "firmware"),
+                            internet = { url -> url.openConnection() as HttpURLConnection },
+                            device = { url ->
+                                val network = activeBadgeNetworkForRequest(fastUpload = true)
+                                (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+                            },
+                            diagnostic = { android.util.Log.i("BadgeFirmware", it) },
+                        )
+                        val reply = when (method) {
+                            "checkFirmwareUpdate" -> transfer.check(args["backendBase"] as? String ?: "http://47.108.204.22", args["hardware"] as? String ?: "")
+                            "downloadFirmware" -> transfer.download(args)
+                            else -> transfer.upload(args, activeBadgeHost)
+                        }
+                        mainHandler.post { result.success(reply) }
+                    } catch (error: Exception) {
+                        val code = (error as? FirmwareTransfer.Failure)?.code
+                            ?: if (error is java.io.IOException) "network_unavailable" else "firmware_failed"
+                        mainHandler.post { result.error(code, error.message, null) }
+                    } finally { if (uploadingFirmware) isUploading = false }
+                }.start()
+            }
+            "calibrationStatus" -> calibrationCommand("status", null, true, result)
+            "previewCalibration" -> {
+                val angleTenths = call.argument<Int>("angleTenths") ?: 0
+                calibrationCommand("preview", angleTenths, false, result)
+            }
+            "saveCalibration" -> {
+                val angleTenths = call.argument<Int>("angleTenths") ?: 0
+                calibrationCommand("save", angleTenths, false, result)
+            }
+            "cancelCalibration" -> calibrationCommand("cancel", null, false, result)
             "pickMedia" -> pickMedia(result)
             "warmVideoAnimatedPreview" -> {
                 val uri = call.argument<String>("uri")
@@ -320,6 +415,17 @@ class MainActivity : FlutterActivity() {
                 val hardware = normalizeBadgeHardware(call.argument<String>("hardware"))
                 downloadApprovedPackage(assetId, name, hardware, backendBase, result)
             }
+            "inspectLocalPackage" -> {
+                val path = call.argument<String>("assetPath") ?: ""
+                Thread {
+                    try {
+                        val metadata = localPackageMetadata(File(path))
+                        mainHandler.post { result.success(metadata) }
+                    } catch (error: Exception) {
+                        mainHandler.post { result.error("package_invalid", error.message, null) }
+                    }
+                }.start()
+            }
             "loadHistory" -> loadHistory(result)
             "saveHistory" -> {
                 val items = call.arguments as? List<*> ?: emptyList<Any>()
@@ -365,6 +471,15 @@ class MainActivity : FlutterActivity() {
                 }
                 switchToAsset(id, call.argument<String>("crc32"), result)
             }
+            "sendBleControl" -> {
+                val action = call.argument<String>("action") ?: "flap"
+                result.success(sendBleControl(action))
+            }
+            "sendGameControl" -> {
+                val action = call.argument<String>("action") ?: "flap"
+                gameBluetooth.send(action, result)
+            }
+            "gameControlStatus", "readGameControlStatus" -> gameBluetooth.status(result)
             "getDeviceIdentity" -> {
                 runDeviceCommand("IDENTITY\n", "identity_failed", result) { response ->
                     parseDeviceKey(response)
@@ -812,6 +927,46 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
+    private fun calibrationCommand(
+        action: String,
+        angleTenths: Int?,
+        returnsSnapshot: Boolean,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                val network = activeBadgeNetworkForRequest()
+                val angleQuery = angleTenths?.let {
+                    "&angle_tenths=${it.coerceIn(-1800, 1800)}"
+                }.orEmpty()
+                val response = requestBadgeText(
+                    network,
+                    "${badgeUrl("/calibration")}?action=$action$angleQuery",
+                )
+                val payload = JSONObject(response)
+                if (!payload.optBoolean("success", false)) {
+                    throw IllegalStateException(payload.optString("message", "校正失败"))
+                }
+                mainHandler.post {
+                    if (returnsSnapshot) {
+                        result.success(
+                            mapOf(
+                                "angleTenths" to payload.optInt("angleTenths", 0),
+                                "active" to payload.optBoolean("active", false),
+                            ),
+                        )
+                    } else {
+                        result.success(null)
+                    }
+                }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("calibration_failed", error.message ?: "校正失败", null)
+                }
+            }
+        }.start()
+    }
+
     private fun pickMedia(result: MethodChannel.Result) {
         if (pendingPickResult != null) {
             result.error("busy", "正在选择素材", null)
@@ -999,6 +1154,8 @@ class MainActivity : FlutterActivity() {
                 val deviceKey: String? = null
                 sendEvent(mapOf("type" to "uploadProgress", "progress" to 1.0, "message" to "已切换显示"))
                 val resultMap = mutableMapOf<String, Any?>()
+                resultMap["crc32"] = packageInfo.crc
+                resultMap["packageSize"] = packageInfo.size
                 if (assignedId != null) resultMap["assignedId"] = assignedId
                 if (deviceKey != null) resultMap["deviceKey"] = deviceKey
                 mainHandler.post { result.success(resultMap.ifEmpty { null }) }
@@ -1118,10 +1275,21 @@ class MainActivity : FlutterActivity() {
                 mainHandler.post { result.success(response) }
             } catch (error: Exception) {
                 mainHandler.post {
-                    result.error("transcode_failed", error.message ?: "服务器转码失败", null)
+                    val unavailable = error is java.net.SocketException || error is java.net.SocketTimeoutException ||
+                        error is java.net.UnknownHostException || error is BackendUnavailable
+                    result.error(if (unavailable) "network_unavailable" else "transcode_failed", error.message ?: "服务器转码失败", null)
                 }
             }
         }.start()
+    }
+
+    private fun localPackageMetadata(file: File): Map<String, Any> {
+        val info = preparePackageForUpload(file)
+        val header = ByteArray(HEADER_SIZE)
+        java.io.DataInputStream(FileInputStream(file)).use { it.readFully(header) }
+        return mapOf("assetPath" to file.absolutePath, "crc32" to info.crc,
+            "packageSize" to info.size, "frameCount" to readLe16(header, 12),
+            "fps" to readLe16(header, 14))
     }
 
     private fun downloadApprovedPackage(
@@ -1137,15 +1305,13 @@ class MainActivity : FlutterActivity() {
                 sendEvent(mapOf("type" to "transcodeProgress", "stage" to "download", "message" to "下载素材包"))
                 val directory = persistentAssetDirectory("ebaj")
                 val file = File(directory, "${System.currentTimeMillis()}_${safeFileName(name)}.ebaj")
-                if (!downloadAssetPackage(backend, assetId, hardware, file)) {
-                    throw IllegalStateException("素材包下载失败")
-                }
+                downloadAssetPackage(backend, assetId, hardware, file)
                 android.util.Log.i("BadgeTranscode", "downloaded ${file.length()} bytes to ${file.absolutePath}")
-                val response = mapOf("assetPath" to file.absolutePath)
+                val response = localPackageMetadata(file)
                 mainHandler.post { result.success(response) }
             } catch (error: Exception) {
                 mainHandler.post {
-                    result.error("download_failed", error.message ?: "素材包下载失败", null)
+                    result.error(if (error is BackendUnavailable || error is java.net.SocketException || error is SocketTimeoutException) "network_unavailable" else "download_failed", error.message ?: "素材包下载失败", null)
                 }
             }
         }.start()
@@ -1199,7 +1365,8 @@ class MainActivity : FlutterActivity() {
         connection.disconnect()
         if (responseCode !in 200..299) {
             android.util.Log.e("BadgeTranscode", "POST /api/transcode failed $responseCode: $body")
-            return null
+            if (responseCode >= 500) throw BackendUnavailable("服务器暂不可用 HTTP $responseCode")
+            throw IllegalStateException(body.ifBlank { "HTTP $responseCode" })
         }
         return runCatching { JSONObject(body).optString("jobId") }.getOrNull()
     }
@@ -1219,8 +1386,15 @@ class MainActivity : FlutterActivity() {
             val connection = url.openConnection() as HttpURLConnection
             connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
             connection.readTimeout = HTTP_READ_TIMEOUT_MS
-            val body = readResponseBody(connection)
-            connection.disconnect()
+            val body = try {
+                val statusCode = connection.responseCode
+                val response = readResponseBody(connection)
+                if (statusCode >= 500) throw BackendUnavailable("转码服务器暂时不可用 ($statusCode)")
+                if (statusCode !in 200..299) throw IllegalStateException("转码任务查询失败 ($statusCode): $response")
+                response
+            } finally {
+                connection.disconnect()
+            }
             val payload = runCatching { JSONObject(body) }.getOrNull() ?: JSONObject()
             val status = payload.optString("status")
             when (status) {
@@ -1248,12 +1422,30 @@ class MainActivity : FlutterActivity() {
         assetId: String,
         hardware: String,
         target: File,
-    ): Boolean {
+    ) {
         val url = URL("$backend/api/assets/$assetId/package?hardware=$hardware")
         val connection = url.openConnection() as HttpURLConnection
         connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
         connection.readTimeout = HTTP_READ_TIMEOUT_MS
-        return runCatching {
+        connection.instanceFollowRedirects = false
+        try {
+            val status = connection.responseCode
+            if (status !in 200..299) {
+                val detail = readResponseBody(connection).take(512)
+                if (status >= 500) throw BackendUnavailable("素材服务器暂时不可用 HTTP $status")
+                val message = when (status) {
+                    403 -> "素材不可下载，请重新上传"
+                    404 -> "服务器素材包不存在，请重新制作上传"
+                    409 -> "素材包与当前设备型号不匹配或已损坏，请重新制作"
+                    else -> "素材包下载失败 HTTP $status"
+                }
+                throw IllegalStateException("$message $detail")
+            }
+            val mime = connection.contentType ?: ""
+            if (mime.contains("text/html") || mime.contains("application/json")) throw IllegalStateException("服务器未返回有效素材包")
+            val expected = (connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L)
+            val expectedHash = connection.getHeaderField("x-asset-sha256")
+            val digest = MessageDigest.getInstance("SHA-256")
             connection.inputStream.use { input ->
                 target.outputStream().use { output ->
                     val buffer = ByteArray(64 * 1024)
@@ -1261,12 +1453,18 @@ class MainActivity : FlutterActivity() {
                         val read = input.read(buffer)
                         if (read <= 0) break
                         output.write(buffer, 0, read)
+                        digest.update(buffer, 0, read)
                     }
                 }
             }
-            connection.disconnect()
-            target.length() > 0
-        }.getOrDefault(false)
+            if (target.length() == 0L || (expected >= 0 && expected != target.length())) throw IllegalStateException("素材包下载不完整，请重试")
+            val actualHash = digest.digest().joinToString("") { "%02x".format(it) }
+            if (!expectedHash.isNullOrBlank() && !expectedHash.equals(actualHash, ignoreCase = true)) throw IllegalStateException("素材包校验失败，请重试")
+            localPackageMetadata(target)
+        } catch (error: Exception) {
+            target.delete()
+            throw error
+        } finally { connection.disconnect() }
     }
 
     private fun downloadAssetPreview(backend: String, assetId: String, target: File): Boolean {
@@ -1698,15 +1896,28 @@ class MainActivity : FlutterActivity() {
         return "${value and 0xff}.${(value shr 8) and 0xff}.${(value shr 16) and 0xff}.${(value shr 24) and 0xff}"
     }
 
+    private fun joinDeviceAccessPoint(result: MethodChannel.Result) {
+        Thread {
+            try {
+                releaseBadgeWifi()
+                setActiveBadgeHost(BADGE_AP_HOST)
+                ensureBadgeWifiNetwork(fastUpload = true, forceAp = true)
+                runOnUiThread { result.success(true) }
+            } catch (e: Exception) {
+                runOnUiThread { result.error("wifi_connect", e.message ?: "请连接 DotLoop 热点后重试", null) }
+            }
+        }.start()
+    }
+
     @Synchronized
     @SuppressLint("MissingPermission")
-    private fun ensureBadgeWifiNetwork(fastUpload: Boolean = false): Network {
+    private fun ensureBadgeWifiNetwork(fastUpload: Boolean = false, forceAp: Boolean = false): Network {
         if (!hasWifiPermissions()) {
             throw IllegalStateException("请允许 Wi-Fi 权限后重试")
         }
 
         val manager = connectivityManager()
-        if (fastUpload && !badgeWifiManagedRequest) {
+        if (!forceAp && fastUpload && !badgeWifiManagedRequest) {
             val activeNetwork = manager.activeNetwork
             if (activeNetwork != null) {
                 try {
@@ -1734,7 +1945,7 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        manager.activeNetwork?.let { activeNetwork ->
+        if (!forceAp) manager.activeNetwork?.let { activeNetwork ->
             try {
                 reuseBadgeNetworkIfReachable(manager, activeNetwork, "已连接 Wi-Fi")?.let {
                     return it
@@ -1754,7 +1965,7 @@ class MainActivity : FlutterActivity() {
             return network
         }
 
-        findExistingBadgeWifiNetwork(manager)?.let { network ->
+        if (!forceAp) findExistingBadgeWifiNetwork(manager)?.let { network ->
             bindBadgeWifiNetwork(network)
             sendEvent(mapOf("type" to "status", "message" to "已复用 ${connectedAddress ?: BADGE_WIFI_SSID}"))
             return network
@@ -2322,13 +2533,16 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun parseBadgeHardware(status: String): String {
-        /* P4 remains implemented for a later opt-in release, but the current
-         * app deliberately exposes and packages only the S3 format. */
-        return "esp32s3"
+        return status.split(Regex("\\s+"))
+            .firstOrNull { it.startsWith("hardware=", ignoreCase = true) }
+            ?.substringAfter('=')
+            ?.lowercase()
+            ?.let { if (it.startsWith("esp32s3")) "esp32s3" else "esp32p4" }
+            ?: "esp32p4"
     }
 
     private fun normalizeBadgeHardware(value: String?): String {
-        return "esp32s3"
+        return if (value?.lowercase()?.startsWith("esp32s3") == true) "esp32s3" else "esp32p4"
     }
 
     private fun resolveBadgePackageBudget(sdAvailable: Boolean): Int {
@@ -2371,6 +2585,80 @@ class MainActivity : FlutterActivity() {
         return writeCharacteristicSync(characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
     }
 
+    private fun sendBleControl(action: String): Boolean {
+        val payload = "GB:$action".toByteArray(Charsets.UTF_8)
+        return writeControl(payload)
+    }
+
+    private fun gameCommand(action: String, result: MethodChannel.Result) {
+        result.success(sendBleControl(action))
+    }
+
+    /**
+     * Send a game action over the Wi-Fi / TCP control channel.
+     *
+     * The app reaches the badge over Wi-Fi (TCP + HTTP), not BLE - the BLE
+     * path exists for a phone that pairs directly, but a normally connected
+     * badge is talking TCP. Sending "start" only over BLE therefore did
+     * nothing on a Wi-Fi-connected badge: the badge never left animation
+     * playback and the game screen never appeared.
+     *
+     * The firmware routes both transports through the same dispatcher, so the
+     * action vocabulary is identical ("start", "flap", "restart", "pause",
+     * "resume", "stop"). We speak the raw TCP line protocol here because that
+     * is the channel every other device command already uses.
+     */
+    private fun sendGameControl(action: String, result: MethodChannel.Result) {
+        val normalized = action.trim().lowercase()
+        if (normalized !in GAME_ACTIONS) {
+            result.error("bad_action", "不支持的游戏指令：$action", null)
+            return
+        }
+        if (activeBadgeHost.isBlank()) {
+            result.error("not_connected", "请先连接设备", null)
+            return
+        }
+        Thread {
+            try {
+                acquireUploadWifiLock()
+                val network = activeBadgeNetworkForRequest(fastUpload = true)
+                val response = sendRawTcpCommandWithRetry(network, "GAME $normalized\n")
+                if (!response.startsWith("OK")) {
+                    throw IllegalStateException(response.ifBlank { "游戏指令失败" })
+                }
+                mainHandler.post { result.success(response.trim()) }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    result.error("game_failed", error.message ?: "游戏指令失败", null)
+                }
+            } finally {
+                releaseUploadWifiLock(keepIfConnected = true)
+            }
+        }.start()
+    }
+
+    /** Read the badge's current game state without changing it. */
+    private fun readGameControlStatus(result: MethodChannel.Result) {
+        if (activeBadgeHost.isBlank()) {
+            mainHandler.post { result.success(null) }
+            return
+        }
+        Thread {
+            try {
+                acquireUploadWifiLock()
+                val network = activeBadgeNetworkForRequest(fastUpload = true)
+                val response = sendRawTcpCommandWithRetry(network, "GAME status\n")
+                mainHandler.post { result.success(response.trim()) }
+            } catch (_: Exception) {
+                // A status probe is best-effort: an offline badge just means
+                // the page falls back to its idle state.
+                mainHandler.post { result.success(null) }
+            } finally {
+                releaseUploadWifiLock(keepIfConnected = true)
+            }
+        }.start()
+    }
+
     private fun writeData(payload: ByteArray): Boolean {
         val characteristic = dataCharacteristic ?: return false
         return writeCharacteristicSync(characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -2410,6 +2698,7 @@ class MainActivity : FlutterActivity() {
             "connected" to (connectedAddress != null && (badgeWifiNetwork != null || badgeDirectIpMode)),
             "address" to connectedAddress,
             "sdAvailable" to badgeSdAvailable,
+            "hardware" to badgeHardware,
             "message" to if (connectedAddress == null) "未连接" else "已连接",
         )
     }
@@ -2424,6 +2713,7 @@ class MainActivity : FlutterActivity() {
                             "address" to connectedAddress,
                             "sdAvailable" to badgeSdAvailable,
                             "message" to "上传中",
+                            "hardware" to badgeHardware,
                         ),
                     )
                 }
@@ -2488,6 +2778,7 @@ class MainActivity : FlutterActivity() {
                         "address" to connectedAddress,
                         "sdAvailable" to badgeSdAvailable,
                         "message" to "已发现局域网设备",
+                        "hardware" to badgeHardware,
                     )
                 } else {
                     connectionState()
@@ -2680,6 +2971,9 @@ class MainActivity : FlutterActivity() {
                 "deviceAssetId" to item.optString("deviceAssetId", null),
                 "crc32" to item.optLong("crc32"),
                 "createdAt" to item.optLong("createdAt"),
+                "reviewId" to item.optString("reviewId", null),
+                "name" to item.optString("name", "asset"),
+                "needsPackageIdentity" to item.optBoolean("needsPackageIdentity", false),
             )
         }
         return output
@@ -2694,6 +2988,9 @@ class MainActivity : FlutterActivity() {
             item.put("deviceAssetId", map["deviceAssetId"])
             item.put("crc32", map["crc32"])
             item.put("createdAt", map["createdAt"])
+            item.put("reviewId", map["reviewId"])
+            item.put("name", map["name"])
+            item.put("needsPackageIdentity", map["needsPackageIdentity"])
             array.put(item)
         }
         return getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -3969,6 +4266,12 @@ class MainActivity : FlutterActivity() {
         private const val PREFS_NAME = "esp_baji"
         private const val HISTORY_KEY = "history"
         private const val PENDING_DEVICE_DELETES_KEY = "pending_device_deletes_v1"
+
+        /* Actions the badge's game dispatcher accepts. Kept in one place so the
+         * app and the firmware vocabulary cannot silently drift apart. */
+        private val GAME_ACTIONS = setOf(
+            "start", "flap", "restart", "pause", "resume", "stop", "status",
+        )
 
         private const val WIDTH = 480
         private const val HEIGHT = 480

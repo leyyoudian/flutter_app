@@ -51,6 +51,15 @@ bool isRetryableBackendError(Object error) {
   return false;
 }
 
+Future<T> withLocalTranscodeFallback<T>(Future<T> Function() server,
+    Future<T> Function() local) async {
+  try { return await server(); }
+  catch (error) {
+    if (!isRetryableBackendError(error)) rethrow;
+    return local();
+  }
+}
+
 Future<T> withBackendFailover<T>(
   Iterable<Uri> candidates,
   Future<T> Function(Uri base) operation, {

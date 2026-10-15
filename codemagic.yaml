@@ -14,6 +14,10 @@ workflows:
         distribution_type: app_store
         bundle_identifier: com.domainname.DotLoop
     scripts:
+      - name: Set unique release version
+        script: |
+          set -euo pipefail
+          python3 tool/ios_ci_version.py --project-build-number "${PROJECT_BUILD_NUMBER:?Codemagic project build number is required}" >> "$CM_ENV"
       - name: Get Flutter packages
         script: |
           flutter packages pub get
@@ -25,6 +29,12 @@ workflows:
           pod install --repo-update
           cd ..
           rm -f ios/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+      - name: Check shared UI and iOS feature contracts
+        script: |
+          set -euo pipefail
+          python3 -m unittest discover -s tool -p test_ios_ci_version.py
+          flutter analyze lib test
+          flutter test test/interaction_parity_test.dart test/app_language_test.dart test/p4_priority_ui_test.dart test/calibration_test.dart test/device_control_test.dart test/firmware_update_test.dart test/game_controller_recovery_test.dart test/ios_priority_parity_test.dart test/ios_native_static_test.dart test/ios_firmware_static_test.dart test/package_identity_test.dart test/p4_asset_target_test.dart test/preview_player_test.dart
       - name: Set up App Store code signing
         script: |
           xcode-project use-profiles
@@ -37,7 +47,7 @@ workflows:
           pod deintegrate || true
           pod install --repo-update
           cd ..
-          flutter build ipa --release --export-options-plist=$HOME/export_options.plist
+          flutter build ipa --release --build-name="$FLUTTER_BUILD_NAME" --build-number="$FLUTTER_BUILD_NUMBER" --export-options-plist=$HOME/export_options.plist
     artifacts:
       - build/ios/ipa/*.ipa
       - flutter_drive.log
@@ -58,6 +68,10 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
+      - name: Set unique release version
+        script: |
+          set -euo pipefail
+          python3 tool/ios_ci_version.py --project-build-number "${PROJECT_BUILD_NUMBER:?Codemagic project build number is required}" >> "$CM_ENV"
       - name: Get Flutter packages
         script: |
           flutter packages pub get
@@ -66,7 +80,7 @@ workflows:
           find . -name "Podfile" -execdir pod install \;
       - name: Build ad-hoc iOS release IPA for sideloading
         script: |
-          flutter build ios --release --no-codesign
+          flutter build ios --release --no-codesign --build-name="$FLUTTER_BUILD_NAME" --build-number="$FLUTTER_BUILD_NUMBER"
           APP_PATH="build/ios/iphoneos/Runner.app"
           test -d "$APP_PATH"
           if [ -e "$APP_PATH/Runner.debug.dylib" ] || [ -e "$APP_PATH/__preview.dylib" ]; then

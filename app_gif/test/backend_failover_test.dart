@@ -4,6 +4,16 @@ import 'package:app_gif/backend_failover.dart';
 import 'package:flutter/services.dart';
 
 void main() {
+  test('local conversion is only a transport fallback, never a moderation bypass', () async {
+    var localRuns = 0;
+    Future<String> local() async { localRuns++; return 'local-pending-review'; }
+    expect(await withLocalTranscodeFallback<String>(() async => 'server-package', local), 'server-package');
+    expect(localRuns, 0);
+    expect(await withLocalTranscodeFallback<String>(() async => throw PlatformException(code: 'network_unavailable'), local), 'local-pending-review');
+    expect(localRuns, 1);
+    await expectLater(withLocalTranscodeFallback<String>(() async => throw PlatformException(code: 'transcode_failed', message: 'rejected'), local), throwsA(isA<PlatformException>()));
+    expect(localRuns, 1);
+  });
   test(
     'production backend candidates prefer new server and retain fallback',
     () {

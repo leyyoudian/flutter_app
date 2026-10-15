@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.25+27
+version: 1.0.30+32
 
 environment:
   sdk: ^3.8.1
@@ -29,6 +29,8 @@ environment:
 # versions available, run `flutter pub outdated`.
 dependencies:
   flutter:
+    sdk: flutter
+  flutter_localizations:
     sdk: flutter
 
   # The following adds the Cupertino Icons font to your application.
@@ -60,6 +62,17 @@ flutter:
   uses-material-design: true
   assets:
     - assets/factory_previews/
+    - assets/fly_bird/
+    - assets/fonts/roboto_license.txt
+  fonts:
+    - family: Roboto
+      fonts:
+        - asset: assets/fonts/roboto-regular.ttf
+          weight: 400
+        - asset: assets/fonts/roboto-medium.ttf
+          weight: 500
+        - asset: assets/fonts/roboto-bold.ttf
+          weight: 700
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

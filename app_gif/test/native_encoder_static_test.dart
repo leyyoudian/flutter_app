@@ -152,7 +152,7 @@ void main() {
   test('video animated previews use sequential decode at full preview fps', () {
     final source = File(
       'android/app/src/main/kotlin/com/example/app_gif/MainActivity.kt',
-    ).readAsStringSync();
+    ).readAsStringSync().replaceAll('\r\n', '\n');
     final previewStart = source.indexOf(
       '        fun buildVideoAnimatedPreview(\n            context: Context,',
     );

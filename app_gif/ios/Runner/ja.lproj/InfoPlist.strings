@@ -1,0 +1,4 @@
+"NSBluetoothAlwaysUsageDescription" = "Bluetooth で DotLoop デバイスに接続し、再生、明るさ、角度調整、ゲームを操作します。";
+"NSBluetoothPeripheralUsageDescription" = "Bluetooth で DotLoop デバイスに接続し、再生、明るさ、角度調整、ゲームを操作します。";
+"NSLocalNetworkUsageDescription" = "DotLoop デバイスに接続して、アニメーションとファームウェア更新を転送します。";
+"NSPhotoLibraryUsageDescription" = "画像、GIF、動画を追加してアニメーションを作成します。";

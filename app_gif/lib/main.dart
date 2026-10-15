@@ -5,17 +5,27 @@ import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
 import 'factory_catalog_sync.dart';
+import 'preview_player.dart';
 import 'device_asset_delete.dart';
+import 'device_control.dart';
 import 'transcode_policy.dart';
 import 'backend_failover.dart';
+import 'calibration.dart';
+import 'reference_ui.dart';
+import 'app_language.dart';
+import 'fly_bird.dart';
+import 'firmware_update.dart';
+import 'p4_asset_target.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  unawaited(LanguageSettings.load());
   runApp(const BadgeApp());
 }
 
@@ -31,30 +41,51 @@ class BadgeApp extends StatelessWidget {
       onSurface: Colors.white,
     );
 
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'ESP Baji',
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        colorScheme: scheme,
-        fontFamily: 'Roboto',
-        scaffoldBackgroundColor: Colors.black,
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
+    return ValueListenableBuilder<AppLanguage>(
+      valueListenable: LanguageSettings.current,
+      builder: (context, language, child) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        locale: language == AppLanguage.system
+            ? null
+            : LanguageSettings.localeFor(language),
+        supportedLocales: const [
+          Locale('en'),
+          Locale('zh', 'CN'),
+          Locale('zh', 'TW'),
+          Locale('ja'),
+          Locale('ru'),
+        ],
+        localizationsDelegates: GlobalMaterialLocalizations.delegates,
+        localeResolutionCallback: (locale, supported) =>
+            LanguageSettings.localeFor(
+              language == AppLanguage.system
+                  ? LanguageSettings.resolve(locale ?? const Locale('en'))
+                  : language,
+            ),
+        title: 'ESP Baji',
+        theme: ThemeData(
+          useMaterial3: true,
+          platform: TargetPlatform.android,
+          brightness: Brightness.dark,
+          colorScheme: scheme,
+          fontFamily: 'Roboto',
+          scaffoldBackgroundColor: Colors.black,
+          filledButtonTheme: FilledButtonThemeData(
+            style: FilledButton.styleFrom(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
             ),
           ),
+          sliderTheme: SliderThemeData(
+            activeTrackColor: Colors.white,
+            inactiveTrackColor: Colors.white.withValues(alpha: 0.18),
+            thumbColor: Colors.white,
+            overlayColor: Colors.white.withValues(alpha: 0.12),
+          ),
         ),
-        sliderTheme: SliderThemeData(
-          activeTrackColor: Colors.white,
-          inactiveTrackColor: Colors.white.withValues(alpha: 0.18),
-          thumbColor: Colors.white,
-          overlayColor: Colors.white.withValues(alpha: 0.12),
-        ),
+        home: const BadgeHomePage(),
       ),
-      home: const BadgeHomePage(),
     );
   }
 }
@@ -75,7 +106,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.25';
+  static const _appVersion = '1.0.30';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -83,10 +114,27 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   Timer? _connectionTimer;
   final Map<String, Completer<String?>> _assetPreviewWaiters = {};
   int _pageIndex = 1;
+  int _libraryFilter = 0;
+  int _alignmentAngleTenths = 0;
   int _brightness = 70;
   bool _scanning = false;
   bool _connecting = false;
   bool _connected = false;
+  bool _bluetoothControl = false;
+  String? _deviceFirmwareVersion;
+  late final _deviceControl = DeviceControl((command) async {
+    final reply = await _channel.invokeMethod<String>(
+      'deviceBluetoothCommand',
+      {'command': command},
+    );
+    if (reply == null) {
+      throw PlatformException(
+        code: 'bluetooth_disconnected',
+        message: '设备未返回蓝牙响应',
+      );
+    }
+    return reply;
+  });
   bool _sdAvailable = false;
   bool _preparing = false;
   bool _uploading = false;
@@ -104,10 +152,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   double _uploadProgress = 0;
   String _status = '未连接';
   String? _connectedAddress;
-  String _connectedHardware = 'esp32s3';
+  String _connectedHardware = 'esp32p4';
   SelectedMedia? _media;
   PreparedAsset? _asset;
   CropTransform _cropTransform = const CropTransform();
+  String _draftAssetName = '';
   List<FactoryAnimation> _factoryAnims = [];
   final List<PendingDeviceDeletion> _pendingDeviceDeletes = [];
   String? _connectedDeviceKey;
@@ -209,9 +258,16 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         });
         break;
       case 'connectionState':
+        if (_bluetoothControl) {
+          break; // AP bulk transport is not the control connection.
+        }
         final wasConnected = _connected;
         final previousHardware = _connectedHardware;
         setState(() {
+          if (event['connected'] != true ||
+              _connectedAddress != event['address']) {
+            _connectedDeviceKey = null;
+          }
           _connected = event['connected'] == true;
           _connecting = event['connecting'] == true;
           _sdAvailable = event['sdAvailable'] == true;
@@ -221,6 +277,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
               (event['message'] as String?) ?? (_connected ? '已连接' : '未连接');
         });
         if (_connected && !wasConnected) {
+          unawaited(_refreshAlignmentAngle());
           unawaited(_refreshRandomMode());
           unawaited(_reconcilePendingDeviceDeletes());
         }
@@ -312,6 +369,15 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         _factoryAnims = builtIn
             .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
             .toList();
+        if (_asset == null &&
+            _selectedFactoryId == null &&
+            _factoryAnims.isNotEmpty) {
+          _selectedFactoryId = _factoryAnims.first.id;
+          final video =
+              _factoryAnims.first.firstVideo ?? _factoryAnims.first.loopVideo;
+          _videoQueue = video == null ? [] : [video];
+          _videoIndex = 0;
+        }
       });
     } catch (_) {
       // Fallback: manifest not found, leave empty
@@ -509,6 +575,62 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     );
   }
 
+  Future<Map<dynamic, dynamic>> _packageIdentity({
+    required String assetPath,
+    required String? reviewId,
+    required String name,
+  }) async {
+    if (assetPath.isNotEmpty && File(assetPath).existsSync()) {
+      try {
+        final result = await _invokeNative<Map<dynamic, dynamic>>(
+          'inspectLocalPackage',
+          {'assetPath': assetPath},
+        );
+        if (result != null) return result;
+      } on PlatformException {
+        // A damaged local cache may be replaced by its approved server package.
+        // Without a review ID, retain the deletion for a safe future retry.
+        if (reviewId == null) rethrow;
+      }
+    }
+    if (reviewId == null) {
+      throw PlatformException(
+        code: 'package_missing',
+        message: '缺少素材包，无法安全识别设备文件',
+      );
+    }
+    final result = await _invokeBackendNative<Map<dynamic, dynamic>>(
+      'downloadApprovedPackage',
+      {'assetId': reviewId, 'name': name, 'hardware': _connectedHardware},
+    );
+    if (result == null ||
+        result['crc32'] is! num ||
+        result['packageSize'] is! num) {
+      throw PlatformException(code: 'package_invalid', message: '素材包缺少校验信息');
+    }
+    return result;
+  }
+
+  Future<HistoryEntry> _repairHistoryIdentity(HistoryEntry entry) async {
+    if (entry.packageSize > 0 && entry.frameCount > 0) return entry;
+    final data = await _packageIdentity(
+      assetPath: entry.assetPath,
+      reviewId: entry.reviewId,
+      name: entry.name,
+    );
+    final repaired = entry.copyWith(
+      assetPath: data['assetPath'] as String?,
+      crc32: (data['crc32'] as num).toInt(),
+      packageSize: (data['packageSize'] as num).toInt(),
+      frameCount: (data['frameCount'] as num?)?.toInt(),
+      fps: (data['fps'] as num?)?.toInt(),
+    );
+    final index = _history.indexOf(entry);
+    if (index >= 0) _history[index] = repaired;
+    await _saveHistory();
+    return repaired;
+  }
+
   Future<void> _reconcilePendingDeviceDeletes() {
     final existing = _deviceDeleteSync;
     if (existing != null) {
@@ -540,7 +662,32 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       for (final original in List<PendingDeviceDeletion>.from(
         _pendingDeviceDeletes,
       )) {
+        if (_uploading || !_connected) break;
         var deletion = original;
+        if (deletion.deviceKey != null && !deletion.matchesDevice(deviceKey)) {
+          continue;
+        }
+        if (deletion.needsPackageIdentity) {
+          Map<dynamic, dynamic> metadata;
+          try {
+            metadata = await _packageIdentity(
+              assetPath: '',
+              reviewId: deletion.reviewId,
+              name: deletion.name,
+            );
+          } on PlatformException {
+            // One unavailable legacy package must not block other valid deletes.
+            continue;
+          }
+          deletion = deletion.copyWith(
+            crc32: (metadata['crc32'] as num).toInt(),
+            needsPackageIdentity: false,
+          );
+          final index = _pendingDeviceDeletes.indexOf(original);
+          if (index >= 0) _pendingDeviceDeletes[index] = deletion;
+          await _savePendingDeviceDeletes();
+          if (_uploading || !_connected) break;
+        }
         if (deletion.deviceKey == null) {
           final response = await _invokeNative<String>('statDeviceAsset', {
             'id': deletion.deviceAssetId,
@@ -552,7 +699,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           }
           if (status == DeviceAssetStatus.rejected) {
             _pendingDeviceDeletes.removeWhere(
-              (item) => item.operationKey == original.operationKey,
+              (item) => item.operationKey == deletion.operationKey,
             );
             await _savePendingDeviceDeletes();
             continue;
@@ -560,9 +707,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           if (status != DeviceAssetStatus.match) {
             continue;
           }
+          final previousOperationKey = deletion.operationKey;
           deletion = deletion.copyWith(deviceKey: deviceKey);
           final index = _pendingDeviceDeletes.indexWhere(
-            (item) => item.operationKey == original.operationKey,
+            (item) => item.operationKey == previousOperationKey,
           );
           if (index >= 0) {
             _pendingDeviceDeletes[index] = deletion;
@@ -573,6 +721,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           continue;
         }
 
+        if (_uploading || !_connected) break;
         final response = await _invokeNative<String>('deleteDeviceAsset', {
           'id': deletion.deviceAssetId,
           'crc32': crc32Hex(deletion.crc32),
@@ -669,6 +818,19 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _refreshConnectionState() async {
+    if (_bluetoothControl) {
+      final info = await _channel.invokeMapMethod<String, dynamic>(
+        'deviceBluetoothState',
+      );
+      if (!mounted) return;
+      if (info?['connected'] != true) {
+        setState(() {
+          _connected = false;
+          _status = '蓝牙已断开，请重新连接';
+        });
+      }
+      return;
+    }
     if (_demoMode) {
       setState(() {
         _connected = true;
@@ -688,6 +850,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     final wasConnected = _connected;
     final previousHardware = _connectedHardware;
     setState(() {
+      if (state['connected'] != true || _connectedAddress != state['address']) {
+        _connectedDeviceKey = null;
+      }
       _connected = state['connected'] == true;
       _sdAvailable = state['sdAvailable'] == true;
       _connectedAddress = state['address'] as String?;
@@ -697,6 +862,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           (_connected ? '已连接' : (wasConnected ? '断开连接' : '未连接'));
     });
     if (_connected && !wasConnected) {
+      unawaited(_refreshAlignmentAngle());
       unawaited(_refreshRandomMode());
       unawaited(_reconcilePendingDeviceDeletes());
     }
@@ -711,12 +877,44 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       return;
     }
     setState(() {
+      _connectedDeviceKey = null;
       _devices.clear();
       _scanning = true;
       _status = '扫描 DotLoop';
     });
     try {
-      await _invokeNative<void>('startScan');
+      final info = await _channel.invokeMapMethod<String, dynamic>(
+        'ensureDeviceBluetooth',
+      );
+      if (!mounted) return;
+      final status = info?['status']?.toString() ?? '';
+      if (info?['connected'] != true ||
+          !status.contains('hardware=esp32p4') ||
+          !status.contains('dc=1')) {
+        await _channel.invokeMethod<void>('releaseGameBluetooth');
+        throw PlatformException(
+          code: 'firmware_update_required',
+          message: '请先更新设备的蓝牙控制固件',
+        );
+      }
+      setState(() {
+        _bluetoothControl = true;
+        _connected = true;
+        _scanning = false;
+        _connecting = false;
+        _connectedHardware = 'esp32p4';
+        _sdAvailable = status.contains('sd=1');
+        _connectedAddress = info?['address']?.toString();
+        _deviceFirmwareVersion = RegExp(
+          r'version=([^ ]+)',
+        ).firstMatch(status)?.group(1);
+        _status = '蓝牙已连接';
+      });
+      unawaited(_refreshAlignmentAngle());
+      unawaited(_refreshRandomMode());
+      unawaited(_reconcilePendingDeviceDeletes());
+      unawaited(_loadFactoryAnimations());
+      unawaited(_refreshBrightness());
     } on PlatformException catch (error) {
       _showSnack(error.message ?? error.code);
       setState(() => _scanning = false);
@@ -724,6 +922,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _connect(BadgeDevice device) async {
+    _connectedDeviceKey = null;
+    _bluetoothControl = false; // Explicit S3/legacy Wi-Fi entry.
     if (_demoMode) {
       setState(() {
         _connected = true;
@@ -747,6 +947,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _disconnect() async {
+    _connectedDeviceKey = null;
     if (_demoMode) {
       setState(() {
         _connected = false;
@@ -755,8 +956,62 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       });
       return;
     }
+    if (_bluetoothControl) {
+      await _channel.invokeMethod<void>('releaseGameBluetooth');
+      await _channel.invokeMethod<void>('leaveDeviceAccessPoint');
+      setState(() {
+        _bluetoothControl = false;
+        _connected = false;
+        _connectedAddress = null;
+        _deviceFirmwareVersion = null;
+      });
+    }
     await _invokeNative<void>('disconnect');
     await _refreshConnectionState();
+  }
+
+  Future<bool> _prepareDeviceTransfer({bool firmware = false}) async {
+    if (!_bluetoothControl || _demoMode) return true;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xff202020),
+        title: const AppText('连接设备传输热点'),
+        content: AppText(
+          '${firmware ? '固件已下载并校验。' : '素材已准备好。'}接下来设备会开启 DotLoop Wi-Fi，允许系统连接后即可传输。传输期间没有互联网是正常的，蓝牙控制仍保持连接。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const AppText('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const AppText('连接并传输'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return false;
+    final key = await _invokeNative<String>('getDeviceIdentity');
+    await _invokeNative<String>('startTransferAccessPoint');
+    await _channel.invokeMethod<bool>('joinDeviceAccessPoint');
+    if (!_connected) {
+      throw PlatformException(
+        code: 'device_disconnected',
+        message: '蓝牙设备已断开，请重新连接',
+      );
+    }
+    // Verify Wi-Fi and BLE are the SAME badge before writing any file.
+    final wifiKey = await _channel.invokeMethod<String>('getDeviceIdentity');
+    if (key == null || wifiKey != key) {
+      throw PlatformException(
+        code: 'wrong_device',
+        message: '热点不是当前蓝牙设备，已停止传输',
+      );
+    }
+    _connectedDeviceKey = key;
+    return true;
   }
 
   Future<void> _pickMedia() async {
@@ -767,6 +1022,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       }
       final media = SelectedMedia.fromMap(_asStringMap(picked));
       setState(() {
+        if (_draftAssetName.trim().isEmpty || _draftAssetName == _media?.name) {
+          _draftAssetName = media.name;
+        }
         _media = media;
         _asset = null;
         _cropTransform = const CropTransform();
@@ -804,91 +1062,105 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _showSnack('请先导入 GIF、图片或视频');
       return;
     }
+    final assetName = _draftAssetName.trim().isEmpty
+        ? media.name
+        : _draftAssetName.trim();
     setState(() {
       _preparing = true;
       _prepareProgress = 0;
       _status = '保存素材';
     });
     try {
-      final useServerTranscode = _isVideoMime(media.mime);
+      final useServerTranscode =
+          _isVideoMime(media.mime) || media.mime.startsWith('image/');
       if (useServerTranscode) {
-        /* Server-side transcoding: the phone only uploads the source video
+        /* Server-side transcoding: the phone uploads the original media
          * and crop params. The server selects the S3 indexed or P4 JPEG
          * EBAJ4 payload from the connected hardware. */
         setState(() => _status = '上传服务器解码');
         final transcodeResult =
-            await _invokeBackendNative<Map<dynamic, dynamic>>(
-              'transcodeOnServer',
-              {
-                'uri': media.uri,
-                'name': media.name,
-                'maxFps': _connectedHardware == 'esp32s3'
-                    ? s3MaxTranscodeFps
-                    : p4MaxTranscodeFps,
-                'cropScale': _cropTransform.scale,
-                'cropOffsetX': _cropTransform.offset.dx,
-                'cropOffsetY': _cropTransform.offset.dy,
-                'hardware': _connectedHardware,
-                // A user import is intended for a device even when the
-                // device is offline right now. The package remains local
-                // until a device is connected, but the server must produce
-                // and approve the hardware-specific payload immediately.
-                'deviceTransfer': !_demoMode,
+            await withLocalTranscodeFallback<Map<dynamic, dynamic>?>(
+              () => _invokeBackendNative<Map<dynamic, dynamic>>(
+                'transcodeOnServer',
+                {
+                  'uri': media.uri,
+                  'name': assetName,
+                  'maxFps': _connectedHardware == 'esp32s3'
+                      ? s3MaxTranscodeFps
+                      : p4MaxTranscodeFps,
+                  'cropScale': _cropTransform.scale,
+                  'cropOffsetX': _cropTransform.offset.dx,
+                  'cropOffsetY': _cropTransform.offset.dy,
+                  'hardware': _connectedHardware,
+                  // A user import is intended for a device even when the
+                  // device is offline right now. The package remains local
+                  // until a device is connected, but the server must produce
+                  // and approve the hardware-specific payload immediately.
+                  'deviceTransfer': !_demoMode,
+                },
+              ),
+              () async {
+                if (mounted) setState(() => _status = '服务器无法连接，改为本地处理');
+                return null;
               },
             );
-        if (!mounted || transcodeResult == null) {
+        if (!mounted) return;
+        if (transcodeResult != null) {
+          final reviewId = _readNullableString(transcodeResult['reviewId']);
+          if (reviewId == null) {
+            throw PlatformException(
+              code: 'transcode_failed',
+              message: '服务器转码失败',
+            );
+          }
+          final actualFps = resolveServerTranscodeFps(transcodeResult['fps']);
+          final asset = PreparedAsset(
+            assetPath: '',
+            previewPath: _readNullableString(transcodeResult['previewPath']),
+            animatedPreviewPath: media.animatedPreviewPath,
+            sourceUri: media.uri,
+            mime: media.mime,
+            name: assetName,
+            packageSize: 0,
+            frameCount: 0,
+            fps: actualFps,
+            crc32: 0,
+            cropScale: _cropTransform.scale,
+            cropOffsetX: _cropTransform.offset.dx,
+            cropOffsetY: _cropTransform.offset.dy,
+            reviewId: reviewId,
+            reviewStatus:
+                _readNullableString(transcodeResult['reviewStatus']) ??
+                'pending',
+          );
+          final entry = HistoryEntry.fromAsset(
+            asset,
+            cropTransform: _cropTransform,
+          );
+          setState(() {
+            _asset = asset;
+            _preparing = false;
+            _prepareProgress = 1;
+            _pageIndex = 1;
+            _history.removeWhere((item) => item.reviewId == asset.reviewId);
+            _history.insert(0, entry);
+            if (_history.length > 20) {
+              _history.removeRange(20, _history.length);
+            }
+            _status = asset.reviewStatus == 'approved' ? '已转码，可上传' : '处理中';
+          });
+          _showSnack(
+            asset.reviewStatus == 'approved' ? '素材已转码，可直接上传' : '服务器正在处理素材',
+          );
+          unawaited(_saveHistory());
           return;
         }
-        final reviewId = _readNullableString(transcodeResult['reviewId']);
-        if (reviewId == null) {
-          throw PlatformException(code: 'transcode_failed', message: '服务器转码失败');
-        }
-        final actualFps = resolveServerTranscodeFps(transcodeResult['fps']);
-        final asset = PreparedAsset(
-          assetPath: '',
-          previewPath: _readNullableString(transcodeResult['previewPath']),
-          animatedPreviewPath: media.animatedPreviewPath,
-          sourceUri: media.uri,
-          mime: media.mime,
-          name: media.name,
-          packageSize: 0,
-          frameCount: 0,
-          fps: actualFps,
-          crc32: 0,
-          cropScale: _cropTransform.scale,
-          cropOffsetX: _cropTransform.offset.dx,
-          cropOffsetY: _cropTransform.offset.dy,
-          reviewId: reviewId,
-          reviewStatus:
-              _readNullableString(transcodeResult['reviewStatus']) ?? 'pending',
-        );
-        final entry = HistoryEntry.fromAsset(
-          asset,
-          cropTransform: _cropTransform,
-        );
-        setState(() {
-          _asset = asset;
-          _preparing = false;
-          _prepareProgress = 1;
-          _pageIndex = 1;
-          _history.removeWhere((item) => item.reviewId == asset.reviewId);
-          _history.insert(0, entry);
-          if (_history.length > 20) {
-            _history.removeRange(20, _history.length);
-          }
-          _status = asset.reviewStatus == 'approved' ? '已转码，可上传' : '待审核';
-        });
-        _showSnack(
-          asset.reviewStatus == 'approved' ? '素材已转码，可直接上传' : '已提交服务器转码，等待审核',
-        );
-        unawaited(_saveHistory());
-        return;
       }
       final prepared = await _invokeNative<Map<dynamic, dynamic>>(
         'prepareAsset',
         {
           'uri': media.uri,
-          'name': media.name,
+          'name': assetName,
           'fps': 40,
           'maxPackageBytes': resolveBadgePackageBudget(
             sdAvailable: _sdAvailable,
@@ -904,31 +1176,31 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       }
       final rawAsset = PreparedAsset.fromMap(_asStringMap(prepared));
       var asset = rawAsset.copyWith(cropTransform: _cropTransform);
-      var saveMessage = '素材已保存，已提交审核';
+      var saveMessage = '素材已保存并同步服务器';
       if (_isVideoMime(asset.mime) &&
           !_hasPreviewPath(asset.animatedPreviewPath)) {
-        setState(() => _status = '生成审核预览');
+        setState(() => _status = '生成素材预览');
         asset = await _withReviewPreviewReady(asset);
         if (!mounted) {
           return;
         }
       }
       try {
-        setState(() => _status = '提交审核');
+        setState(() => _status = '同步素材到服务器');
         asset = await _submitAssetForReview(asset);
         if (!mounted) {
           return;
         }
         if (asset.reviewStatus == 'approved') {
-          saveMessage = '素材已保存，审核已通过';
+          saveMessage = '素材已保存，可直接上传';
         } else if (asset.reviewStatus == 'rejected') {
-          saveMessage = '素材已保存，但审核未通过';
+          saveMessage = '素材已保存，但服务器拒绝此素材';
         }
       } catch (_) {
         if (!mounted) {
           return;
         }
-        saveMessage = '素材已本地保存，联网后将重新提交审核';
+        saveMessage = '素材已本地保存，联网后将同步服务器';
       }
       final entry = HistoryEntry.fromAsset(
         asset,
@@ -944,7 +1216,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         if (_history.length > 20) {
           _history.removeRange(20, _history.length);
         }
-        _status = asset.reviewStatus == 'pending' ? '待审核' : '已保存';
+        _status = asset.reviewStatus == 'pending' ? '处理中' : '已保存';
       });
       _showSnack(saveMessage);
       unawaited(_saveHistory());
@@ -958,6 +1230,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _uploadAsset(PreparedAsset asset) async {
+    if (_uploading || _preparing) return;
     if (!_connected) {
       _showSnack('请先连接设备');
       setState(() => _pageIndex = 0);
@@ -980,7 +1253,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     if (!mounted) {
       return;
     }
-    var approvedAsset = await _ensureAssetApproved(asset);
+    var approvedAsset = await _ensureP4Asset(asset);
+    if (approvedAsset != null) {
+      approvedAsset = await _ensureAssetApproved(approvedAsset);
+    }
     if (!mounted || approvedAsset == null) {
       if (mounted) {
         setState(() => _uploading = false);
@@ -1036,10 +1312,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         sourceUri: approvedAsset.sourceUri,
         mime: approvedAsset.mime,
         name: approvedAsset.name,
-        packageSize: approvedAsset.packageSize,
-        frameCount: approvedAsset.frameCount,
-        fps: approvedAsset.fps,
-        crc32: approvedAsset.crc32,
+        packageSize: (downloadResult['packageSize'] as num).toInt(),
+        frameCount: (downloadResult['frameCount'] as num).toInt(),
+        fps: (downloadResult['fps'] as num).toInt(),
+        crc32: (downloadResult['crc32'] as num).toInt(),
         cropScale: approvedAsset.cropScale,
         cropOffsetX: approvedAsset.cropOffsetX,
         cropOffsetY: approvedAsset.cropOffsetY,
@@ -1049,9 +1325,29 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (!mounted) {
         return;
       }
+      for (var i = 0; i < _history.length; i++) {
+        if (_history[i].reviewId == approvedAsset.reviewId) {
+          _history[i] = _history[i].copyWith(
+            assetPath: downloadedPath,
+            packageSize: approvedAsset.packageSize,
+            frameCount: approvedAsset.frameCount,
+            fps: approvedAsset.fps,
+            crc32: approvedAsset.crc32,
+          );
+        }
+      }
+      await _saveHistory();
     }
     try {
       final uploadTarget = approvedAsset;
+      if (!await _prepareDeviceTransfer()) {
+        if (mounted) setState(() => _uploading = false);
+        return;
+      }
+      // Capture the identity verified for THIS upload, never a prior device.
+      final uploadDeviceKey = !_demoMode && _bluetoothControl
+          ? _connectedDeviceKey
+          : null; // Legacy S3 does not implement the P4 identity command.
       final result = _demoMode
           ? await _simulateDemoUpload(uploadTarget)
           : await _invokeNative<Map<dynamic, dynamic>>('uploadAsset', {
@@ -1077,7 +1373,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           )) {
             _history[i] = _history[i].copyWith(
               deviceId: assignedId,
-              deviceKey: deviceKey ?? _connectedDeviceKey,
+              deviceKey: deviceKey ?? uploadDeviceKey,
+              assetPath: uploadTarget.assetPath,
+              packageSize:
+                  (result?['packageSize'] as num?)?.toInt() ??
+                  uploadTarget.packageSize,
+              crc32: (result?['crc32'] as num?)?.toInt() ?? uploadTarget.crc32,
             );
             break;
           }
@@ -1090,6 +1391,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         _status = '上传失败';
       });
       _showSnack(error.message ?? error.code);
+    } finally {
+      if (_bluetoothControl) {
+        await _channel.invokeMethod<void>('leaveDeviceAccessPoint');
+      }
     }
   }
 
@@ -1112,8 +1417,183 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
+  Future<void> _refreshBrightness() async {
+    if (!_connected || !_bluetoothControl || _demoMode) return;
+    final address = _connectedAddress;
+    final previous = _brightness;
+    try {
+      final value = await _deviceControl.invoke('getBrightness') as int;
+      if (mounted &&
+          _connected &&
+          address == _connectedAddress &&
+          previous == _brightness) {
+        setState(() => _brightness = value);
+      }
+    } on PlatformException {
+      // Older firmware does not expose BRIGHT GET; keep its existing controls.
+    }
+  }
+
+  Future<void> _refreshAlignmentAngle() async {
+    if (_demoMode || _connectedHardware == 'esp32s3') return;
+    final address = _connectedAddress;
+    try {
+      final response = await _invokeNative<Map<dynamic, dynamic>>(
+        'calibrationStatus',
+      );
+      if (response != null && mounted && _connectedAddress == address) {
+        setState(
+          () => _alignmentAngleTenths = CalibrationSnapshot.fromMap(
+            response,
+          ).angleTenths,
+        );
+      }
+    } on PlatformException {
+      // Older firmware can still connect without the optional calibration API.
+    }
+  }
+
+  Future<void> _openAlignment() async {
+    if (_uploading) {
+      _showSnack('请等待当前传输完成后再校正');
+      return;
+    }
+    await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (context) => AlignmentPage(
+          connected: _connected,
+          enter: () async {
+            final response = await _invokeNative<Map<dynamic, dynamic>>(
+              'enterCalibration',
+            );
+            if (response == null) {
+              throw StateError('设备未返回校正状态');
+            }
+            final snapshot = CalibrationSnapshot.fromMap(response);
+            if (mounted) {
+              setState(() => _alignmentAngleTenths = snapshot.angleTenths);
+            }
+            return snapshot;
+          },
+          preview: (angleTenths) => _invokeNative<void>('previewCalibration', {
+            'angleTenths': angleTenths,
+          }),
+          save: (angleTenths) async {
+            await _invokeNative<void>('saveCalibration', {
+              'angleTenths': angleTenths,
+            });
+            if (mounted) setState(() => _alignmentAngleTenths = angleTenths);
+          },
+          cancel: () => _invokeNative<void>('cancelCalibration'),
+        ),
+      ),
+    );
+  }
+
   List<Uri> get _backendBases =>
       backendBaseCandidates(overrideBase: _backendBaseOverride);
+
+  void _openSettings() => setState(() => _pageIndex = 4);
+
+  void _openBrightness() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ReferenceBrightnessPage(
+          initialValue: _brightness,
+          connected: _connected,
+          onChanged: _setBrightness,
+        ),
+      ),
+    );
+  }
+
+  void _openDeviceStatus() {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xff202020),
+        title: const AppText('设备状态'),
+        content: Row(
+          children: [
+            const AppText('TF 卡'),
+            const Spacer(),
+            AppText(
+              !_connected
+                  ? '未连接'
+                  : _sdAvailable
+                  ? '可用'
+                  : '不可用',
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const AppText('完成'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openVersionInfo() {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xff202020),
+        title: const AppText('版本'),
+        content: AppText(
+          'DotLoop $_appVersion\n设备：$_connectedHardware\n固件：${_deviceFirmwareVersion ?? (_connected ? '读取中' : '未连接')}\n${_bluetoothControl ? '控制：蓝牙 · 文件：Wi-Fi 热点' : '控制：Wi-Fi'}\n连接 P4 设备后，可先将固件下载到手机，再通过设备热点更新。',
+        ),
+        actions: [
+          if (_connected && _bluetoothControl && !_demoMode)
+            TextButton(
+              onPressed: _uploading || _preparing
+                  ? null
+                  : () {
+                      Navigator.pop(context);
+                      _openFirmwareUpdate();
+                    },
+              child: const AppText('检查固件更新'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const AppText('完成'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openSupport() => unawaited(
+    _invokeNative<void>('openUrl', {
+      'url': 'https://leyyoudian.github.io/flutter_app/support.html',
+    }),
+  );
+
+  void _openFirmwareUpdate() {
+    if (!_connected || !_bluetoothControl || _uploading || _preparing) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => FirmwareUpdatePage(
+          hardware: 'esp32p4-2.8',
+          currentVersion: _deviceFirmwareVersion ?? '0.0.0',
+          backendBases: _backendBases,
+          prepareTransfer: () async {
+            await _channel.invokeMethod<void>('gameCommand', {
+              'action': 'stop',
+            });
+            await _invokeNative<void>('cancelCalibration');
+            return _prepareDeviceTransfer(firmware: true);
+          },
+          setBusy: (busy) {
+            if (mounted) setState(() => _uploading = busy);
+          },
+          deviceIdentity: () => _invokeNative<String>('getDeviceIdentity'),
+        ),
+      ),
+    );
+  }
 
   bool _retryBackendError(Object error) {
     return isRetryableBackendError(error);
@@ -1337,11 +1817,22 @@ class _BadgeHomePageState extends State<BadgeHomePage>
 
   void _rememberReviewedAsset(PreparedAsset asset) {
     setState(() {
-      if (_asset?.assetPath == asset.assetPath) {
+      if (_asset != null &&
+          uploadMatchesHistory(
+            historyAssetPath: _asset!.assetPath,
+            historyReviewId: _asset!.reviewId,
+            uploadedAssetPath: asset.assetPath,
+            uploadedReviewId: asset.reviewId,
+          )) {
         _asset = asset;
       }
       for (var index = 0; index < _history.length; index++) {
-        if (_history[index].assetPath == asset.assetPath) {
+        if (uploadMatchesHistory(
+          historyAssetPath: _history[index].assetPath,
+          historyReviewId: _history[index].reviewId,
+          uploadedAssetPath: asset.assetPath,
+          uploadedReviewId: asset.reviewId,
+        )) {
           _history[index] = _history[index].copyWith(
             reviewId: asset.reviewId,
             reviewStatus: asset.reviewStatus,
@@ -1360,22 +1851,20 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         reviewStatus: 'approved',
       );
     }
-    if (asset.reviewStatus == 'approved') {
+    if (asset.reviewStatus == 'approved' && asset.reviewId != null) {
       return asset;
     }
     try {
       PreparedAsset reviewed;
       if (asset.reviewId == null) {
-        setState(() => _status = '提交审核');
+        setState(() => _status = '同步素材到服务器');
         reviewed = await _submitAssetForReview(asset);
         if (!mounted) return null;
         _rememberReviewedAsset(reviewed);
-        _showSnack('素材已提交审核，管理员审核通过后可上传');
-        return null;
+      } else {
+        setState(() => _status = '检查素材状态');
+        reviewed = await _refreshReviewStatus(asset);
       }
-
-      setState(() => _status = '检查审核状态');
-      reviewed = await _refreshReviewStatus(asset);
       if (!mounted) return null;
       _rememberReviewedAsset(reviewed);
       if (reviewed.reviewStatus == 'approved') {
@@ -1384,18 +1873,131 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (reviewed.reviewStatus == 'rejected') {
         _showSnack('素材审核未通过，请更换内容');
       } else {
-        _showSnack('素材仍在审核中');
+        _showSnack('服务器仍在处理素材，请稍后重试');
       }
-    } catch (_) {
+    } catch (error) {
+      if (isRetryableBackendError(error) &&
+          asset.reviewId == null &&
+          asset.assetPath.isNotEmpty &&
+          File(asset.assetPath).existsSync()) {
+        final local = asset.copyWith(reviewStatus: 'approved');
+        if (mounted) {
+          _rememberReviewedAsset(local);
+          _showSnack('服务器无法连接，使用本地已处理的素材');
+        }
+        return local;
+      }
       if (mounted) {
-        _showSnack('审核服务暂时不可用，请稍后再试');
+        _showSnack('素材服务器暂时不可用，请稍后再试');
       }
     }
     return null;
   }
 
+  Future<PreparedAsset?> _ensureP4Asset(PreparedAsset original) async {
+    if (_demoMode ||
+        _connectedHardware != 'esp32p4' ||
+        original.reviewId == null ||
+        original.reviewStatus == 'rejected') {
+      return original;
+    }
+    if (await hasP4JpegPackage(original.assetPath)) return original;
+    try {
+      // Internet requests must precede joining the badge's transfer hotspot.
+      if (_bluetoothControl) {
+        await _channel.invokeMethod<void>('leaveDeviceAccessPoint');
+      }
+      final rebuilt = await rebuildLegacyP4Asset(
+        assetId: original.reviewId!,
+        sourceUri: original.sourceUri,
+        name: original.name,
+        cropScale: original.cropScale,
+        cropOffsetX: original.cropOffsetX,
+        cropOffsetY: original.cropOffsetY,
+        metadata: (id) => _getBackendJson('/api/assets/$id'),
+        transcode: (arguments) async {
+          if (mounted) setState(() => _status = '正在将旧素材转换为 P4 格式');
+          return _invokeBackendNative<Map<dynamic, dynamic>>(
+            'transcodeOnServer',
+            arguments,
+          );
+        },
+      );
+      if (!mounted) return null;
+      if (rebuilt == null) return original;
+      final asset = PreparedAsset(
+        assetPath: '',
+        previewPath:
+            _readNullableString(rebuilt['previewPath']) ?? original.previewPath,
+        animatedPreviewPath: original.animatedPreviewPath,
+        sourceUri: original.sourceUri,
+        mime: original.mime,
+        name: original.name,
+        packageSize: 0,
+        frameCount: 0,
+        fps: resolveServerTranscodeFps(rebuilt['fps']),
+        crc32: 0,
+        cropScale: original.cropScale,
+        cropOffsetX: original.cropOffsetX,
+        cropOffsetY: original.cropOffsetY,
+        reviewId: rebuilt['reviewId'] as String,
+        reviewStatus: 'approved',
+      );
+      setState(() {
+        if (_asset != null &&
+            uploadMatchesHistory(
+              historyAssetPath: _asset!.assetPath,
+              historyReviewId: _asset!.reviewId,
+              uploadedAssetPath: original.assetPath,
+              uploadedReviewId: original.reviewId,
+            )) {
+          _asset = asset;
+        }
+        for (var i = 0; i < _history.length; i++) {
+          final entry = _history[i];
+          if (!uploadMatchesHistory(
+            historyAssetPath: entry.assetPath,
+            historyReviewId: entry.reviewId,
+            uploadedAssetPath: original.assetPath,
+            uploadedReviewId: original.reviewId,
+          )) {
+            continue;
+          }
+          _history[i] = entry.copyWith(
+            assetPath: '',
+            packageSize: 0,
+            frameCount: 0,
+            fps: asset.fps,
+            crc32: 0,
+            reviewId: asset.reviewId,
+            reviewStatus: 'approved',
+            clearDeviceIdentity: true,
+          );
+        }
+      });
+      await _saveHistory();
+      return asset;
+    } catch (error) {
+      if (mounted) {
+        _showSnack(
+          error is PlatformException
+              ? error.message ?? '旧素材转换失败，请重新选择原素材'
+              : '素材型号检查失败，请稍后重试',
+        );
+      }
+      return null;
+    }
+  }
+
   Future<T?> _invokeNative<T>(String method, [Object? arguments]) async {
     try {
+      if (_bluetoothControl && DeviceControl.methods.contains(method)) {
+        final value = await _deviceControl.invoke(
+          method,
+          arguments is Map ? arguments : const {},
+        );
+        return value as T?;
+      }
       return await _channel.invokeMethod<T>(method, arguments);
     } on MissingPluginException {
       return null;
@@ -1405,7 +2007,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   Future<T?> _invokeBackendNative<T>(
     String method,
     Map<String, Object?> arguments,
-  ) {
+  ) async {
+    if (_bluetoothControl) {
+      await _channel.invokeMethod<void>('leaveDeviceAccessPoint');
+    }
     return withBackendFailover<T?>(
       _backendBases,
       (base) => _invokeNative<T>(method, {
@@ -1431,12 +2036,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       context: context,
       builder: (dialogContext) => AlertDialog(
         backgroundColor: const Color(0xff171717),
-        title: const Text('隐私政策'),
+        title: const AppText('隐私政策'),
         content: SingleChildScrollView(
-          child: Text(
+          child: AppText(
             'ESP Baji 不收集、出售或分享个人信息。\n\n'
-            '导入的图片、GIF 和视频会在本机处理。用户自定义素材在上传到 ESP 设备前，需要提交到 ESP Baji 服务器审核。'
-            '审核通过后，应用仅在用户操作时通过本地 Wi-Fi 发送到已连接的 ESP 设备。'
+            '导入的图片、GIF 和视频会提交到 ESP Baji 服务器处理；服务器无法连接时可在本机处理。'
+            '处理完成后，应用仅在用户操作时通过本地 Wi-Fi 发送到已连接的 ESP 设备。'
             '应用不会上传素材到第三方服务器，也不使用广告或分析 SDK。\n\n'
             '公开隐私政策链接：\n$_privacyPolicyUrl',
             style: const TextStyle(height: 1.45),
@@ -1445,14 +2050,14 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('关闭'),
+            child: const AppText('关闭'),
           ),
           TextButton(
             onPressed: () {
               Navigator.pop(dialogContext);
               unawaited(_openPrivacyPolicyUrl());
             },
-            child: const Text('打开网页'),
+            child: const AppText('打开网页'),
           ),
         ],
       ),
@@ -1465,6 +2070,17 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
+  /// The factory animation currently selected (used by both the library page
+  /// and the device page preview dial so they stay in sync).
+  FactoryAnimation? get _selectedFactory {
+    return _selectedFactoryId != null
+        ? _factoryAnims.cast<FactoryAnimation?>().firstWhere(
+            (a) => a?.id == _selectedFactoryId,
+            orElse: () => null,
+          )
+        : null;
+  }
+
   bool get _isDefaultCrop {
     return (_cropTransform.scale - 1).abs() < 0.0001 &&
         _cropTransform.offset.distance < 0.0001;
@@ -1473,6 +2089,16 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   Future<void> _uploadHistoryEntry(HistoryEntry entry) async {
     if (_preparing || _uploading) {
       return;
+    }
+    if (entry.deviceId != null &&
+        _connected &&
+        (entry.packageSize <= 0 || entry.frameCount <= 0)) {
+      try {
+        entry = await _repairHistoryIdentity(entry);
+      } on PlatformException catch (error) {
+        _showSnack(error.message ?? '素材身份校验失败');
+        return;
+      }
     }
     // If already uploaded, just switch to it
     if (entry.deviceId != null && _connected) {
@@ -1594,12 +2220,27 @@ class _BadgeHomePageState extends State<BadgeHomePage>
 
   Future<void> _deleteHistoryEntry(HistoryEntry entry) async {
     await _pendingDeviceDeletesLoad;
+    if (isUserDeviceAssetId(entry.deviceId) &&
+        (entry.packageSize <= 0 || entry.frameCount <= 0) &&
+        (_connected ||
+            (entry.assetPath.isNotEmpty &&
+                File(entry.assetPath).existsSync()))) {
+      try {
+        entry = await _repairHistoryIdentity(entry);
+      } on PlatformException {
+        // Preserve review identity in the durable offline queue; never delete
+        // a reused device ID using the old placeholder CRC.
+      }
+    }
     if (isUserDeviceAssetId(entry.deviceId)) {
       final deletion = PendingDeviceDeletion(
         deviceKey: entry.deviceKey,
         deviceAssetId: entry.deviceId!,
         crc32: entry.crc32,
         createdAt: DateTime.now().millisecondsSinceEpoch,
+        reviewId: entry.reviewId,
+        name: entry.name,
+        needsPackageIdentity: entry.packageSize <= 0 || entry.frameCount <= 0,
       );
       final updated = coalescePendingDeviceDeletions(<PendingDeviceDeletion>[
         ..._pendingDeviceDeletes,
@@ -1642,7 +2283,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     });
     await _saveHistory();
     if (_connected) {
-      unawaited(_reconcilePendingDeviceDeletes());
+      await _reconcilePendingDeviceDeletes();
+      if (mounted &&
+          _pendingDeviceDeletes.any(
+            (item) => item.deviceAssetId == entry.deviceId,
+          )) {
+        _showSnack('已从手机删除，设备删除任务将在重连后重试');
+      }
     }
   }
 
@@ -1659,16 +2306,21 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xff151515),
-        title: const Text('删除素材'),
-        content: Text(entry.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+        title: const AppText('删除素材'),
+        content: AppText(
+          entry.name,
+          translate: false,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
+            child: const AppText('取消'),
           ),
           FilledButton(
             onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('删除'),
+            child: const AppText('删除'),
           ),
         ],
       ),
@@ -1688,7 +2340,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
+        content: AppText(
           message,
           style: const TextStyle(
             color: Colors.black,
@@ -1715,7 +2367,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     final message = force ? '发现必须更新版本 $latestVersion' : '发现新版本 $latestVersion';
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
+        content: AppText(
           message,
           style: const TextStyle(
             color: Colors.black,
@@ -1725,7 +2377,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         action: storeUrl == null
             ? null
             : SnackBarAction(
-                label: '更新',
+                label: tr('更新'),
                 textColor: Colors.black,
                 onPressed: () {
                   unawaited(_invokeNative<void>('openUrl', {'url': storeUrl}));
@@ -1740,8 +2392,65 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     );
   }
 
+  Future<void> _openGame() async {
+    if (_uploading || _preparing) return;
+    // BLE game discovery validates its own service. A Wi-Fi connection is
+    // neither required nor sufficient to control the P4 game.
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => FlyBirdPage(retainConnection: _bluetoothControl),
+      ),
+    );
+    if (mounted) unawaited(_refreshConnectionState());
+  }
+
+  void _openLanguage() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.black,
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const AppText(
+                '语言',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+              ),
+              for (final language in AppLanguage.values)
+                ListTile(
+                  title: Text(LanguageSettings.label(language)),
+                  trailing: LanguageSettings.current.value == language
+                      ? const Icon(Icons.check)
+                      : null,
+                  onTap: () async {
+                    try {
+                      await LanguageSettings.select(language);
+                      if (context.mounted) Navigator.pop(context);
+                    } catch (error) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(
+                          context,
+                        ).showSnackBar(SnackBar(content: AppText('$error')));
+                      }
+                    }
+                  },
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => ValueListenableBuilder<AppLanguage>(
+    valueListenable: LanguageSettings.current,
+    builder: (context, language, child) => _buildPage(context),
+  );
+
+  Widget _buildPage(BuildContext context) {
     final previewActive = _previewActive;
     final pages = [
       _DevicePage(
@@ -1757,12 +2466,48 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onConnect: _connect,
         onDisconnect: _disconnect,
         onBrightness: _setBrightness,
+        supportsAlignment: true,
+        alignmentAngleTenths: _alignmentAngleTenths,
+        onAlignment: () => unawaited(_openAlignment()),
         onPrivacyPolicy: _showPrivacyPolicy,
         demoMode: _demoMode,
         onEnterDemoMode: _enterDemoMode,
         onExitDemoMode: _exitDemoMode,
+        onOpenBrightness: _openBrightness,
+        onImport: () => setState(() => _pageIndex = 2),
+        onLibrary: () => setState(() {
+          _libraryFilter = 1;
+          _pageIndex = 1;
+        }),
+        preview: _PreviewDial(
+          active: previewActive && _pageIndex == 0,
+          media: null,
+          asset: _asset,
+          /* The device page shows the same content as the library page: the
+           * selected factory animation's video sequence, or the user's own
+           * asset. Without this the dial had nothing to draw and fell back to
+           * its empty placeholder, which looked like the preview had been
+           * removed entirely. */
+          factoryVideo:
+              _videoQueue.isNotEmpty && _videoIndex < _videoQueue.length
+              ? _videoQueue[_videoIndex]
+              : null,
+          factoryPreview: _selectedFactory?.previewAsset,
+          nextVideo:
+              _videoQueue.isNotEmpty && _videoIndex + 1 < _videoQueue.length
+              ? _videoQueue[_videoIndex + 1]
+              : null,
+          looping: _selectedFactory?.isLoop == true,
+          onFactoryVideoDone:
+              _selectedFactory?.isLoop == true || _videoQueue.isEmpty
+              ? null
+              : _advanceVideo,
+          preparing: _uploading,
+          progress: _uploadProgress,
+        ),
       ),
       _DisplayLibraryPage(
+        onAssetUpload: (asset) => unawaited(_uploadAsset(asset)),
         active: previewActive && _pageIndex == 1,
         connected: _connected,
         status: _status,
@@ -1782,8 +2527,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         randomEnabled: _randomEnabled,
         randomUpdating: _randomUpdating,
         onRandomToggle: (enabled) => unawaited(_setRandomMode(enabled)),
+        filter: _libraryFilter,
+        onFilter: (filter) => setState(() => _libraryFilter = filter),
+        onImport: () => setState(() => _pageIndex = 2),
       ),
       _MakerPage(
+        key: ValueKey('maker-${_media?.uri ?? "empty"}'),
         active: previewActive && _pageIndex == 2,
         media: _media,
         asset: _asset,
@@ -1795,144 +2544,99 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onSave: _saveMakerAsset,
         onCropChanged: (value) => setState(() => _cropTransform = value),
         onResetCrop: _resetCrop,
+        draftName: _draftAssetName,
+        onNameChanged: (value) => _draftAssetName = value,
+        onClose: () => setState(() => _pageIndex = 1),
+      ),
+      ReferenceLoopPage(
+        enabled: _randomEnabled,
+        updating: _randomUpdating,
+        factoryCount: _factoryAnims.length,
+        onChanged: (enabled) => unawaited(_setRandomMode(enabled)),
+        onBack: () => setState(() => _pageIndex = 4),
+      ),
+      ReferenceSettingsPage(
+        onAlignment: () => unawaited(_openAlignment()),
+        onBrightness: _openBrightness,
+        onMode: () => setState(() => _pageIndex = 3),
+        onDevice: () => setState(() => _pageIndex = 0),
+        onLibrary: () => setState(() {
+          _libraryFilter = 1;
+          _pageIndex = 1;
+        }),
+        onPrivacy: _showPrivacyPolicy,
+        onSupport: _openSupport,
+        onVersion: _openVersionInfo,
+        version: _appVersion,
+        demoMode: _demoMode,
+        onDemo: () => _demoMode ? _exitDemoMode() : _enterDemoMode(),
+        onLanguage: _openLanguage,
+        onGame: () => Navigator.of(context).push<void>(
+          MaterialPageRoute(
+            builder: (_) => GamesPage(onFlyBird: () => unawaited(_openGame())),
+          ),
+        ),
+        onDeviceStatus: _openDeviceStatus,
       ),
     ];
 
     return Scaffold(
-      extendBody: true,
+      extendBody: false,
       body: Stack(
         children: [
           const _Backdrop(),
           SafeArea(
-            child: IndexedStack(index: _pageIndex, children: pages),
-          ),
-        ],
-      ),
-      bottomNavigationBar: _FloatingBottomNav(
-        selectedIndex: _pageIndex,
-        onSelected: (index) => setState(() => _pageIndex = index),
-      ),
-    );
-  }
-}
-
-class _FloatingBottomNav extends StatelessWidget {
-  const _FloatingBottomNav({
-    required this.selectedIndex,
-    required this.onSelected,
-  });
-
-  final int selectedIndex;
-  final ValueChanged<int> onSelected;
-
-  @override
-  Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.paddingOf(context).bottom;
-    final bottomPadding = math.max(8.0, bottomInset + 6.0);
-
-    return Padding(
-      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomPadding),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(30),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: const Color(0xff181818).withValues(alpha: 0.82),
-              borderRadius: BorderRadius.circular(30),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.035)),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.34),
-                  blurRadius: 24,
-                  offset: const Offset(0, 10),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: IndexedStack(
+                    index: _pageIndex == 2 ? 1 : _pageIndex,
+                    children: [
+                      for (var i = 0; i < pages.length; ++i)
+                        i == 2
+                            ? const SizedBox.shrink()
+                            : ExcludeSemantics(
+                                excluding: _pageIndex == 2,
+                                child: i == 1
+                                    ? pages[i]
+                                    : Padding(
+                                        padding: const EdgeInsets.only(top: 58),
+                                        child: pages[i],
+                                      ),
+                              ),
+                    ],
+                  ),
                 ),
-              ],
-            ),
-            child: SizedBox(
-              key: const ValueKey('floating-bottom-nav'),
-              height: 62,
-              child: Row(
-                children: [
-                  _BottomNavButton(
-                    index: 0,
-                    selectedIndex: selectedIndex,
-                    icon: Icons.wifi_find,
-                    selectedIcon: Icons.wifi,
-                    tooltip: '设备',
-                    onSelected: onSelected,
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: ReferenceTopNavigation(
+                    selectedIndex: _pageIndex,
+                    connected: _connected,
+                    onSelected: (index) => index == 4
+                        ? _openSettings()
+                        : setState(() => _pageIndex = index),
                   ),
-                  _BottomNavButton(
-                    index: 1,
-                    selectedIndex: selectedIndex,
-                    icon: Icons.grid_view_rounded,
-                    selectedIcon: Icons.grid_view_rounded,
-                    tooltip: '主页',
-                    onSelected: onSelected,
+                ),
+                if (_pageIndex == 2) ...[
+                  const Positioned.fill(
+                    child: ColoredBox(color: Colors.black54),
                   ),
-                  _BottomNavButton(
-                    index: 2,
-                    selectedIndex: selectedIndex,
-                    icon: Icons.add_photo_alternate_outlined,
-                    selectedIcon: Icons.add_photo_alternate,
-                    tooltip: '制作',
-                    onSelected: onSelected,
+                  Positioned.fill(
+                    top: 80,
+                    child: ClipRRect(
+                      borderRadius: const BorderRadius.vertical(
+                        top: Radius.circular(22),
+                      ),
+                      child: ColoredBox(color: Colors.black, child: pages[2]),
+                    ),
                   ),
                 ],
-              ),
+              ],
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _BottomNavButton extends StatelessWidget {
-  const _BottomNavButton({
-    required this.index,
-    required this.selectedIndex,
-    required this.icon,
-    required this.selectedIcon,
-    required this.tooltip,
-    required this.onSelected,
-  });
-
-  final int index;
-  final int selectedIndex;
-  final IconData icon;
-  final IconData selectedIcon;
-  final String tooltip;
-  final ValueChanged<int> onSelected;
-
-  @override
-  Widget build(BuildContext context) {
-    final selected = index == selectedIndex;
-
-    return Expanded(
-      child: Center(
-        child: Tooltip(
-          message: tooltip,
-          child: InkResponse(
-            radius: 34,
-            onTap: () => onSelected(index),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 160),
-              curve: Curves.easeOutCubic,
-              width: selected ? 76 : 54,
-              height: 44,
-              decoration: BoxDecoration(
-                color: selected ? Colors.white : Colors.transparent,
-                borderRadius: BorderRadius.circular(24),
-              ),
-              child: Icon(
-                selected ? selectedIcon : icon,
-                color: selected ? Colors.black : Colors.white,
-                size: 22,
-              ),
-            ),
-          ),
-        ),
+        ],
       ),
     );
   }
@@ -1941,6 +2645,10 @@ class _BottomNavButton extends StatelessWidget {
 class _DisplayLibraryPage extends StatelessWidget {
   const _DisplayLibraryPage({
     required this.active,
+    required this.filter,
+    required this.onFilter,
+    required this.onImport,
+    required this.onAssetUpload,
     required this.connected,
     required this.status,
     required this.asset,
@@ -1979,6 +2687,140 @@ class _DisplayLibraryPage extends StatelessWidget {
   final bool randomUpdating;
   final ValueChanged<bool> onRandomToggle;
 
+  final int filter;
+  final ValueChanged<int> onFilter;
+  final VoidCallback onImport;
+  final ValueChanged<PreparedAsset> onAssetUpload;
+  void _openSearch(BuildContext context) {
+    var query = '';
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.black,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: .86,
+        minChildSize: .5,
+        maxChildSize: .96,
+        builder: (context, controller) => StatefulBuilder(
+          builder: (context, update) {
+            final factories = factoryAnims
+                .where(
+                  (item) =>
+                      '${item.name} ${item.id}'.toLowerCase().contains(query),
+                )
+                .toList();
+            final users = history
+                .where(
+                  (item) => '${item.name} ${item.deviceId ?? ""}'
+                      .toLowerCase()
+                      .contains(query),
+                )
+                .toList();
+            return Padding(
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.viewInsetsOf(context).bottom,
+              ),
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 12, 12, 0),
+                    child: Row(
+                      children: [
+                        const Expanded(
+                          child: AppText(
+                            '查找动画',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.pop(context),
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+                    child: TextField(
+                      key: const ValueKey('material-search-input'),
+                      onChanged: (value) =>
+                          update(() => query = value.trim().toLowerCase()),
+                      decoration: InputDecoration(
+                        hintText: tr('搜索名称或编号'),
+                        prefixIcon: const Icon(Icons.search_rounded),
+                        filled: true,
+                        fillColor: const Color(0xff171717),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(18),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: users.isEmpty && factories.isEmpty
+                        ? const Center(
+                            child: AppText(
+                              '未找到匹配素材',
+                              style: TextStyle(color: referenceMuted),
+                            ),
+                          )
+                        : GridView.builder(
+                            controller: controller,
+                            padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: 3,
+                                  mainAxisSpacing: 12,
+                                  crossAxisSpacing: 12,
+                                ),
+                            itemCount: users.length + factories.length,
+                            itemBuilder: (context, index) {
+                              if (index < users.length) {
+                                final entry = users[index];
+                                return _HistoryGridTile(
+                                  active: false,
+                                  entry: entry,
+                                  selected: false,
+                                  onLongPress: () {},
+                                  onTap: uploading
+                                      ? null
+                                      : () {
+                                          Navigator.pop(context);
+                                          onHistoryTap(entry);
+                                        },
+                                );
+                              }
+                              final item = factories[index - users.length];
+                              return _FactoryGridTile(
+                                anim: item,
+                                selected: item.id == selectedFactoryId,
+                                onTap: uploading
+                                    ? null
+                                    : () {
+                                        Navigator.pop(context);
+                                        onFactoryTap(item);
+                                      },
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final selectedFactory = selectedFactoryId != null
@@ -1987,184 +2829,272 @@ class _DisplayLibraryPage extends StatelessWidget {
             orElse: () => null,
           )
         : null;
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
-          child: Column(
+    final userItems = filter == 2 ? <HistoryEntry>[] : history;
+    final factoryItems = filter == 1 ? <FactoryAnimation>[] : factoryAnims;
+    final addTile = filter == 1;
+    final tabIndex = filter == 1
+        ? 0
+        : filter == 2
+        ? 1
+        : 2;
+    return Padding(
+      padding: const EdgeInsets.only(top: 58),
+      child: LayoutBuilder(
+        builder: (context, viewport) {
+          final double previewHeight = math.min<double>(
+            math.max(0, viewport.maxHeight * .51),
+            math.max(0.0, viewport.maxWidth - 32),
+          );
+          return Column(
             children: [
-              Row(
-                children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: connected
-                          ? const Color(0xff32d583)
-                          : const Color(0xffff5b5b),
-                    ),
-                  ),
-                  const Spacer(),
-                  _RandomToggleButton(
-                    enabled: randomEnabled,
-                    updating: randomUpdating,
-                    onChanged: onRandomToggle,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              Center(
-                child: _PreviewDial(
-                  active: active,
-                  media: null,
-                  asset: asset,
-                  factoryVideo:
-                      videoQueue.isNotEmpty && videoIndex < videoQueue.length
-                      ? videoQueue[videoIndex]
-                      : null,
-                  nextVideo:
-                      videoQueue.isNotEmpty &&
-                          videoIndex + 1 < videoQueue.length
-                      ? videoQueue[videoIndex + 1]
-                      : null,
-                  looping: selectedFactory?.isLoop == true,
-                  onFactoryVideoDone:
-                      selectedFactory?.isLoop == true || videoQueue.isEmpty
-                      ? null
-                      : onVideoDone,
-                  preparing: uploading,
-                  progress: uploadProgress,
-                ),
-              ),
-              const SizedBox(height: 16),
-              if (uploading) ...[
-                LinearProgressIndicator(
-                  value: _clamp01(uploadProgress),
-                  minHeight: 6,
-                  borderRadius: BorderRadius.circular(99),
-                ),
-                const SizedBox(height: 18),
-              ],
-            ],
-          ),
-        ),
-        Expanded(
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  const Color(0xff171717).withValues(alpha: 0),
-                  const Color(0xff060606).withValues(alpha: 0.98),
-                  Colors.black,
-                ],
-                stops: const [0, 0.12, 1],
-              ),
-            ),
-            child: GridView.builder(
-              padding: const EdgeInsets.fromLTRB(18, 8, 18, 104),
-              itemCount: factoryAnims.length + history.length,
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-                childAspectRatio: 1,
-              ),
-              itemBuilder: (context, index) {
-                if (index < history.length) {
-                  final entry = history[index];
-                  return _HistoryGridTile(
-                    key: ValueKey(
-                      historyEntryIdentity(
-                        assetPath: entry.assetPath,
-                        reviewId: entry.reviewId,
-                        createdAt: entry.createdAt,
-                      ),
-                    ),
-                    active: active,
-                    entry: entry,
-                    selected:
-                        asset != null &&
-                        uploadMatchesHistory(
-                          historyAssetPath: entry.assetPath,
-                          historyReviewId: entry.reviewId,
-                          uploadedAssetPath: asset!.assetPath,
-                          uploadedReviewId: asset!.reviewId,
+              SizedBox(
+                key: const ValueKey('fixed-home-preview'),
+                height: previewHeight,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: GestureDetector(
+                        key: const ValueKey('home-circle-preview'),
+                        onTap: uploading
+                            ? null
+                            : selectedFactory != null
+                            ? () => onFactoryTap(selectedFactory)
+                            : asset != null
+                            ? () => onAssetUpload(asset!)
+                            : onImport,
+                        child: Center(
+                          child: AspectRatio(
+                            aspectRatio: 1,
+                            child: FittedBox(
+                              child: _PreviewDial(
+                                active: active,
+                                media: null,
+                                asset: asset,
+                                factoryPreview: selectedFactory?.previewAsset,
+                                factoryVideo:
+                                    videoQueue.isNotEmpty &&
+                                        videoIndex < videoQueue.length
+                                    ? videoQueue[videoIndex]
+                                    : null,
+                                nextVideo:
+                                    videoQueue.isNotEmpty &&
+                                        videoIndex + 1 < videoQueue.length
+                                    ? videoQueue[videoIndex + 1]
+                                    : null,
+                                looping: selectedFactory?.isLoop == true,
+                                onFactoryVideoDone:
+                                    selectedFactory?.isLoop == true ||
+                                        videoQueue.isEmpty
+                                    ? null
+                                    : onVideoDone,
+                                preparing: uploading,
+                                progress: uploadProgress,
+                              ),
+                            ),
+                          ),
                         ),
-                    onTap: uploading ? null : () => onHistoryTap(entry),
-                    onLongPress: () => onHistoryDelete(entry),
-                  );
-                }
-                final anim = factoryAnims[index - history.length];
-                final isSelected = selectedFactoryId == anim.id;
-                return _FactoryGridTile(
-                  key: ValueKey('fac_${anim.id}'),
-                  anim: anim,
-                  selected: isSelected,
-                  onTap: uploading ? null : () => onFactoryTap(anim),
-                );
-              },
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _RandomToggleButton extends StatelessWidget {
-  const _RandomToggleButton({
-    required this.enabled,
-    required this.updating,
-    required this.onChanged,
-  });
-
-  final bool enabled;
-  final bool updating;
-  final ValueChanged<bool> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = enabled ? const Color(0xff37e26f) : Colors.white;
-    return Tooltip(
-      message: enabled ? '关闭随机播放' : '随机播放',
-      child: InkResponse(
-        radius: 28,
-        onTap: updating ? null : () => onChanged(!enabled),
-        child: SizedBox(
-          width: 42,
-          height: 42,
-          child: Opacity(
-            opacity: updating ? 0.55 : 1,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                Icon(Icons.shuffle_rounded, color: color, size: 28),
-                if (enabled)
-                  Positioned(
-                    bottom: 3,
-                    child: Container(
-                      width: 6,
-                      height: 6,
-                      decoration: const BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Color(0xff37e26f),
                       ),
                     ),
-                  ),
-              ],
-            ),
-          ),
-        ),
+                    Positioned(
+                      bottom: 0,
+                      left: 0,
+                      right: 0,
+                      height: 35,
+                      child: IgnorePointer(
+                        child: ClipRect(
+                          key: const ValueKey('preview-filter-frost'),
+                          child: BackdropFilter(
+                            filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [
+                                    Colors.black.withValues(alpha: .05),
+                                    Colors.black,
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (uploading)
+                      Positioned(
+                        left: 24,
+                        right: 24,
+                        bottom: 0,
+                        child: LinearProgressIndicator(
+                          value: _clamp01(uploadProgress),
+                          minHeight: 2,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                child: ReferenceSegmentedBar(
+                  labels: [tr('我的素材'), tr('出厂素材'), tr('全部素材')],
+                  selectedIndex: tabIndex,
+                  onSelected: (index) => onFilter([1, 2, 0][index]),
+                ),
+              ),
+              Expanded(
+                child: Stack(
+                  children: [
+                    CustomScrollView(
+                      key: const ValueKey('home-material-grid'),
+                      slivers: [
+                        if (userItems.isEmpty &&
+                            factoryItems.isEmpty &&
+                            !addTile)
+                          const SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.all(24),
+                              child: AppText(
+                                '还没有素材，添加图片或视频开始制作',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: referenceMuted,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                          ),
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 88),
+                          sliver: SliverGrid(
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: 3,
+                                  mainAxisSpacing: 10,
+                                  crossAxisSpacing: 10,
+                                ),
+                            delegate: SliverChildBuilderDelegate(
+                              (context, gridIndex) {
+                                if (addTile && gridIndex == 0) {
+                                  return Material(
+                                    color: Colors.black,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(14),
+                                      side: const BorderSide(
+                                        color: Color(0xff252525),
+                                      ),
+                                    ),
+                                    child: InkWell(
+                                      key: const ValueKey('add-material'),
+                                      onTap: uploading ? null : onImport,
+                                      borderRadius: BorderRadius.circular(14),
+                                      child: const Center(
+                                        child: Icon(
+                                          Icons.add_circle_outline_rounded,
+                                          color: referenceMuted,
+                                          size: 44,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }
+                                final index = gridIndex - (addTile ? 1 : 0);
+                                if (index < userItems.length) {
+                                  final entry = userItems[index];
+                                  return _HistoryGridTile(
+                                    key: ValueKey(
+                                      historyEntryIdentity(
+                                        assetPath: entry.assetPath,
+                                        reviewId: entry.reviewId,
+                                        createdAt: entry.createdAt,
+                                      ),
+                                    ),
+                                    active: active,
+                                    entry: entry,
+                                    selected:
+                                        asset != null &&
+                                        uploadMatchesHistory(
+                                          historyAssetPath: entry.assetPath,
+                                          historyReviewId: entry.reviewId,
+                                          uploadedAssetPath: asset!.assetPath,
+                                          uploadedReviewId: asset!.reviewId,
+                                        ),
+                                    onTap: uploading
+                                        ? null
+                                        : () => onHistoryTap(entry),
+                                    onLongPress: () => onHistoryDelete(entry),
+                                  );
+                                }
+                                final anim =
+                                    factoryItems[index - userItems.length];
+                                return _FactoryGridTile(
+                                  key: ValueKey('fac_${anim.id}'),
+                                  anim: anim,
+                                  selected: selectedFactoryId == anim.id,
+                                  onTap: uploading
+                                      ? null
+                                      : () => onFactoryTap(anim),
+                                );
+                              },
+                              childCount:
+                                  userItems.length +
+                                  factoryItems.length +
+                                  (addTile ? 1 : 0),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    Positioned(
+                      left: 32,
+                      right: 32,
+                      bottom: 16,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(24),
+                        child: BackdropFilter(
+                          filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                          child: Material(
+                            color: const Color(
+                              0xff202020,
+                            ).withValues(alpha: .88),
+                            child: InkWell(
+                              key: const ValueKey('find-animation'),
+                              onTap: () => _openSearch(context),
+                              child: const SizedBox(
+                                height: 46,
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.search_rounded, size: 20),
+                                    SizedBox(width: 8),
+                                    AppText(
+                                      '查找动画',
+                                      style: TextStyle(fontSize: 14),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
-class _MakerPage extends StatelessWidget {
+class _MakerPage extends StatefulWidget {
   const _MakerPage({
+    super.key,
     required this.active,
     required this.media,
     required this.asset,
@@ -2176,124 +3106,283 @@ class _MakerPage extends StatelessWidget {
     required this.onSave,
     required this.onCropChanged,
     required this.onResetCrop,
+    required this.draftName,
+    required this.onNameChanged,
+    required this.onClose,
   });
-
-  final bool active;
+  final bool active, preparing, uploading;
   final SelectedMedia? media;
   final PreparedAsset? asset;
   final CropTransform cropTransform;
-  final bool preparing;
-  final bool uploading;
   final double prepareProgress;
-  final VoidCallback onPick;
-  final VoidCallback onSave;
+  final VoidCallback onPick, onSave, onResetCrop, onClose;
   final ValueChanged<CropTransform> onCropChanged;
-  final VoidCallback onResetCrop;
+  final String draftName;
+  final ValueChanged<String> onNameChanged;
+  @override
+  State<_MakerPage> createState() => _MakerPageState();
+}
+
+class _MakerPageState extends State<_MakerPage> {
+  late final _name = TextEditingController(text: widget.draftName);
+  late int _kind =
+      widget.media != null &&
+          !_isVideoMime(widget.media!.mime) &&
+          widget.media!.mime != 'image/gif'
+      ? 1
+      : 0;
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final disabled = preparing || uploading;
-
+    final disabled = widget.preparing || widget.uploading;
     return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 14, 18, 104),
+      key: const ValueKey('video-upload-sheet'),
+      padding: EdgeInsets.fromLTRB(
+        24,
+        8,
+        24,
+        24 + MediaQuery.viewInsetsOf(context).bottom,
+      ),
       children: [
-        _PageHeader(
-          title: '制作',
-          trailing: IconButton.filled(
-            tooltip: '导入',
-            onPressed: disabled ? null : onPick,
-            icon: const Icon(Icons.file_open_outlined),
+        Row(
+          children: [
+            const SizedBox(width: 32),
+            Expanded(
+              child: GestureDetector(
+                onVerticalDragEnd: disabled
+                    ? null
+                    : (details) {
+                        if ((details.primaryVelocity ?? 0) > 400) {
+                          widget.onClose();
+                        }
+                      },
+                child: Center(
+                  child: Container(
+                    width: 58,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: const Color(0xff666666),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            IconButton(
+              key: const ValueKey('close-maker'),
+              onPressed: disabled ? null : widget.onClose,
+              icon: const Icon(Icons.close_rounded, size: 18),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        const AppText(
+          '上传动画',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 30,
+            fontWeight: FontWeight.w800,
+            letterSpacing: -1,
           ),
         ),
-        const SizedBox(height: 22),
-        Center(
-          child: _CropPreview(
-            active: active && !preparing,
-            media: media,
-            asset: asset,
-            transform: cropTransform,
-            preparing: preparing,
-            progress: prepareProgress,
-            onChanged: disabled ? null : onCropChanged,
-          ),
+        const SizedBox(height: 10),
+        const AppText(
+          '添加素材，调整圆形画面并保存到我的素材。',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 13, color: referenceMuted),
         ),
         const SizedBox(height: 24),
-        _GlassPanel(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+        ReferenceSegmentedBar(
+          labels: const ['动画', '图片'],
+          selectedIndex: _kind,
+          onSelected: (index) {
+            if (disabled) return;
+            setState(() => _kind = index);
+            widget.onPick();
+          },
+        ),
+        const SizedBox(height: 28),
+        const AppText(
+          '素材名称',
+          style: TextStyle(
+            color: Color(0xff777777),
+            fontSize: 11,
+            letterSpacing: 2,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          key: const ValueKey('maker-name'),
+          controller: _name,
+          enabled: !disabled,
+          onChanged: widget.onNameChanged,
+          decoration: InputDecoration(
+            hintText: tr('为这个动画取个名字'),
+            hintStyle: const TextStyle(fontSize: 13, color: Color(0xff555555)),
+            filled: true,
+            fillColor: const Color(0xff111111),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: const BorderSide(color: Color(0xff333333)),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: const BorderSide(color: Color(0xff333333)),
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 16,
+            ),
+          ),
+        ),
+        const SizedBox(height: 28),
+        const AppText(
+          '动画素材',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Color(0xff777777),
+            fontSize: 11,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 2,
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (widget.media == null)
+          Center(
+            child: InkWell(
+              key: const ValueKey('maker-pick'),
+              onTap: disabled ? null : widget.onPick,
+              customBorder: const CircleBorder(),
+              child: Container(
+                width: 252,
+                height: 252,
+                decoration: BoxDecoration(
+                  color: const Color(0xff0b0b0b),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: const Color(0xff202020)),
+                ),
+                child: const Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.movie_creation_outlined,
+                      color: referenceMuted,
+                      size: 25,
+                    ),
+                    SizedBox(height: 10),
+                    AppText(
+                      '点击添加素材',
+                      style: TextStyle(fontSize: 12, color: Color(0xff666666)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          )
+        else
+          Center(
+            child: _CropPreview(
+              active: widget.active && !widget.preparing,
+              media: widget.media,
+              asset: widget.asset,
+              transform: widget.cropTransform,
+              preparing: widget.preparing,
+              progress: widget.prepareProgress,
+              onChanged: disabled ? null : widget.onCropChanged,
+            ),
+          ),
+        const SizedBox(height: 12),
+        if (widget.media != null) ...[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Row(
-                children: [
-                  const Icon(Icons.zoom_in_map),
-                  const SizedBox(width: 10),
-                  Text('${cropTransform.scale.toStringAsFixed(2)}x'),
-                  const Spacer(),
-                  IconButton(
-                    tooltip: '重置',
-                    onPressed: disabled ? null : onResetCrop,
-                    icon: const Icon(Icons.refresh),
-                  ),
-                ],
-              ),
-              Slider(
-                value: cropTransform.scale,
-                min: 1,
-                max: 4,
-                divisions: 30,
-                onChanged: disabled
-                    ? null
-                    : (value) =>
-                          onCropChanged(cropTransform.copyWith(scale: value)),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: disabled ? null : onPick,
-                      icon: const Icon(Icons.file_open_outlined),
-                      label: const Text('导入素材'),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: disabled || media == null ? null : onSave,
-                      icon: const Icon(Icons.save_alt),
-                      label: Text(preparing ? '保存中' : '保存'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '素材需审核，请勿上传非法素材',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.white.withValues(alpha: 0.48),
-                  height: 1.25,
+              TextButton(
+                onPressed: disabled ? null : widget.onPick,
+                child: const AppText(
+                  '更换素材',
+                  style: TextStyle(color: referenceMuted, fontSize: 12),
                 ),
               ),
-              if (preparing) ...[
-                const SizedBox(height: 16),
-                LinearProgressIndicator(
-                  value: prepareProgress == 0
-                      ? null
-                      : _clamp01(prepareProgress),
-                  minHeight: 6,
-                  borderRadius: BorderRadius.circular(99),
+              const SizedBox(width: 20),
+              TextButton(
+                onPressed: disabled ? null : widget.onResetCrop,
+                child: const AppText(
+                  '重置裁剪',
+                  style: TextStyle(color: referenceMuted, fontSize: 12),
                 ),
-              ],
+              ),
             ],
           ),
+          Slider(
+            value: widget.cropTransform.scale,
+            min: 1,
+            max: 4,
+            divisions: 30,
+            onChanged: disabled
+                ? null
+                : (value) => widget.onCropChanged(
+                    widget.cropTransform.copyWith(scale: value),
+                  ),
+          ),
+          const AppText(
+            '拖动、双指缩放调整画面',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 11, color: referenceMuted),
+          ),
+        ],
+        const SizedBox(height: 28),
+        SizedBox(
+          height: 42,
+          child: FilledButton.icon(
+            key: const ValueKey('maker-save'),
+            onPressed: disabled || widget.media == null ? null : widget.onSave,
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xff12341b),
+              foregroundColor: const Color(0xffb8dcb8),
+              disabledBackgroundColor: const Color(0xff101510),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            icon: const Icon(Icons.save_alt_rounded, size: 15),
+            label: AppText(
+              widget.preparing ? '处理中…' : '保存到我的素材',
+              style: const TextStyle(fontSize: 13),
+            ),
+          ),
+        ),
+        if (widget.preparing) ...[
+          const SizedBox(height: 12),
+          LinearProgressIndicator(
+            value: widget.prepareProgress == 0
+                ? null
+                : _clamp01(widget.prepareProgress),
+            minHeight: 3,
+          ),
+        ],
+        const SizedBox(height: 12),
+        const AppText(
+          '素材由服务器处理后直接下发',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 10, color: Color(0xff666666)),
         ),
       ],
     );
   }
 }
 
-class _DevicePage extends StatelessWidget {
+class _DevicePage extends StatefulWidget {
   const _DevicePage({
+    required this.preview,
+    required this.onOpenBrightness,
+    required this.onImport,
+    required this.onLibrary,
     required this.devices,
     required this.scanning,
     required this.connecting,
@@ -2306,6 +3395,9 @@ class _DevicePage extends StatelessWidget {
     required this.onConnect,
     required this.onDisconnect,
     required this.onBrightness,
+    required this.supportsAlignment,
+    required this.alignmentAngleTenths,
+    required this.onAlignment,
     required this.onPrivacyPolicy,
     required this.demoMode,
     required this.onEnterDemoMode,
@@ -2324,201 +3416,280 @@ class _DevicePage extends StatelessWidget {
   final ValueChanged<BadgeDevice> onConnect;
   final VoidCallback onDisconnect;
   final ValueChanged<int> onBrightness;
+  final bool supportsAlignment;
+  final VoidCallback onAlignment;
   final VoidCallback onPrivacyPolicy;
   final bool demoMode;
   final VoidCallback onEnterDemoMode;
   final VoidCallback onExitDemoMode;
 
+  final int alignmentAngleTenths;
+  final Widget preview;
+  final VoidCallback onOpenBrightness, onImport, onLibrary;
   @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 14, 18, 104),
-      children: [
-        _PageHeader(
-          title: '设备',
-          trailing: IconButton.filled(
-            tooltip: '扫描',
-            onPressed: scanning ? null : onScan,
-            icon: scanning
+  State<_DevicePage> createState() => _DevicePageState();
+}
+
+class _DevicePageState extends State<_DevicePage> {
+  int _tab = 0;
+  @override
+  Widget build(BuildContext context) => ListView(
+    padding: const EdgeInsets.fromLTRB(16, 24, 16, 24),
+    children: [
+      SizedBox(
+        height: 166,
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xff080809),
+            border: Border.all(color: const Color(0xff131315), width: .6),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Stack(
+            children: [
+              Center(
+                child: FractionallySizedBox(
+                  heightFactor: .82,
+                  child: widget.connected
+                      ? ReferenceDeviceDisplay(
+                          child: FittedBox(child: widget.preview),
+                        )
+                      : const ReferenceDeviceDisplay(),
+                ),
+              ),
+              Positioned(
+                left: 12,
+                bottom: 12,
+                child: SizedBox.square(
+                  dimension: 28,
+                  child: IconButton.filled(
+                    padding: EdgeInsets.zero,
+                    onPressed: widget.onOpenBrightness,
+                    icon: const Icon(Icons.lightbulb_outline, size: 18),
+                    style: IconButton.styleFrom(
+                      backgroundColor: const Color(0xff222222),
+                      foregroundColor: referenceMuted,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(7),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      const SizedBox(height: 18),
+      const AppText(
+        'DotLoop',
+        textAlign: TextAlign.center,
+        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+      ),
+      const SizedBox(height: 3),
+      AppText(
+        widget.connected ? '已连接' : '未连接',
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: referenceMuted, fontSize: 12),
+      ),
+      const SizedBox(height: 16),
+      ReferenceSegmentedBar(
+        labels: const ['设置', '上传', '已下载'],
+        selectedIndex: _tab,
+        onSelected: (value) => setState(() => _tab = value),
+      ),
+      const SizedBox(height: 12),
+      if (_tab == 0) ...[
+        SizedBox(
+          height: 40,
+          child: FilledButton(
+            onPressed: widget.scanning
+                ? null
+                : widget.connected
+                ? widget.onDisconnect
+                : widget.onScan,
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xff202020),
+              foregroundColor: referenceBlue,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            child: widget.scanning
                 ? const SizedBox.square(
-                    dimension: 18,
+                    dimension: 16,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.radar),
+                : AppText(
+                    widget.connected ? '断开设备' : '连接设备',
+                    style: const TextStyle(fontSize: 13),
+                  ),
           ),
         ),
-        const SizedBox(height: 18),
-        _GlassPanel(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Icon(
-                    connected ? Icons.wifi : Icons.wifi_off,
-                    color: _connectionColor(connected),
+        if (widget.devices.isEmpty && !widget.connected)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 28),
+            child: Column(
+              children: [
+                AppText(
+                  '未发现设备',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+                ),
+                SizedBox(height: 6),
+                AppText(
+                  '确认设备已开机并在附近',
+                  style: TextStyle(color: referenceMuted, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        for (final device in widget.devices)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: ReferencePanel(
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.memory_outlined, size: 30),
+                title: AppText(
+                  device.name,
+                  translate: false,
+                  style: const TextStyle(fontSize: 14),
+                ),
+                subtitle: AppText(
+                  device.address,
+                  style: const TextStyle(fontSize: 11, color: referenceMuted),
+                ),
+                trailing: TextButton(
+                  onPressed: widget.connecting
+                      ? null
+                      : () => widget.onConnect(device),
+                  child: AppText(
+                    widget.connectedAddress == device.address ? '已连接' : '连接',
+                    style: const TextStyle(color: referenceBlue, fontSize: 12),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          connected ? status : '未连接',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: _connectionColor(connected),
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        if (connectedAddress != null) ...[
-                          const SizedBox(height: 3),
-                          Text(
-                            connectedAddress!,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.56),
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
+                ),
+              ),
+            ),
+          ),
+        if (widget.connected) ...[
+          const SizedBox(height: 20),
+          ReferencePanel(
+            child: Column(
+              children: [
+                _row('屏幕亮度', '${widget.brightness}%', widget.onOpenBrightness),
+                if (widget.supportsAlignment) ...[
+                  const Divider(height: 18, color: Color(0xff2b2b2b)),
+                  _row(
+                    '安装角度校正',
+                    '${(widget.alignmentAngleTenths / 10).toStringAsFixed(1)}°',
+                    widget.onAlignment,
+                    key: const ValueKey('device-alignment'),
                   ),
-                  if (connected)
-                    IconButton(
-                      tooltip: '断开',
-                      onPressed: onDisconnect,
-                      icon: const Icon(Icons.link_off),
-                    ),
                 ],
+              ],
+            ),
+          ),
+        ],
+      ] else if (_tab == 1) ...[
+        ReferencePanel(
+          child: Column(
+            children: [
+              const AppText(
+                '上传动画',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 12),
+              const AppText(
+                '添加图片或视频，调整画面后保存并上传到设备。',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: referenceMuted,
+                  fontSize: 12,
+                  height: 1.5,
+                ),
               ),
               const SizedBox(height: 16),
-              Row(
-                children: [
-                  Icon(
-                    sdAvailable ? Icons.sd_card : Icons.sd_card_alert,
-                    size: 20,
-                    color: sdAvailable
-                        ? const Color(0xff32d583)
-                        : Colors.white.withValues(alpha: 0.54),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    sdAvailable ? 'TF 卡可用' : 'TF 卡未确认',
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.72),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 18),
-              Row(
-                children: [
-                  const Icon(Icons.brightness_6_outlined),
-                  const SizedBox(width: 10),
-                  Text('$brightness%'),
-                ],
-              ),
-              Slider(
-                value: brightness.toDouble(),
-                min: 0,
-                max: 100,
-                divisions: 20,
-                onChanged: connected
-                    ? (value) => onBrightness(value.round())
-                    : null,
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 18),
-        if (devices.isEmpty)
-          _GlassPanel(
-            child: SizedBox(
-              height: 170,
-              child: Center(
-                child: Text(
-                  scanning ? '扫描中' : '未发现设备',
-                  style: TextStyle(color: Colors.white.withValues(alpha: 0.62)),
-                ),
-              ),
-            ),
-          )
-        else
-          ...devices.map(
-            (device) => Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: _GlassPanel(
-                child: ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: CircleAvatar(
-                    backgroundColor: Colors.white,
-                    child: Icon(
-                      device.serviceMatch ? Icons.verified : Icons.wifi,
-                      color: Colors.black,
-                    ),
-                  ),
-                  title: Text(
-                    device.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Text('${device.address}   RSSI ${device.rssi}'),
-                  trailing: FilledButton(
-                    onPressed: connecting ? null : () => onConnect(device),
-                    child: Text(
-                      connectedAddress == device.address ? '已连接' : '连接',
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        const SizedBox(height: 8),
-        Center(
-          child: Wrap(
-            alignment: WrapAlignment.center,
-            spacing: 10,
-            runSpacing: 6,
-            children: [
-              TextButton.icon(
-                onPressed: demoMode ? onExitDemoMode : onEnterDemoMode,
-                icon: Icon(demoMode ? Icons.visibility_off : Icons.visibility),
-                label: Text(demoMode ? '退出演示模式' : '审核演示'),
-                style: TextButton.styleFrom(
-                  foregroundColor: Colors.white.withValues(alpha: 0.62),
-                  minimumSize: Size.zero,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  textStyle: const TextStyle(fontSize: 12),
-                ),
-              ),
               TextButton(
-                key: const ValueKey('privacy-policy-link'),
-                onPressed: onPrivacyPolicy,
-                style: TextButton.styleFrom(
-                  foregroundColor: Colors.white.withValues(alpha: 0.46),
-                  minimumSize: Size.zero,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  textStyle: const TextStyle(fontSize: 12),
+                onPressed: widget.onImport,
+                child: const AppText(
+                  '添加素材',
+                  style: TextStyle(color: referenceBlue),
                 ),
-                child: const Text('隐私政策'),
               ),
             ],
           ),
         ),
-      ],
-    );
-  }
+      ] else
+        ReferencePanel(
+          child: Column(
+            children: [
+              const AppText(
+                '我的素材',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 12),
+              const AppText(
+                '查看已导入的素材，并切换设备画面。',
+                style: TextStyle(color: referenceMuted, fontSize: 12),
+              ),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: widget.onLibrary,
+                child: const AppText(
+                  '查看我的素材',
+                  style: TextStyle(color: referenceBlue),
+                ),
+              ),
+            ],
+          ),
+        ),
+      const SizedBox(height: 24),
+      Center(
+        child: Wrap(
+          spacing: 16,
+          children: [
+            TextButton(
+              onPressed: widget.demoMode
+                  ? widget.onExitDemoMode
+                  : widget.onEnterDemoMode,
+              child: AppText(
+                widget.demoMode ? '退出演示模式' : '审核演示',
+                style: const TextStyle(color: referenceMuted, fontSize: 11),
+              ),
+            ),
+            TextButton(
+              key: const ValueKey('privacy-policy-link'),
+              onPressed: widget.onPrivacyPolicy,
+              child: const AppText(
+                '隐私政策',
+                style: TextStyle(color: referenceMuted, fontSize: 11),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
+
+  Widget _row(String label, String value, VoidCallback action, {Key? key}) =>
+      InkWell(
+        key: key,
+        onTap: action,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Row(
+            children: [
+              AppText(label, style: const TextStyle(fontSize: 13)),
+              const Spacer(),
+              AppText(
+                value,
+                style: const TextStyle(color: referenceMuted, fontSize: 12),
+              ),
+              const SizedBox(width: 8),
+              const Icon(Icons.chevron_right, size: 15, color: referenceMuted),
+            ],
+          ),
+        ),
+      );
 }
 
 class _HistoryGridTile extends StatelessWidget {
@@ -2542,71 +3713,44 @@ class _HistoryGridTile extends StatelessWidget {
     final previewPath = entry.previewPath ?? entry.animatedPreviewPath;
     final overlayColor = _reviewOverlayColor(entry);
     final reviewLabel = _reviewStatusLabel(entry);
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-        child: Material(
-          color: Colors.black,
-          child: InkWell(
-            onTap: onTap,
-            onLongPress: onLongPress,
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: selected ? Colors.white : Colors.transparent,
-                  width: selected ? 1.5 : 1,
-                ),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: ClipOval(
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      _HistoryPreview(
-                        active: active,
-                        entry: entry,
-                        previewPath: previewPath,
-                        transform: entry.cropTransform,
-                      ),
-                      if (overlayColor != null) ColoredBox(color: overlayColor),
-                      if (reviewLabel != null)
-                        Center(
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: Colors.black.withValues(alpha: 0.58),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.2),
-                              ),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 4,
-                              ),
-                              child: Text(
-                                reviewLabel,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w800,
-                                  letterSpacing: 0,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
+    return ReferenceMaterialTile(
+      selected: selected,
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: SizedBox.expand(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _HistoryPreview(
+              active: active,
+              entry: entry,
+              previewPath: previewPath,
+              transform: entry.cropTransform,
+            ),
+            if (overlayColor != null) ColoredBox(color: overlayColor),
+            if (reviewLabel != null)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: .65),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: AppText(
+                    reviewLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ),
-            ),
-          ),
+          ],
         ),
       ),
     );
@@ -2906,6 +4050,7 @@ class _PreviewDial extends StatelessWidget {
     required this.media,
     required this.asset,
     this.factoryVideo,
+    this.factoryPreview,
     this.nextVideo,
     this.looping = false,
     this.onFactoryVideoDone,
@@ -2917,6 +4062,7 @@ class _PreviewDial extends StatelessWidget {
   final SelectedMedia? media;
   final PreparedAsset? asset;
   final String? factoryVideo;
+  final String? factoryPreview;
   final String? nextVideo;
   final bool looping;
   final VoidCallback? onFactoryVideoDone;
@@ -2927,41 +4073,43 @@ class _PreviewDial extends StatelessWidget {
   Widget build(BuildContext context) {
     final transform = asset?.cropTransform ?? const CropTransform();
 
-    return Container(
+    return SizedBox(
       width: 284,
       height: 284,
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            Colors.white.withValues(alpha: 0.18),
-            Colors.white.withValues(alpha: 0.03),
-          ],
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.white.withValues(alpha: 0.08),
-            blurRadius: 36,
-            spreadRadius: 2,
-          ),
-        ],
-      ),
       child: ClipOval(
         child: Stack(
           fit: StackFit.expand,
           children: [
             DecoratedBox(decoration: const BoxDecoration(color: Colors.black)),
-            if (media != null && _isVideoMime(media!.mime))
+            if (asset == null && media == null && factoryPreview != null)
+              StaticMaterialPreview(
+                key: const ValueKey('factory-preview-fallback'),
+                image: _isLocalFilePath(factoryPreview!)
+                    ? FileImage(_fileFromPath(factoryPreview!))
+                    : AssetImage(factoryPreview!),
+              ),
+            if (media != null &&
+                _isVideoMime(media!.mime) &&
+                media!.previewBytes != null)
+              Image.memory(
+                media!.previewBytes!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+              )
+            else if (asset != null &&
+                _isVideoMime(asset!.mime) &&
+                _hasPreviewPath(asset!.previewPath))
+              StaticMaterialPreview(
+                image: FileImage(File(asset!.previewPath!)),
+              ),
+            if (active && media != null && _isVideoMime(media!.mime))
               _VideoPreview(
                 key: ValueKey('dial-media-video-${media!.uri}'),
                 uri: media!.uri,
                 active: active,
               )
-            else if (asset != null &&
+            else if (active &&
+                asset != null &&
                 _isVideoMime(asset!.mime) &&
                 asset!.sourceUri != null)
               _CropTransformView(
@@ -3002,15 +4150,15 @@ class _PreviewDial extends StatelessWidget {
                 gaplessPlayback: true,
                 errorBuilder: _blackPreviewFallback,
               )
-            else if (factoryVideo != null)
-              _DualVideoPlayer(
+            else if (active && factoryVideo != null)
+              FactoryVideoPreview(
                 currentVideo: factoryVideo!,
                 nextVideo: nextVideo,
                 active: active,
                 looping: looping,
                 onDone: onFactoryVideoDone,
               )
-            else
+            else if (factoryPreview == null)
               const Center(
                 child: Icon(
                   Icons.perm_media_outlined,
@@ -3140,301 +4288,15 @@ class _VideoPreviewState extends State<_VideoPreview> {
     if (!_ready || controller == null) {
       return const SizedBox.expand();
     }
-    return FittedBox(
-      fit: BoxFit.cover,
-      child: SizedBox(
-        width: controller.value.size.width,
-        height: controller.value.size.height,
-        child: VideoPlayer(controller),
-      ),
-    );
-  }
-}
-
-class _DualVideoPlayer extends StatefulWidget {
-  const _DualVideoPlayer({
-    super.key,
-    required this.currentVideo,
-    this.nextVideo,
-    required this.active,
-    this.looping = false,
-    this.onDone,
-  });
-
-  final String currentVideo;
-  final String? nextVideo;
-  final bool active;
-  final bool looping;
-  final VoidCallback? onDone;
-
-  @override
-  State<_DualVideoPlayer> createState() => _DualVideoPlayerState();
-}
-
-class _DualVideoPlayerState extends State<_DualVideoPlayer> {
-  VideoPlayerController? _active; // currently displayed (always initialized)
-  VideoPlayerController? _preloaded; // next video ready to go
-  String? _activePath;
-  String? _preloadedPath;
-  bool _done = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadCurrent();
-    _maybePreload();
-  }
-
-  @override
-  void didUpdateWidget(covariant _DualVideoPlayer oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.currentVideo != widget.currentVideo) {
-      _done = false;
-      _switchTo(widget.currentVideo);
-    }
-    if (oldWidget.nextVideo != widget.nextVideo) {
-      _maybePreload();
-    }
-    if (oldWidget.looping != widget.looping) {
-      unawaited(_syncLooping());
-    }
-    if (oldWidget.active != widget.active) {
-      unawaited(_syncActive());
-    }
-  }
-
-  void _maybePreload() {
-    final nv = widget.nextVideo;
-    if (nv == null || nv == _activePath || nv == _preloadedPath) return;
-    _preloaded?.removeListener(_onUpdate);
-    _preloaded?.dispose();
-    _preloaded = null;
-    _preloadedPath = null;
-    final c = _factoryVideoController(nv);
-    _preloaded = c;
-    _preloadedPath = nv;
-    c
-        .initialize()
-        .then((_) {
-          if (!mounted || _preloaded != c) return;
-          c.setLooping(false);
-          c.setVolume(0);
-        })
-        .catchError((_) {
-          c.dispose();
-          if (mounted && _preloaded == c) {
-            _preloaded = null;
-            _preloadedPath = null;
-          }
-        });
-  }
-
-  Future<void> _loadCurrent() async {
-    _done = false;
-    await _activate(widget.currentVideo);
-    _maybePreload();
-  }
-
-  Future<void> _switchTo(String path) async {
-    if (_activePath == path && _active != null) return;
-
-    // If preloaded has this, instant swap
-    if (_preloadedPath == path && _preloaded?.value.isInitialized == true) {
-      final old = _active;
-      _active = _preloaded;
-      _activePath = _preloadedPath;
-      _preloaded = old;
-      _preloadedPath = null;
-      _active?.removeListener(_onUpdate);
-      _active?.addListener(_onUpdate);
-      await _active!.setLooping(widget.looping);
-      await _active!.seekTo(Duration.zero);
-      await _active!.play();
-      if (mounted) setState(() {});
-      _disposeAfter(old, 500);
-      _maybePreload();
-      return;
-    }
-
-    // Load new without touching _active — no flicker
-    await _activate(path);
-    _maybePreload();
-  }
-
-  Future<void> _activate(String path) async {
-    // Load new controller while keeping _active displayed
-    final c = _factoryVideoController(path);
-    try {
-      await c.initialize();
-      await c.setLooping(widget.looping);
-      await c.setVolume(0);
-      if (!mounted) {
-        c.dispose();
-        return;
-      }
-      c.addListener(_onUpdate);
-      // Swap: new becomes active, old goes to disposal
-      final old = _active;
-      _active = c;
-      _activePath = path;
-      if (mounted) setState(() {});
-      await c.seekTo(Duration.zero);
-      await c.play();
-      _disposeAfter(old, 500);
-    } catch (_) {
-      await c.dispose();
-    }
-  }
-
-  void _disposeAfter(VideoPlayerController? c, int ms) {
-    if (c == null) return;
-    c.removeListener(_onUpdate);
-    Future.delayed(Duration(milliseconds: ms), () {
-      if (_active != c && _preloaded != c) c.dispose();
-    });
-  }
-
-  void _onUpdate() {
-    if (widget.looping) return;
-    if (_done || _active == null || !_active!.value.isInitialized) return;
-    if (_active!.value.position >=
-        _active!.value.duration - const Duration(milliseconds: 100)) {
-      _done = true;
-      widget.onDone?.call();
-    }
-  }
-
-  Future<void> _syncLooping() async {
-    final c = _active;
-    if (c == null || !c.value.isInitialized) return;
-    await c.setLooping(widget.looping);
-    if (!widget.looping) {
-      _done = false;
-    }
-  }
-
-  Future<void> _syncActive() async {
-    final c = _active;
-    if (c == null || !c.value.isInitialized) return;
-    try {
-      if (widget.active) {
-        await c.play();
-      } else {
-        await c.pause();
-      }
-    } catch (_) {}
-  }
-
-  @override
-  void deactivate() {
-    final c = _active;
-    if (c != null && c.value.isInitialized) unawaited(c.pause());
-    super.deactivate();
-  }
-
-  @override
-  void activate() {
-    super.activate();
-    unawaited(_syncActive());
-  }
-
-  @override
-  void dispose() {
-    _active?.removeListener(_onUpdate);
-    _active?.dispose();
-    _preloaded?.removeListener(_onUpdate);
-    _preloaded?.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final c = _active;
-    if (c == null || !c.value.isInitialized) return const SizedBox.expand();
-    return FittedBox(
-      fit: BoxFit.cover,
-      child: SizedBox(
-        width: c.value.size.width,
-        height: c.value.size.height,
-        child: VideoPlayer(c),
-      ),
-    );
-  }
-}
-
-class _GlassPanel extends StatelessWidget {
-  const _GlassPanel({required this.child});
-
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    const radius = 8.0;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(radius),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.08),
-            borderRadius: BorderRadius.circular(radius),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
-          ),
-          child: Padding(padding: const EdgeInsets.all(16), child: child),
+    return RepaintBoundary(
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: controller.value.size.width,
+          height: controller.value.size.height,
+          child: VideoPlayer(controller),
         ),
       ),
-    );
-  }
-}
-
-class _ConnectionStatusText extends StatelessWidget {
-  const _ConnectionStatusText({required this.connected, required this.text});
-
-  final bool connected;
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = _connectionColor(connected);
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(connected ? Icons.wifi : Icons.wifi_off, size: 18, color: color),
-        const SizedBox(width: 7),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 150),
-          child: Text(
-            text,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(color: color, fontWeight: FontWeight.w800),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _PageHeader extends StatelessWidget {
-  const _PageHeader({required this.title, this.trailing});
-
-  final String title;
-  final Widget? trailing;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Text(
-          title,
-          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-            fontWeight: FontWeight.w800,
-            letterSpacing: 0,
-          ),
-        ),
-        const Spacer(),
-        if (trailing != null) trailing!,
-      ],
     );
   }
 }
@@ -3455,49 +4317,18 @@ class _HistoryPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     Widget? child;
-    if (active && _hasPreviewPath(entry.animatedPreviewPath)) {
-      child = Image.file(
-        File(entry.animatedPreviewPath!),
-        fit: BoxFit.cover,
-        gaplessPlayback: true,
-        errorBuilder: _blackPreviewFallback,
-      );
-    } else if (_hasPreviewPath(previewPath)) {
-      child = Image.file(
-        File(previewPath!),
-        fit: BoxFit.cover,
-        gaplessPlayback: true,
-        errorBuilder: _blackPreviewFallback,
-      );
+    if (_hasPreviewPath(previewPath)) {
+      child = StaticMaterialPreview(image: FileImage(File(previewPath!)));
     }
 
     if (child == null) {
       return const ColoredBox(
-        color: Colors.black,
+        color: Color(0xff0d0c0e),
         child: Icon(Icons.image, color: Colors.white),
       );
     }
 
     return _CropTransformView(transform: transform, child: child);
-  }
-}
-
-class _EmptyHistory extends StatelessWidget {
-  const _EmptyHistory();
-
-  @override
-  Widget build(BuildContext context) {
-    return _GlassPanel(
-      child: SizedBox(
-        height: 72,
-        child: Center(
-          child: Text(
-            '暂无记录',
-            style: TextStyle(color: Colors.white.withValues(alpha: 0.58)),
-          ),
-        ),
-      ),
-    );
   }
 }
 
@@ -3511,7 +4342,7 @@ class _Backdrop extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [Color(0xff050505), Color(0xff171717), Color(0xff030303)],
+          colors: [Colors.black, Colors.black],
         ),
       ),
       child: const SizedBox.expand(),
@@ -3805,29 +4636,35 @@ class HistoryEntry {
   }
 
   HistoryEntry copyWith({
+    String? assetPath,
+    int? packageSize,
+    int? frameCount,
+    int? fps,
+    int? crc32,
     String? animatedPreviewPath,
     String? deviceId,
     String? deviceKey,
     String? reviewId,
     String? reviewStatus,
+    bool clearDeviceIdentity = false,
   }) {
     return HistoryEntry(
-      assetPath: assetPath,
+      assetPath: assetPath ?? this.assetPath,
       previewPath: previewPath,
       animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
       sourceUri: sourceUri,
       mime: mime,
       name: name,
-      packageSize: packageSize,
-      frameCount: frameCount,
-      fps: fps,
-      crc32: crc32,
+      packageSize: packageSize ?? this.packageSize,
+      frameCount: frameCount ?? this.frameCount,
+      fps: fps ?? this.fps,
+      crc32: crc32 ?? this.crc32,
       createdAt: createdAt,
       cropScale: cropScale,
       cropOffsetX: cropOffsetX,
       cropOffsetY: cropOffsetY,
-      deviceId: deviceId ?? this.deviceId,
-      deviceKey: deviceKey ?? this.deviceKey,
+      deviceId: clearDeviceIdentity ? null : deviceId ?? this.deviceId,
+      deviceKey: clearDeviceIdentity ? null : deviceKey ?? this.deviceKey,
       reviewId: reviewId ?? this.reviewId,
       reviewStatus: reviewStatus ?? this.reviewStatus,
     );
@@ -3863,10 +4700,6 @@ int resolveBadgePackageBudget({required bool sdAvailable}) {
   return sdAvailable ? sdStreamBudget : legacyFlashBudget;
 }
 
-Color _connectionColor(bool connected) {
-  return connected ? const Color(0xff32d583) : const Color(0xffff5b5b);
-}
-
 Color? _reviewOverlayColor(HistoryEntry entry) {
   if (entry.reviewStatus == 'approved') {
     return null;
@@ -3884,7 +4717,7 @@ String? _reviewStatusLabel(HistoryEntry entry) {
   if (entry.reviewStatus == 'rejected') {
     return '违规';
   }
-  return '未审核';
+  return '处理中';
 }
 
 String? _readNullableString(Object? value) {
@@ -3895,10 +4728,8 @@ String? _readNullableString(Object? value) {
 }
 
 String _normalizeHardware(Object? value) {
-  // P4 support stays in the package/backend for a later opt-in release.
-  // The current UI intentionally exposes one target and always requests the
-  // S3 EBAJ4 package, even if a stale device status reports another target.
-  return 'esp32s3';
+  final hardware = value?.toString().trim().toLowerCase() ?? '';
+  return hardware.startsWith('esp32s3') ? 'esp32s3' : 'esp32p4';
 }
 
 bool _hasPreviewPath(String? path) =>
@@ -3929,13 +4760,6 @@ File _fileFromPath(String path) {
     return File(Uri.parse(path).toFilePath());
   }
   return File(path);
-}
-
-VideoPlayerController _factoryVideoController(String path) {
-  if (_isLocalFilePath(path)) {
-    return VideoPlayerController.file(_fileFromPath(path));
-  }
-  return VideoPlayerController.asset(path);
 }
 
 Widget _blackPreviewFallback(
@@ -4025,70 +4849,15 @@ class _FactoryGridTile extends StatelessWidget {
   final VoidCallback? onTap;
 
   @override
-  Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: Material(
-        color: selected
-            ? Colors.white.withValues(alpha: 0.05)
-            : Colors.transparent,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(8),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: selected
-                    ? Colors.white
-                    : Colors.white.withValues(alpha: 0.12),
-                width: selected ? 2 : 1,
-              ),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.all(6),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(5),
-                child: SizedBox.expand(
-                  child: _isLocalFilePath(anim.previewAsset)
-                      ? Image.file(
-                          _fileFromPath(anim.previewAsset),
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) =>
-                              const ColoredBox(color: Color(0xff1a1a1a)),
-                        )
-                      : Image.asset(
-                          anim.previewAsset,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) =>
-                              const ColoredBox(color: Color(0xff1a1a1a)),
-                        ),
-                ),
-              ),
-            ),
-          ),
-        ),
+  Widget build(BuildContext context) => ReferenceMaterialTile(
+    selected: selected,
+    onTap: onTap,
+    child: SizedBox.expand(
+      child: StaticMaterialPreview(
+        image: _isLocalFilePath(anim.previewAsset)
+            ? FileImage(_fileFromPath(anim.previewAsset))
+            : AssetImage(anim.previewAsset),
       ),
-    );
-  }
-}
-
-class _SectionLabel extends StatelessWidget {
-  const _SectionLabel(this.text);
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(left: 4),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 14,
-          fontWeight: FontWeight.w600,
-          color: Colors.white.withValues(alpha: 0.6),
-        ),
-      ),
-    );
-  }
+    ),
+  );
 }

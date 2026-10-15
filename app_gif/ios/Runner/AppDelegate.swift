@@ -1,11 +1,14 @@
 import AVFoundation
+import CoreBluetooth
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import CryptoKit
 import Darwin
 import Flutter
 import ImageIO
 import Network
+import NetworkExtension
 import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
@@ -18,9 +21,10 @@ import UIKit
   private var connectedAddress: String?
   private var activeBadgeHost = BadgeConstants.badgeApHost
   private var sdAvailable = false
-  private var badgeHardware = "esp32s3"
+  private var badgeHardware = "esp32p4"
   private var isUploading = false
   private var uploadBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+  private lazy var gameBluetooth = GameBluetoothController()
 
   override func application(
     _ application: UIApplication,
@@ -60,6 +64,88 @@ import UIKit
     case "setBrightness":
       let value = min(100, max(0, args["value"] as? Int ?? 70))
       setBrightness(value, result: result)
+    case "enterCalibration":
+      calibrationCommand(action: "enter", angleTenths: nil, returnsSnapshot: true, result: result)
+    case "loadLanguage":
+      result(UserDefaults.standard.string(forKey: "app_language") ?? "system")
+    case "saveLanguage":
+      let language = args["language"] as? String ?? "system"
+      guard ["system", "chinese", "english", "traditionalChinese", "japanese", "russian"].contains(language) else {
+        result(FlutterError(code: "invalid_language", message: "Invalid language", details: nil))
+        return
+      }
+      UserDefaults.standard.set(language, forKey: "app_language")
+      result(nil)
+    case "ensureGameBluetooth", "ensureDeviceBluetooth":
+      gameBluetooth.connect(result: result)
+    case "deviceBluetoothState":
+      gameBluetooth.connectionInfo(result: result)
+    case "deviceBluetoothCommand":
+      gameBluetooth.sendDevice(command: args["command"] as? String ?? "", result: result)
+    case "joinDeviceAccessPoint":
+      let configuration = NEHotspotConfiguration(ssid: "DotLoop")
+      configuration.joinOnce = true
+      NEHotspotConfigurationManager.shared.apply(configuration) { error in
+        if let error = error as NSError?,
+           !(error.domain == NEHotspotConfigurationErrorDomain && error.code == NEHotspotConfigurationError.alreadyAssociated.rawValue) {
+          DispatchQueue.main.async { result(FlutterError(code: "wifi_connect", message: error.localizedDescription, details: nil)) }
+          return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+          self.setActiveBadgeHost(BadgeConstants.badgeApHost)
+          var lastError: Error?
+          for _ in 0..<10 {
+            do {
+              let status = try self.requestText(self.badgeUrl("/status"), timeout: 2)
+              guard self.isBadgeStatusText(status) else { throw BadgeError.message("设备热点尚未就绪") }
+              self.sdAvailable = self.parseSdAvailable(status)
+              self.connectedAddress = BadgeConstants.badgeApHost
+              DispatchQueue.main.async { result(true) }
+              return
+            } catch { lastError = error; usleep(300_000) }
+          }
+          DispatchQueue.main.async { result(FlutterError(code: "wifi_connect", message: lastError?.localizedDescription ?? "请连接 DotLoop 热点后重试", details: nil)) }
+        }
+      }
+    case "leaveDeviceAccessPoint":
+      NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: "DotLoop")
+      connectedAddress = nil
+      result(nil)
+    case "releaseGameBluetooth":
+      gameBluetooth.close()
+      result(nil)
+    case "gameCommand", "sendGameControl":
+      gameBluetooth.send(action: args["action"] as? String ?? "flap", result: result)
+    case "gameControlStatus", "readGameControlStatus":
+      gameBluetooth.status(result: result)
+    case "calibrationStatus":
+      calibrationCommand(action: "status", angleTenths: nil, returnsSnapshot: true, result: result)
+    case "previewCalibration":
+      calibrationCommand(
+        action: "preview",
+        angleTenths: args["angleTenths"] as? Int ?? 0,
+        returnsSnapshot: false,
+        result: result
+      )
+    case "saveCalibration":
+      calibrationCommand(
+        action: "save",
+        angleTenths: args["angleTenths"] as? Int ?? 0,
+        returnsSnapshot: false,
+        result: result
+      )
+    case "cancelCalibration":
+      calibrationCommand(action: "cancel", angleTenths: nil, returnsSnapshot: false, result: result)
+    case "inspectLocalPackage":
+      let path = args["assetPath"] as? String ?? ""
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          let metadata = try self.localPackageMetadata(fileURL: URL(fileURLWithPath: path), hardware: args["hardware"] as? String)
+          DispatchQueue.main.async { result(metadata) }
+        } catch {
+          DispatchQueue.main.async { result(FlutterError(code: "package_invalid", message: error.localizedDescription, details: nil)) }
+        }
+      }
     case "pickMedia":
       pickMedia(result: result)
     case "warmVideoAnimatedPreview":
@@ -118,6 +204,7 @@ import UIKit
         maxFps: maxFps,
         crop: crop,
         hardware: normalizeBadgeHardware(args["hardware"] as? String),
+        deviceTransfer: args["deviceTransfer"] as? Bool ?? false,
         backendBase: args["backendBase"] as? String ?? "http://47.108.204.22",
         result: result
       )
@@ -133,6 +220,77 @@ import UIKit
         backendBase: args["backendBase"] as? String ?? "http://47.108.204.22",
         result: result
       )
+    case "checkFirmwareUpdate":
+      runFirmwareOperation(result: result) {
+        let hardware = args["hardware"] as? String ?? ""
+        guard hardware == "esp32p4-2.8",
+              let backend = args["backendBase"] as? String,
+              let url = URL(string: "\(backend.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/api/ota/manifest?hardware=\(hardware)") else {
+          throw transferFailure("firmware_invalid", "暂不支持此设备型号或服务器地址无效")
+        }
+        let reply = try self.firmwareJSONRequest(URLRequest(url: url))
+        let manifest = try RelayFirmwareManifest(reply)
+        return manifest.dictionary
+      }
+    case "downloadFirmware":
+      runFirmwareOperation(result: result) {
+        let manifest = try RelayFirmwareManifest(args)
+        let directory = try self.cacheDirectory("firmware")
+        let target = directory.appendingPathComponent("\(manifest.sha256).bin")
+        if (try? self.verifyFirmware(target, manifest: manifest)) == nil {
+          do {
+            _ = try self.downloadBackendFile(url: manifest.url, target: target,
+              maximumBytes: manifest.size, expectedSize: manifest.size, expectedSHA256: manifest.sha256)
+            try self.verifyFirmware(target, manifest: manifest)
+          } catch {
+            try? FileManager.default.removeItem(at: target)
+            throw error
+          }
+        }
+        return ["assetPath": target.path]
+      }
+    case "uploadFirmware":
+      runFirmwareOperation(result: result) {
+        let manifest = try RelayFirmwareManifest(args)
+        guard let path = args["assetPath"] as? String,
+              let deviceId = args["deviceId"] as? String,
+              deviceId.range(of: "^P4-[0-9a-fA-F]{12}$", options: .regularExpression) != nil else {
+          throw transferFailure("firmware_invalid", "固件缓存地址或设备身份无效")
+        }
+        let file = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL
+        let directory = try self.cacheDirectory("firmware").resolvingSymlinksInPath().standardizedFileURL
+        guard file.deletingLastPathComponent() == directory else {
+          throw transferFailure("firmware_invalid", "固件缓存地址无效")
+        }
+        try self.verifyFirmware(file, manifest: manifest)
+        guard let statusURL = URL(string: self.badgeUrl("/ota/status")),
+              let uploadURL = URL(string: self.badgeUrl("/ota/upload")) else {
+          throw transferFailure("firmware_invalid", "设备热点地址无效")
+        }
+        let status = try self.firmwareJSONRequest(URLRequest(url: statusURL), unsupportedOn404: true)
+        guard status["relay"] as? Bool == true,
+              status["hardware"] as? String == manifest.hardware,
+              status["deviceId"] as? String == deviceId,
+              ((status["maxSize"] as? NSNumber)?.intValue ?? 0) >= manifest.size else {
+          throw transferFailure("firmware_invalid", "热点设备身份或固件型号不匹配，已停止更新")
+        }
+        guard status["otaActive"] as? Bool != true else {
+          throw transferFailure("firmware_busy", "设备正在更新，请稍后重试")
+        }
+        var request = URLRequest(url: uploadURL)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(String(manifest.size), forHTTPHeaderField: "Content-Length")
+        request.setValue(manifest.hardware, forHTTPHeaderField: "X-OTA-Hardware")
+        request.setValue(manifest.version, forHTTPHeaderField: "X-OTA-Version")
+        request.setValue(manifest.sha256, forHTTPHeaderField: "X-OTA-SHA256")
+        let reply = try self.firmwareJSONRequest(request, uploadFile: file)
+        guard reply["success"] as? Bool == true,
+              reply["version"] as? String == manifest.version else {
+          throw transferFailure("firmware_rejected", "设备未确认固件更新成功")
+        }
+        return ["success": true, "version": manifest.version, "rebooting": true]
+      }
     case "loadHistory":
       result(loadHistory())
     case "saveHistory":
@@ -311,6 +469,44 @@ import UIKit
       } catch {
         DispatchQueue.main.async {
           result(FlutterError(code: "wifi_write", message: "亮度写入失败", details: nil))
+        }
+      }
+    }
+  }
+
+  private func calibrationCommand(
+    action: String,
+    angleTenths: Int?,
+    returnsSnapshot: Bool,
+    result: @escaping FlutterResult
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        var url = "\(self.badgeUrl("/calibration"))?action=\(action)"
+        if let angleTenths {
+          url += "&angle_tenths=\(min(1800, max(-1800, angleTenths)))"
+        }
+        let response = try self.requestText(url, timeout: BadgeConstants.statusTimeout)
+        guard
+          let data = response.data(using: .utf8),
+          let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          payload["success"] as? Bool == true
+        else {
+          throw BadgeError.message("校正失败")
+        }
+        DispatchQueue.main.async {
+          if returnsSnapshot {
+            result([
+              "angleTenths": payload["angleTenths"] as? Int ?? 0,
+              "active": payload["active"] as? Bool ?? false,
+            ])
+          } else {
+            result(nil)
+          }
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "calibration_failed", message: error.localizedDescription, details: nil))
         }
       }
     }
@@ -608,6 +804,9 @@ import UIKit
     let mime = mimeType(for: local)
     let attributes = try FileManager.default.attributesOfItem(atPath: local.path)
     let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+    if isVideoMime(mime) && size > BadgeConstants.maxVideoInputBytes {
+      throw BadgeError.message("视频文件过大")
+    }
     let previewBytes = try buildPreviewData(url: local, mime: mime, crop: .default)
     let animatedPreviewPath: String?
     if isGif(local) {
@@ -695,6 +894,10 @@ import UIKit
       do {
         let url = try self.url(from: uriText)
         let mime = self.mimeType(for: url)
+        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        if self.isVideoMime(mime) && size > BadgeConstants.maxVideoInputBytes {
+          throw BadgeError.message("视频文件过大")
+        }
         let encoder = EbajEncoder { progress in
           self.sendEvent(["type": "prepareProgress", "progress": progress])
         }
@@ -806,6 +1009,8 @@ import UIKit
         }
         self.sendEvent(["type": "uploadProgress", "progress": 1.0, "message": "已切换显示"])
         var resultMap: [String: Any] = [:]
+        resultMap["crc32"] = package.crc
+        resultMap["packageSize"] = package.size
         if let id = assignedId { resultMap["assignedId"] = id }
         if assignedId != nil,
            let response = try? self.sendRawTcpCommand("IDENTITY\n"),
@@ -1016,6 +1221,7 @@ import UIKit
     maxFps: Int,
     crop: CropTransform,
     hardware: String,
+    deviceTransfer: Bool,
     backendBase: String,
     result: @escaping FlutterResult
   ) {
@@ -1023,12 +1229,17 @@ import UIKit
       do {
         self.sendEvent(["type": "transcodeProgress", "stage": "upload", "message": "上传素材到服务器"])
         let source = try self.url(from: uriText)
+        let size = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        if self.isVideoMime(self.mimeType(for: source)) && size > BadgeConstants.maxVideoInputBytes {
+          throw BadgeError.message("视频文件过大")
+        }
         let params: [String: Any] = [
           "name": name,
           "maxFps": maxFps,
           "streamSize": 480,
           "userId": "ios-user",
           "hardware": hardware,
+          "deviceTransfer": deviceTransfer,
           "crop": ["scale": crop.scale, "offsetX": crop.offsetX, "offsetY": crop.offsetY],
         ]
         let backend = backendBase.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -1043,22 +1254,128 @@ import UIKit
         let preview = directory.appendingPathComponent("\(stem).png")
         let previewPath = try? self.downloadBackendFile(
           url: URL(string: "\(backend)/api/assets/\(assetId)/preview")!,
-          target: preview
+          target: preview,
+          maximumBytes: 8 * 1024 * 1024,
+          requestTimeout: BadgeConstants.previewRequestTimeout,
+          resourceTimeout: BadgeConstants.previewResourceTimeout
         )
         DispatchQueue.main.async {
           result([
             "reviewId": assetId,
-            "reviewStatus": "pending",
+            "reviewStatus": job["reviewStatus"] as? String ?? "pending",
             "fps": job["fps"] as? Int ?? 60,
             "previewPath": nullable(previewPath?.path),
           ])
         }
       } catch {
         DispatchQueue.main.async {
-          result(FlutterError(code: "transcode_failed", message: error.localizedDescription, details: nil))
+          let ns = error as NSError
+          let networkCodes = [NSURLErrorTimedOut, NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost,
+            NSURLErrorNetworkConnectionLost, NSURLErrorDNSLookupFailed, NSURLErrorNotConnectedToInternet]
+          let unavailable = (ns.domain == NSURLErrorDomain && networkCodes.contains(ns.code)) || ns.domain == "DotLoopBackendUnavailable"
+          result(FlutterError(code: unavailable ? "network_unavailable" : "transcode_failed", message: error.localizedDescription, details: nil))
         }
       }
     }
+  }
+
+  private func localPackageMetadata(fileURL: URL, hardware: String? = nil) throws -> [String: Any] {
+    let info = try preparePackageForUpload(fileURL: fileURL, hardware: hardware)
+    let handle = try FileHandle(forReadingFrom: fileURL)
+    defer { handle.closeFile() }
+    let header = handle.readData(ofLength: BadgeConstants.headerSize)
+    return ["assetPath": fileURL.path, "crc32": info.crc, "packageSize": info.size,
+            "frameCount": Int(readLe16(header, 12)), "fps": Int(readLe16(header, 14))]
+  }
+
+  private func runFirmwareOperation(result: @escaping FlutterResult, operation: @escaping () throws -> [String: Any]) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let value = try operation()
+        DispatchQueue.main.async { result(value) }
+      } catch {
+        DispatchQueue.main.async { result(nativeTransferError(error, fallback: "firmware_failed")) }
+      }
+    }
+  }
+
+  private func verifyFirmware(_ file: URL, manifest: RelayFirmwareManifest) throws {
+    let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+    guard (attributes[.size] as? NSNumber)?.intValue == manifest.size else {
+      throw transferFailure("firmware_invalid", "固件长度校验失败，请重新下载")
+    }
+    // At most 3 MiB: never map an unbounded or unverified input into memory.
+    let data = try Data(contentsOf: file)
+    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    func field(_ offset: Int, _ length: Int) -> String {
+      String(bytes: data[offset..<(offset + length)].prefix { $0 != 0 }, encoding: .utf8) ?? ""
+    }
+    guard data.count >= 288, data.count == manifest.size, hash == manifest.sha256,
+          data[0] == 0xe9, field(48, 32) == manifest.version,
+          field(80, 32) == "esp32-p4c5-dotloop" else {
+      throw transferFailure("firmware_invalid", "固件 SHA256 或内容与版本清单不一致")
+    }
+  }
+
+  private func firmwareJSONRequest(_ original: URLRequest, uploadFile: URL? = nil,
+                                   unsupportedOn404: Bool = false) throws -> [String: Any] {
+    var request = original
+    request.timeoutInterval = 120
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForResource = 150
+    // Firmware URLs and device responses must not redirect uploads elsewhere.
+    let redirects = RelayNoRedirectDelegate()
+    let session = URLSession(configuration: configuration, delegate: redirects, delegateQueue: nil)
+    defer { session.invalidateAndCancel() }
+    let semaphore = DispatchSemaphore(value: 0)
+    var output = Data()
+    var failure: Error?
+    var status = 0
+    let completion: (Data?, URLResponse?, Error?) -> Void = { data, response, error in
+      output = data ?? Data()
+      failure = error
+      status = (response as? HTTPURLResponse)?.statusCode ?? 0
+      semaphore.signal()
+    }
+    let task: URLSessionTask = uploadFile == nil
+      ? session.dataTask(with: request, completionHandler: completion)
+      : session.uploadTask(with: request, fromFile: uploadFile!, completionHandler: completion)
+    let started = Date()
+    if uploadFile != nil { NSLog("BadgeFirmware upload started bytes=%@", request.value(forHTTPHeaderField: "Content-Length") ?? "unknown") }
+    task.resume()
+    if semaphore.wait(timeout: .now() + 155) == .timedOut {
+      task.cancel()
+      throw transferFailure(uploadFile == nil ? "network_unavailable" : "firmware_result_unknown",
+        uploadFile == nil ? "固件请求超时" : "固件更新请求超时，手机未收到更新结果。设备可能已更新，请重新连接并查看实际固件版本后再决定是否重试。")
+    }
+    if let failure {
+      if uploadFile != nil {
+        NSLog("BadgeFirmware upload response lost elapsed=%ldms bytes=%lld error=%@",
+          Int(Date().timeIntervalSince(started) * 1000), redirects.sentBytes, failure.localizedDescription)
+        // An upload response can disappear when a verified device reboots.
+        // Preserve uncertainty and never issue another firmware POST here.
+        throw transferFailure("firmware_result_unknown",
+          "手机未收到固件更新结果。设备可能已更新并重启，请重新连接并查看实际固件版本后再决定是否重试。")
+      }
+      throw failure
+    }
+    guard (200...299).contains(status) else {
+      if status == 404 && unsupportedOn404 {
+        throw transferFailure("firmware_unsupported", "设备当前固件不支持手机更新，请先安装支持更新的固件")
+      }
+      throw transferHTTPFailure(status, firmware: true)
+    }
+    guard output.count <= 8192,
+          let reply = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any] else {
+      if uploadFile != nil {
+        throw transferFailure("firmware_result_unknown",
+          "固件已传送，但设备确认响应不完整。设备可能已更新并重启，请重新连接并查看实际固件版本后再决定是否重试。")
+      }
+      throw transferFailure("firmware_invalid", "固件响应格式无效")
+    }
+    if uploadFile != nil { NSLog("BadgeFirmware upload acknowledged elapsed=%ldms", Int(Date().timeIntervalSince(started) * 1000)) }
+    return reply
   }
 
   private func downloadApprovedPackage(
@@ -1069,6 +1386,7 @@ import UIKit
     result: @escaping FlutterResult
   ) {
     DispatchQueue.global(qos: .userInitiated).async {
+      var downloaded: URL?
       do {
         self.sendEvent(["type": "transcodeProgress", "stage": "download", "message": "下载素材包"])
         let backend = backendBase.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -1080,10 +1398,13 @@ import UIKit
           throw BadgeError.message("素材包地址错误")
         }
         _ = try self.downloadBackendFile(url: url, target: target)
-        DispatchQueue.main.async { result(["assetPath": target.path]) }
+        downloaded = target
+        let metadata = try self.localPackageMetadata(fileURL: target, hardware: hardware)
+        DispatchQueue.main.async { result(metadata) }
       } catch {
+        if let downloaded { try? FileManager.default.removeItem(at: downloaded) }
         DispatchQueue.main.async {
-          result(FlutterError(code: "download_failed", message: error.localizedDescription, details: nil))
+          result(nativeTransferError(error, fallback: "download_failed"))
         }
       }
     }
@@ -1111,7 +1432,8 @@ import UIKit
   }
 
   private func waitForTranscode(backend: String, jobId: String) throws -> [String: Any] {
-    for _ in 0..<900 {
+    let deadline = Date().addingTimeInterval(10 * 60)
+    while Date() < deadline {
       guard let url = URL(string: "\(backend)/api/transcode/\(jobId)") else {
         throw BadgeError.message("转码任务地址错误")
       }
@@ -1122,7 +1444,7 @@ import UIKit
       switch json["status"] as? String {
       case "done": return json
       case "failed": throw BadgeError.message(json["error"] as? String ?? "服务器转码失败")
-      default: Thread.sleep(forTimeInterval: 1)
+      default: Thread.sleep(forTimeInterval: 0.25)
       }
     }
     throw BadgeError.message("转码超时")
@@ -1147,35 +1469,21 @@ import UIKit
     if let responseError { throw responseError }
     guard (200...299).contains(statusCode) else {
       let message = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? "HTTP \(statusCode)"
+      if statusCode >= 500 { throw NSError(domain: "DotLoopBackendUnavailable", code: statusCode, userInfo: [NSLocalizedDescriptionKey: message]) }
       throw BadgeError.message(message)
     }
     return responseData ?? Data()
   }
 
-  private func downloadBackendFile(url: URL, target: URL) throws -> URL {
-    let semaphore = DispatchSemaphore(value: 0)
-    var responseError: Error?
-    var statusCode = 0
-    var copied = false
-    let task = URLSession.shared.downloadTask(with: url) { temporary, response, error in
-      responseError = error
-      statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-      if let temporary, (200...299).contains(statusCode) {
-        do {
-          try? FileManager.default.removeItem(at: target)
-          try FileManager.default.copyItem(at: temporary, to: target)
-          copied = true
-        } catch {
-          responseError = error
-        }
-      }
-      semaphore.signal()
-    }
-    task.resume()
-    semaphore.wait()
-    if let responseError { throw responseError }
-    guard copied else { throw BadgeError.message("下载失败 HTTP \(statusCode)") }
-    return target
+  private func downloadBackendFile(url: URL, target: URL,
+                                   maximumBytes: Int = BadgeConstants.sdStreamBudgetBytes,
+                                   expectedSize: Int? = nil, expectedSHA256: String? = nil,
+                                   requestTimeout: TimeInterval = 120,
+                                   resourceTimeout: TimeInterval = 900) throws -> URL {
+    let transfer = RelayBoundedDownload(target: target, maximumBytes: maximumBytes,
+      expectedSize: expectedSize, expectedSHA256: expectedSHA256,
+      requestTimeout: requestTimeout, resourceTimeout: resourceTimeout)
+    return try transfer.download(url)
   }
 
   private func validUserDeviceCommand(id: String, crc32: String) -> Bool {
@@ -1843,6 +2151,10 @@ import UIKit
   }
 
   private func preparePackageForUpload(fileURL: URL) throws -> UploadPackageInfo {
+    try preparePackageForUpload(fileURL: fileURL, hardware: badgeHardware)
+  }
+
+  private func preparePackageForUpload(fileURL: URL, hardware: String?) throws -> UploadPackageInfo {
     let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
     let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
     if size < BadgeConstants.headerSize {
@@ -1853,16 +2165,43 @@ import UIKit
     }
 
     let handle = try FileHandle(forReadingFrom: fileURL)
+    defer { handle.closeFile() }
     let header = handle.readData(ofLength: BadgeConstants.headerSize)
-    handle.closeFile()
-    if let message = validatePackageForUpload(header, packageSize: size) {
+    // First validate header geometry without assuming a codec. Codec/fps checks
+    // happen against the actual frame table before this file may be uploaded.
+    if let message = validatePackageForUpload(header, packageSize: size, jpeg: true) {
       throw BadgeError.message(message)
+    }
+    let frameCount = Int(readLe16(header, 12))
+    let tableOffset = Int(readLe32(header, 16))
+    handle.seek(toFileOffset: UInt64(tableOffset))
+    let table = handle.readData(ofLength: frameCount * BadgeConstants.frameEntrySize)
+    guard table.count == frameCount * BadgeConstants.frameEntrySize else {
+      throw BadgeError.message("素材帧表不完整，请重新下载")
+    }
+    let jpeg = table[10] == 0x20
+    if jpeg && hardware != nil && hardware != "esp32p4" {
+      throw BadgeError.message("P4 JPEG 素材不能用于 S3 设备，请重新转换")
+    }
+    if let message = validatePackageForUpload(header, packageSize: size, jpeg: jpeg) {
+      throw BadgeError.message(message)
+    }
+    let frameDataOffset = Int(readLe32(header, 20))
+    for index in 0..<frameCount {
+      let offset = index * BadgeConstants.frameEntrySize
+      let codec = table[offset + 10]
+      let payloadOffset = Int(readLe32(table, offset))
+      let payloadSize = Int(readLe32(table, offset + 4))
+      guard (jpeg ? codec == 0x20 : [0x10, 0x11, 0x12].contains(Int(codec))),
+            payloadOffset >= frameDataOffset, payloadOffset + payloadSize <= size else {
+        throw BadgeError.message("素材帧编码或范围无效，请重新下载")
+      }
     }
 
     return UploadPackageInfo(fileURL: fileURL, size: size, crc: try crc32(fileURL: fileURL))
   }
 
-  private func validatePackageForUpload(_ data: Data, packageSize packageLength: Int) -> String? {
+  private func validatePackageForUpload(_ data: Data, packageSize packageLength: Int, jpeg: Bool = false) -> String? {
     guard data.count >= BadgeConstants.headerSize else {
       return "素材包头不完整，请重新导入生成 EBAJ4"
     }
@@ -1890,8 +2229,10 @@ import UIKit
     if frameCount == 0 {
       return "素材没有可用帧，请重新导入生成"
     }
-    if fps < BadgeConstants.minDeviceFps || fps > BadgeConstants.maxDeviceFps {
-      return "历史素材帧率不是25-30fps，请重新导入生成"
+    let minimumFps = jpeg ? 1 : BadgeConstants.minDeviceFps
+    let maximumFps = jpeg ? 80 : BadgeConstants.maxDeviceFps
+    if fps < minimumFps || fps > maximumFps {
+      return jpeg ? "P4 素材帧率不在1–80fps范围，请重新转换" : "S3 素材帧率不在25–40fps范围，请重新转换"
     }
     if paletteEntries != BadgeConstants.paletteEntries || !isValidStreamSize(streamWidth, streamHeight) {
       return "素材编码和当前固件不匹配，请重新导入生成"
@@ -1925,13 +2266,13 @@ import UIKit
     let token = status
       .split { $0 == " " || $0 == "\n" || $0 == "\r" || $0 == "\t" }
       .first { $0.lowercased().hasPrefix("hardware=") }
-    return token?.split(separator: "=", maxSplits: 1).last?.lowercased() == "esp32p4"
-      ? "esp32p4"
-      : "esp32s3"
+    return token?.split(separator: "=", maxSplits: 1).last?.lowercased().hasPrefix("esp32s3") == true
+      ? "esp32s3"
+      : "esp32p4"
   }
 
   private func normalizeBadgeHardware(_ value: String?) -> String {
-    value?.lowercased() == "esp32p4" ? "esp32p4" : "esp32s3"
+    value?.lowercased().hasPrefix("esp32s3") == true ? "esp32s3" : "esp32p4"
   }
 
   private func sendConnectionEvent(connected: Bool, connecting: Bool, message: String) {
@@ -1956,6 +2297,176 @@ import UIKit
     let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
     let filtered = String(value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
     return filtered.isEmpty ? "asset" : filtered
+  }
+}
+
+/// Separate BLE session: firmware/material uploads continue to use Wi-Fi.
+private final class GameBluetoothController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+  private let serviceID = CBUUID(string: "31494a41-6252-4288-b942-2f8d009e1ab1")
+  private let controlID = CBUUID(string: "31494a41-6252-4288-b942-2f8d019e1ab1")
+  private var central: CBCentralManager?
+  private var peripheral: CBPeripheral?
+  private var control: CBCharacteristic?
+  private var connectResult: FlutterResult?
+  private var commandResult: FlutterResult?
+  private var candidates: [UUID: CBPeripheral] = [:]
+  private var connectTimeout: DispatchWorkItem?
+  private var scanEnd: DispatchWorkItem?
+  private var commandTimeout: DispatchWorkItem?
+  private var ready = false
+  private var sequence = 0
+  private var lastStatus = ""
+  private var deviceReply = false
+
+  func connect(result: @escaping FlutterResult) {
+    if ready { result(info()); return }
+    guard connectResult == nil else {
+      result(FlutterError(code: "bluetooth_busy", message: "正在连接蓝牙，请稍候", details: nil)); return
+    }
+    connectResult = result
+    candidates.removeAll()
+    let timeout = DispatchWorkItem { [weak self] in self?.fail("未找到可连接的 P4 蓝牙设备，请确认设备已开机") }
+    connectTimeout = timeout
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
+    if central == nil { central = CBCentralManager(delegate: self, queue: .main) }
+    else if central?.state == .poweredOn { scan() }
+    else if central?.state != .unknown && central?.state != .resetting { fail("请打开蓝牙，并允许 DotLoop 使用蓝牙") }
+  }
+
+  private func info() -> [String: Any] {
+    ["connected": true, "name": "DotLoop", "address": peripheral?.identifier.uuidString ?? "", "status": lastStatus, "transport": "bluetooth"]
+  }
+  func connectionInfo(result: @escaping FlutterResult) { result(ready ? info() : ["connected": false]) }
+  func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    if central.state == .poweredOn && connectResult != nil { scan() }
+    else if central.state != .unknown && central.state != .resetting && central.state != .poweredOn { fail("请打开蓝牙，并允许 DotLoop 使用蓝牙") }
+  }
+  private func scan() {
+    central?.scanForPeripherals(withServices: [serviceID])
+    scanEnd?.cancel()
+    let end = DispatchWorkItem { [weak self] in
+      guard let self = self else { return }
+      self.central?.stopScan()
+      guard self.candidates.count == 1, let device = self.candidates.values.first else {
+        self.fail(self.candidates.isEmpty ? "未发现 DotLoop 蓝牙设备" : "附近有多个 DotLoop，请只保留目标设备开机后重试"); return
+      }
+      self.peripheral = device
+      device.delegate = self
+      self.central?.connect(device)
+    }
+    scanEnd = end
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: end)
+  }
+  func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+                      advertisementData: [String: Any], rssi RSSI: NSNumber) {
+    candidates[peripheral.identifier] = peripheral
+  }
+  func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    guard self.peripheral === peripheral, connectResult != nil else { return }
+    peripheral.discoverServices([serviceID])
+  }
+  func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+    guard self.peripheral === peripheral else { return }
+    fail(error?.localizedDescription ?? "蓝牙连接失败")
+  }
+  func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+    guard self.peripheral === peripheral else { return }
+    fail("设备蓝牙已断开，请重新连接")
+  }
+  func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    guard self.peripheral === peripheral, connectResult != nil else { return }
+    guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == serviceID }) else {
+      fail("设备固件缺少蓝牙游戏服务，请更新 P4 固件"); return
+    }
+    peripheral.discoverCharacteristics([controlID], for: service)
+  }
+  func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+    guard self.peripheral === peripheral, connectResult != nil else { return }
+    guard error == nil, let characteristic = service.characteristics?.first(where: { $0.uuid == controlID }) else {
+      fail("设备缺少蓝牙控制特征"); return
+    }
+    control = characteristic
+    peripheral.setNotifyValue(true, for: characteristic)
+  }
+  func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+    guard self.peripheral === peripheral, characteristic === control, connectResult != nil else { return }
+    guard error == nil && characteristic.isNotifying else { fail("无法订阅蓝牙状态"); return }
+    peripheral.readValue(for: characteristic)
+  }
+  func send(action: String, result: @escaping FlutterResult) {
+    guard ["start", "flap", "restart", "pause", "resume", "stop", "status"].contains(action) else {
+      result(FlutterError(code: "bad_action", message: "不支持的游戏指令", details: nil)); return
+    }
+    write(action: action, isDevice: false, result: result)
+  }
+  func sendDevice(command: String, result: @escaping FlutterResult) {
+    guard (1...63).contains(command.utf8.count), command.utf8.allSatisfy({ (32...126).contains($0) }) else {
+      result(FlutterError(code: "bad_control", message: "设备指令参数无效", details: nil)); return
+    }
+    guard lastStatus.contains("dc=1") else {
+      result(FlutterError(code: "firmware_update_required", message: "请更新 P4 蓝牙控制固件", details: nil)); return
+    }
+    write(action: "DC:\(command)", isDevice: true, result: result)
+  }
+  private func write(action: String, isDevice: Bool, result: @escaping FlutterResult) {
+    guard ready, let device = peripheral, let characteristic = control else {
+      result(FlutterError(code: "bluetooth_disconnected", message: "蓝牙未连接，请重新连接", details: nil)); return
+    }
+    guard commandResult == nil else {
+      result(FlutterError(code: "game_busy", message: "设备正在处理上一条游戏指令", details: nil)); return
+    }
+    sequence = sequence >= 999999 ? 1 : sequence + 1
+    commandResult = result
+    deviceReply = isDevice
+    let timeout = DispatchWorkItem { [weak self] in self?.commandError("设备未确认游戏指令，请重试") }
+    commandTimeout = timeout
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    let payload = Data("GB:\(sequence):\(action)".utf8)
+    guard payload.count <= device.maximumWriteValueLength(for: .withResponse) else {
+      commandError("蓝牙数据长度不足，请重新连接"); return
+    }
+    device.writeValue(payload, for: characteristic, type: .withResponse)
+  }
+  func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+    guard self.peripheral === peripheral, characteristic === control else { return }
+    if let error = error { commandError(error.localizedDescription) }
+  }
+  func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+    guard self.peripheral === peripheral, characteristic === control else { return }
+    guard error == nil, let data = characteristic.value, let text = String(data: data, encoding: .utf8) else { return }
+    if text.hasPrefix("GB:\(sequence):") {
+      commandTimeout?.cancel()
+      let result = commandResult; commandResult = nil
+      if deviceReply && text.hasPrefix("GB:\(sequence):OK:") { result?(String(text.dropFirst("GB:\(sequence):OK:".count))) }
+      else if !deviceReply && text == "GB:\(sequence):OK" { result?(true) }
+      else { result?(FlutterError(code: "game_rejected", message: "设备拒绝指令：\(text)", details: nil)) }
+    } else if text.contains("hardware=esp32p4") {
+      lastStatus = text
+      if connectResult != nil && characteristic.isNotifying {
+        ready = true; connectTimeout?.cancel()
+        let result = connectResult; connectResult = nil
+        result?(info())
+      }
+    }
+  }
+  func status(result: @escaping FlutterResult) {
+    if ready { result(lastStatus) }
+    else { result(FlutterError(code: "bluetooth_disconnected", message: "蓝牙已断开", details: nil)) }
+  }
+  func close() { fail("蓝牙连接已关闭") }
+  private func commandError(_ message: String, code: String = "game_failed") {
+    commandTimeout?.cancel()
+    let result = commandResult; commandResult = nil
+    result?(FlutterError(code: code, message: message, details: nil))
+  }
+  private func fail(_ message: String) {
+    connectTimeout?.cancel(); scanEnd?.cancel(); central?.stopScan()
+    ready = false; control = nil; lastStatus = ""
+    let device = peripheral; peripheral = nil
+    if let device = device { central?.cancelPeripheralConnection(device) }
+    let result = connectResult; connectResult = nil
+    result?(FlutterError(code: "bluetooth_connect_failed", message: message, details: nil))
+    commandError(message, code: "bluetooth_disconnected")
   }
 }
 
@@ -2283,6 +2794,219 @@ private final class EbajEncoder {
   }
 }
 
+private struct RelayFirmwareManifest {
+  let hardware: String
+  let version: String
+  let url: URL
+  let size: Int
+  let sha256: String
+  let notes: String
+
+  init(_ data: [String: Any]) throws {
+    guard let hardware = data["hardware"] as? String, hardware == "esp32p4-2.8",
+          let version = data["version"] as? String, version.utf8.count <= 31,
+          version.range(of: "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$", options: .regularExpression) != nil,
+          let address = data["url"] as? String, let url = URL(string: address),
+          ["http", "https"].contains(url.scheme?.lowercased() ?? ""), !(url.host ?? "").isEmpty,
+          let size = (data["size"] as? NSNumber)?.intValue, (288...3 * 1024 * 1024).contains(size),
+          let sha256 = data["sha256"] as? String,
+          sha256.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil else {
+      throw transferFailure("firmware_invalid", "固件清单不完整或设备型号不匹配")
+    }
+    self.hardware = hardware
+    self.version = version
+    self.url = url
+    self.size = size
+    self.sha256 = sha256.lowercased()
+    self.notes = data["notes"] as? String ?? ""
+  }
+
+  var dictionary: [String: Any] {
+    ["hardware": hardware, "version": version, "url": url.absoluteString,
+     "size": size, "sha256": sha256, "notes": notes]
+  }
+}
+
+private func transferFailure(_ code: String, _ message: String) -> NSError {
+  NSError(domain: "DotLoopTransfer", code: 0,
+          userInfo: [NSLocalizedDescriptionKey: message, "nativeCode": code])
+}
+
+private func transferHTTPFailure(_ status: Int, firmware: Bool) -> NSError {
+  if status >= 500 {
+    return NSError(domain: "DotLoopBackendUnavailable", code: status,
+      userInfo: [NSLocalizedDescriptionKey: "服务器暂不可用 HTTP \(status)，请稍后重试"])
+  }
+  let code = status == 404
+    ? (firmware ? "firmware_unavailable" : "package_unavailable")
+    : (firmware ? "firmware_rejected" : "download_failed")
+  let message = status == 404
+    ? (firmware ? "该设备型号暂无可用固件" : "服务器素材包不存在，请重新转换素材")
+    : "下载或更新请求失败 HTTP \(status)"
+  return transferFailure(code, message)
+}
+
+private func nativeTransferError(_ error: Error, fallback: String) -> FlutterError {
+  let ns = error as NSError
+  let networkCodes = [NSURLErrorTimedOut, NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost,
+    NSURLErrorNetworkConnectionLost, NSURLErrorDNSLookupFailed, NSURLErrorNotConnectedToInternet]
+  let unavailable = ns.domain == "DotLoopBackendUnavailable" ||
+    (ns.domain == NSURLErrorDomain && networkCodes.contains(ns.code))
+  return FlutterError(code: unavailable ? "network_unavailable" : ns.userInfo["nativeCode"] as? String ?? fallback,
+    message: ns.localizedDescription, details: nil)
+}
+
+private final class RelayNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+  private(set) var sentBytes: Int64 = 0
+  func urlSession(_ session: URLSession, task: URLSessionTask,
+                  didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
+                  totalBytesExpectedToSend: Int64) {
+    sentBytes = totalBytesSent
+  }
+  func urlSession(_ session: URLSession, task: URLSessionTask,
+                  willPerformHTTPRedirection response: HTTPURLResponse,
+                  newRequest request: URLRequest,
+                  completionHandler: @escaping (URLRequest?) -> Void) {
+    completionHandler(nil)
+  }
+}
+
+/// Streams into a unique partial file. Both firmware and approved asset
+/// downloads commit only after byte count and any advertised SHA256 match.
+private final class RelayBoundedDownload: NSObject, URLSessionDataDelegate {
+  private let target: URL
+  private let partial: URL
+  private let maximumBytes: Int
+  private let expectedSize: Int?
+  private let expectedSHA256: String?
+  private let requestTimeout: TimeInterval
+  private let resourceTimeout: TimeInterval
+  private let semaphore = DispatchSemaphore(value: 0)
+  private var handle: FileHandle?
+  private var failure: Error?
+  private var received = 0
+  private var contentLength: Int?
+  private var serverSHA256: String?
+  private var hasher = SHA256()
+  private var firmware: Bool { expectedSHA256 != nil }
+
+  init(target: URL, maximumBytes: Int, expectedSize: Int?, expectedSHA256: String?,
+       requestTimeout: TimeInterval, resourceTimeout: TimeInterval) {
+    self.target = target
+    self.partial = target.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString).part")
+    self.maximumBytes = maximumBytes
+    self.expectedSize = expectedSize
+    self.expectedSHA256 = expectedSHA256?.lowercased()
+    self.requestTimeout = requestTimeout
+    self.resourceTimeout = resourceTimeout
+    super.init()
+  }
+
+  private func invalid(_ message: String) -> NSError {
+    transferFailure(firmware ? "firmware_invalid" : "package_invalid", message)
+  }
+
+  func download(_ url: URL) throws -> URL {
+    guard FileManager.default.createFile(atPath: partial.path, contents: nil) else {
+      throw invalid("下载缓存创建失败")
+    }
+    defer { try? FileManager.default.removeItem(at: partial) }
+    handle = try FileHandle(forWritingTo: partial)
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = requestTimeout
+    configuration.timeoutIntervalForResource = resourceTimeout
+    let queue = OperationQueue()
+    queue.maxConcurrentOperationCount = 1
+    let session = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
+    defer { session.invalidateAndCancel() }
+    var request = URLRequest(url: url)
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+    session.dataTask(with: request).resume()
+    semaphore.wait()
+    if let failure { throw failure }
+    guard received > 0,
+          expectedSize == nil || expectedSize == received,
+          contentLength == nil || contentLength == received else {
+      throw invalid("下载长度校验失败，请重新下载")
+    }
+    let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    guard expectedSHA256 == nil || expectedSHA256 == digest,
+          serverSHA256 == nil || serverSHA256 == digest else {
+      throw invalid("下载 SHA256 校验失败，请重新下载")
+    }
+    if FileManager.default.fileExists(atPath: target.path) {
+      try FileManager.default.removeItem(at: target)
+    }
+    try FileManager.default.moveItem(at: partial, to: target)
+    return target
+  }
+
+  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                  didReceive response: URLResponse,
+                  completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+      failure = transferHTTPFailure((response as? HTTPURLResponse)?.statusCode ?? 0, firmware: firmware)
+      completionHandler(.cancel)
+      return
+    }
+    if let length = http.value(forHTTPHeaderField: "Content-Length") {
+      guard let count = Int(length), count >= 0, count <= maximumBytes,
+            expectedSize == nil || expectedSize == count else {
+        failure = invalid("下载长度与清单不匹配")
+        completionHandler(.cancel)
+        return
+      }
+      contentLength = count
+    }
+    if let hash = http.value(forHTTPHeaderField: "x-asset-sha256") {
+      guard hash.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil else {
+        failure = invalid("服务器 SHA256 响应无效")
+        completionHandler(.cancel)
+        return
+      }
+      serverSHA256 = hash.lowercased()
+    }
+    if ["text/html", "application/json", "text/plain"].contains(http.mimeType?.lowercased() ?? "") {
+      failure = invalid("服务器未返回有效素材或固件文件")
+      completionHandler(.cancel)
+      return
+    }
+    completionHandler(.allow)
+  }
+
+  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    guard failure == nil else { return }
+    guard received + data.count <= maximumBytes else {
+      failure = invalid("下载文件超出允许长度")
+      dataTask.cancel()
+      return
+    }
+    do {
+      try handle?.write(contentsOf: data)
+      hasher.update(data: data)
+      received += data.count
+    } catch {
+      failure = error
+      dataTask.cancel()
+    }
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    if failure == nil { failure = error }
+    do { try handle?.close() } catch { if failure == nil { failure = error } }
+    handle = nil
+    semaphore.signal()
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask,
+                  willPerformHTTPRedirection response: HTTPURLResponse,
+                  newRequest request: URLRequest,
+                  completionHandler: @escaping (URLRequest?) -> Void) {
+    completionHandler(nil)
+  }
+}
+
 private enum BadgeConstants {
   static let channel = "esp_baji/native"
   static let badgeDeviceName = "DotLoop"
@@ -2303,6 +3027,9 @@ private enum BadgeConstants {
   static let randomCommandAttempts = 4
   static let randomCommandRetryDelayMs = 120
   static let sdStreamBudgetBytes = 512 * 1024 * 1024
+  static let maxVideoInputBytes = 200 * 1024 * 1024
+  static let previewRequestTimeout: TimeInterval = 5
+  static let previewResourceTimeout: TimeInterval = 8
   static let assetTooLargeMessage = "转换后的设备包超过当前素材存储空间，请换短一点的素材。"
   static let maxHistoryItems = 20
   static let historyKey = "history"
@@ -2314,7 +3041,7 @@ private enum BadgeConstants {
   static let maxDeviceFps = 40
   static let previewSize = 320
   static let videoPreviewGifSize = 192
-  static let videoPreviewGifFps = 30
+  static let videoPreviewGifFps = 25
   static let stream240Pixels = 240 * 240
   static let magic: UInt32 = 0x344a4142
   static let version = 4

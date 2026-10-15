@@ -20,6 +20,9 @@ class PendingDeviceDeletion {
     required this.deviceAssetId,
     required this.crc32,
     required this.createdAt,
+    this.reviewId,
+    this.name = 'asset',
+    this.needsPackageIdentity = false,
   });
 
   factory PendingDeviceDeletion.fromMap(Map<String, dynamic> map) {
@@ -40,6 +43,9 @@ class PendingDeviceDeletion {
       deviceAssetId: deviceAssetId!,
       crc32: crc32,
       createdAt: createdAt,
+      reviewId: map['reviewId'] as String?,
+      name: map['name'] as String? ?? 'asset',
+      needsPackageIdentity: map['needsPackageIdentity'] == true,
     );
   }
 
@@ -47,18 +53,30 @@ class PendingDeviceDeletion {
   final String deviceAssetId;
   final int crc32;
   final int createdAt;
+  final String? reviewId;
+  final String name;
+  final bool needsPackageIdentity;
 
   String get operationKey =>
-      '${deviceKey ?? 'legacy'}|$deviceAssetId|${crc32Hex(crc32)}';
+      '${deviceKey ?? 'legacy'}|$deviceAssetId|'
+      '${needsPackageIdentity ? 'pending:${reviewId ?? createdAt}' : crc32Hex(crc32)}';
 
   bool matchesDevice(String value) => deviceKey == value;
 
-  PendingDeviceDeletion copyWith({String? deviceKey, int? createdAt}) {
+  PendingDeviceDeletion copyWith({
+    String? deviceKey,
+    int? createdAt,
+    int? crc32,
+    bool? needsPackageIdentity,
+  }) {
     return PendingDeviceDeletion(
       deviceKey: deviceKey ?? this.deviceKey,
       deviceAssetId: deviceAssetId,
-      crc32: crc32,
+      crc32: crc32 ?? this.crc32,
       createdAt: createdAt ?? this.createdAt,
+      reviewId: reviewId,
+      name: name,
+      needsPackageIdentity: needsPackageIdentity ?? this.needsPackageIdentity,
     );
   }
 
@@ -68,6 +86,9 @@ class PendingDeviceDeletion {
       'deviceAssetId': deviceAssetId,
       'crc32': crc32,
       'createdAt': createdAt,
+      if (reviewId != null) 'reviewId': reviewId,
+      'name': name,
+      'needsPackageIdentity': needsPackageIdentity,
     };
   }
 }

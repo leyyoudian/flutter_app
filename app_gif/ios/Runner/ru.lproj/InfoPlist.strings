@@ -1,0 +1,4 @@
+"NSBluetoothAlwaysUsageDescription" = "Подключение к устройству DotLoop по Bluetooth для управления воспроизведением, яркостью, коррекцией угла и играми.";
+"NSBluetoothPeripheralUsageDescription" = "Подключение к устройству DotLoop по Bluetooth для управления воспроизведением, яркостью, коррекцией угла и играми.";
+"NSLocalNetworkUsageDescription" = "Подключение к устройству DotLoop для передачи анимаций и обновлений прошивки.";
+"NSPhotoLibraryUsageDescription" = "Импорт изображений, GIF или видео для создания анимаций.";

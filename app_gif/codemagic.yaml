@@ -5,19 +5,40 @@ workflows:
     max_build_duration: 120
     working_directory: app_gif
     integrations:
-      app_store_connect: codemagic
+      app_store_connect: Codemagic CI
     environment:
       flutter: stable
       xcode: latest
       cocoapods: default
       ios_signing:
         distribution_type: app_store
-        bundle_identifier: com.leyyoudian.espbaji
+        bundle_identifier: com.domainname.DotLoop
     scripts:
+      - name: Set unique release version
+        script: |
+          set -euo pipefail
+          python3 tool/ios_ci_version.py --project-build-number "${PROJECT_BUILD_NUMBER:?Codemagic project build number is required}" >> "$CM_ENV"
       - name: Get Flutter packages
         script: |
           flutter packages pub get
       - name: Install pods
+        script: |
+          cd ios
+          rm -rf Pods Podfile.lock
+          pod deintegrate || true
+          pod install --repo-update
+          cd ..
+          rm -f ios/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+      - name: Check shared UI and iOS feature contracts
+        script: |
+          set -euo pipefail
+          python3 -m unittest discover -s tool -p test_ios_ci_version.py
+          flutter analyze lib test
+          flutter test test/interaction_parity_test.dart test/app_language_test.dart test/p4_priority_ui_test.dart test/calibration_test.dart test/device_control_test.dart test/firmware_update_test.dart test/game_controller_recovery_test.dart test/ios_priority_parity_test.dart test/ios_native_static_test.dart test/ios_firmware_static_test.dart test/package_identity_test.dart test/p4_asset_target_test.dart test/preview_player_test.dart
+      - name: Set up App Store code signing
+        script: |
+          xcode-project use-profiles
+      - name: Build app-store-ipa
         script: |
           flutter clean
           flutter pub get
@@ -26,15 +47,16 @@ workflows:
           pod deintegrate || true
           pod install --repo-update
           cd ..
-      - name: Set up App Store code signing
-        script: |
-          xcode-project use-profiles
-      - name: Build app-store-ipa
-        script: |
-          flutter build ipa --release --export-options-plist=$HOME/export_options.plist
+          flutter build ipa --release --build-name="$FLUTTER_BUILD_NAME" --build-number="$FLUTTER_BUILD_NUMBER" --export-options-plist=$HOME/export_options.plist
     artifacts:
       - build/ios/ipa/*.ipa
       - flutter_drive.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+        submit_to_app_store: false
+        beta_groups: []
 
   ios-release:
     name: iOS Release IPA
@@ -46,21 +68,19 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
+      - name: Set unique release version
+        script: |
+          set -euo pipefail
+          python3 tool/ios_ci_version.py --project-build-number "${PROJECT_BUILD_NUMBER:?Codemagic project build number is required}" >> "$CM_ENV"
       - name: Get Flutter packages
         script: |
           flutter packages pub get
       - name: Install pods
         script: |
-          flutter clean
-          flutter pub get
-          cd ios
-          rm -rf Pods Podfile.lock
-          pod deintegrate || true
-          pod install --repo-update
-          cd ..
+          find . -name "Podfile" -execdir pod install \;
       - name: Build ad-hoc iOS release IPA for sideloading
         script: |
-          flutter build ios --release --no-codesign
+          flutter build ios --release --no-codesign --build-name="$FLUTTER_BUILD_NAME" --build-number="$FLUTTER_BUILD_NUMBER"
           APP_PATH="build/ios/iphoneos/Runner.app"
           test -d "$APP_PATH"
           if [ -e "$APP_PATH/Runner.debug.dylib" ] || [ -e "$APP_PATH/__preview.dylib" ]; then

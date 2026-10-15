@@ -45,9 +45,13 @@
 		</dict>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>用于连接 DotLoop 设备并上传车标动画。</string>
+	<string>连接 DotLoop 设备，传输动画和固件更新。</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>通过蓝牙连接 DotLoop 设备，控制播放、亮度、角度校正和游戏。</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>通过蓝牙连接 DotLoop 设备，控制播放、亮度、角度校正和游戏。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>用于导入图片、GIF 或视频素材。</string>
+	<string>导入图片、GIF 或视频，制作动画素材。</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

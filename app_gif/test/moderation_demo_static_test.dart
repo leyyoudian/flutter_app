@@ -49,12 +49,14 @@ void main() {
     );
   });
 
-  test('app package version is aligned with local update manifest', () {
+  test('app update check version matches the installed package version', () {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    expect(source, contains("static const _appVersion = '1.0.25';"));
-    expect(pubspec, contains('version: 1.0.25+27'));
+    final packageVersion = RegExp(r'^version:\s*(\d+\.\d+\.\d+)\+\d+', multiLine: true)
+        .firstMatch(pubspec)?.group(1);
+    expect(packageVersion, isNotNull);
+    expect(source, contains("static const _appVersion = '$packageVersion';"));
   });
 
   test('firmware project version is aligned with OTA release version', () {
@@ -75,7 +77,7 @@ void main() {
   });
 
   test(
-    'maker save submits review before storing history and shows policy hint',
+    'maker save syncs server before storing history and shows direct delivery hint',
     () {
       final source = File('lib/main.dart').readAsStringSync();
       final saveStart = source.indexOf('Future<void> _saveMakerAsset()');
@@ -85,10 +87,10 @@ void main() {
         submitAtSave,
       );
 
-      expect(source, contains('素材需审核，请勿上传非法素材'));
+      expect(source, contains('素材由服务器处理后直接下发'));
       expect(submitAtSave, greaterThan(saveStart));
       expect(insertHistory, greaterThan(submitAtSave));
-      expect(source, contains('素材已保存，已提交审核'));
+      expect(source, contains('素材已保存并同步服务器'));
     },
   );
 
@@ -167,7 +169,7 @@ void main() {
       expect(source, contains('_reviewOverlayColor'));
       expect(source, contains('_reviewStatusLabel'));
       expect(source, contains("return '违规';"));
-      expect(source, contains("return '未审核';"));
+      expect(source, contains("return '处理中';"));
       expect(source, contains("entry.reviewStatus == 'approved'"));
       expect(source, contains('Colors.redAccent.withValues'));
     },

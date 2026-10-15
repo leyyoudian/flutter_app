@@ -1,0 +1,4 @@
+"NSBluetoothAlwaysUsageDescription" = "透過藍牙連接 DotLoop 裝置，控制播放、亮度、角度校正與遊戲。";
+"NSBluetoothPeripheralUsageDescription" = "透過藍牙連接 DotLoop 裝置，控制播放、亮度、角度校正與遊戲。";
+"NSLocalNetworkUsageDescription" = "連接 DotLoop 裝置，傳輸動畫與韌體更新。";
+"NSPhotoLibraryUsageDescription" = "匯入圖片、GIF 或影片，製作動畫素材。";

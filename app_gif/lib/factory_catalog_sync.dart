@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 
+import 'factory_preview_quality.dart';
+
 class FactoryCatalogSync {
   const FactoryCatalogSync._();
 
@@ -173,11 +175,16 @@ class FactoryCatalogSync {
       'protected': item['protected'] == true || _isProtectedBaseline(id),
       'revision': item['revision'],
       'previewAsset': _readString(thumbnail['localPath']),
-      'firstVideo': _readString(firstVideo['localPath']),
-      'secondVideo': _readString(secondVideo['localPath']),
-      'loopVideo': _readString(loopVideo['localPath']),
+      'firstVideo': _preferredVideoPath(firstVideo),
+      'secondVideo': _preferredVideoPath(secondVideo),
+      'loopVideo': _preferredVideoPath(loopVideo),
       'transitions': item['transitions'] ?? <String, String>{},
     });
+  }
+
+  static String _preferredVideoPath(Map<String, dynamic> file) {
+    final hash = _readString(file['sha256']).toLowerCase();
+    return upgradedFactoryPreviewAssets[hash] ?? _readString(file['localPath']);
   }
 
   static Map<String, dynamic> _normalizeAnimationMap(

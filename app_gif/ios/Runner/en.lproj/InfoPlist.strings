@@ -1,0 +1,4 @@
+"NSBluetoothAlwaysUsageDescription" = "Connect to your DotLoop device over Bluetooth to control playback, brightness, alignment and games.";
+"NSBluetoothPeripheralUsageDescription" = "Connect to your DotLoop device over Bluetooth to control playback, brightness, alignment and games.";
+"NSLocalNetworkUsageDescription" = "Connect to your DotLoop device to transfer animations and firmware updates.";
+"NSPhotoLibraryUsageDescription" = "Import images, GIFs or videos to create animations.";
