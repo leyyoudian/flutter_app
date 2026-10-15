@@ -25,8 +25,9 @@ def main() -> None:
     parser.add_argument("--project-build-number", required=True)
     args = parser.parse_args()
     name, number = build_version(args.pubspec.read_text(encoding="utf-8"), args.project_build_number)
-    print(f"FLUTTER_BUILD_NAME={name}")
-    print(f"FLUTTER_BUILD_NUMBER={number}")
+    # CM_ENV exports these to every later command; FLUTTER_BUILD_* is reserved.
+    print(f"DOTLOOP_BUILD_NAME={name}")
+    print(f"DOTLOOP_BUILD_NUMBER={number}")
 
 
 if __name__ == "__main__":

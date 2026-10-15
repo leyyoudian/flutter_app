@@ -47,7 +47,7 @@ workflows:
           pod deintegrate || true
           pod install --repo-update
           cd ..
-          flutter build ipa --release --build-name="$FLUTTER_BUILD_NAME" --build-number="$FLUTTER_BUILD_NUMBER" --export-options-plist=$HOME/export_options.plist
+          flutter build ipa --release --build-name="$DOTLOOP_BUILD_NAME" --build-number="$DOTLOOP_BUILD_NUMBER" --export-options-plist=$HOME/export_options.plist
     artifacts:
       - build/ios/ipa/*.ipa
       - flutter_drive.log
@@ -80,7 +80,7 @@ workflows:
           find . -name "Podfile" -execdir pod install \;
       - name: Build ad-hoc iOS release IPA for sideloading
         script: |
-          flutter build ios --release --no-codesign --build-name="$FLUTTER_BUILD_NAME" --build-number="$FLUTTER_BUILD_NUMBER"
+          flutter build ios --release --no-codesign --build-name="$DOTLOOP_BUILD_NAME" --build-number="$DOTLOOP_BUILD_NUMBER"
           APP_PATH="build/ios/iphoneos/Runner.app"
           test -d "$APP_PATH"
           if [ -e "$APP_PATH/Runner.debug.dylib" ] || [ -e "$APP_PATH/__preview.dylib" ]; then

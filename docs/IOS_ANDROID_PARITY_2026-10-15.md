@@ -54,3 +54,11 @@
 - 尚未重新执行 Codemagic 云端 IPA 构建；本地检查不能替代新版云端 Flutter、Xcode 编译和签名验证。
 
 本轮日志：`app-1.0.31-tests.log`、`app-1.0.31-analyze.log`、`app-1.0.31-release-build.log`、`app-1.0.31-server-publish.log`（均位于上述 artifacts 目录）。
+
+## Codemagic 保留环境变量冲突修复
+
+- 后续云端日志显示静态分析已通过，但 `flutter test` 启动前报 `FLUTTER_BUILD_NAME is used by the framework and cannot be set in the environment.`，未进入 IPA 构建。版本脚本此前向 `CM_ENV` 写入了 Flutter 的保留变量，本地 Flutter 3.32.8 没有新版的相同限制，导致先前未发现。
+- 版本脚本现在导出 `DOTLOOP_BUILD_NAME`、`DOTLOOP_BUILD_NUMBER`；根目录及 App 内的两个 iOS 工作流均通过 `--build-name`、`--build-number` 显式传给 Flutter。没有关闭测试，也没有以 `--dart-define` 绕过检查。
+- 版本继续为 **1.0.31**，云端构建号继续按 **33 + PROJECT_BUILD_NUMBER** 递增。这次仅改构建配置及脚本，不重新发布 Android APK。
+- 新增版本 CLI 测试在修复前因导出 `FLUTTER_*` 而失败，修复后 **6 项 Python 测试通过**。携带新 CI 变量运行静态分析无问题、完整 Flutter **160 项通过**；两份 YAML 一致，实际 Bash 参数展开检查确认 App Store 和无签名工作流都收到预期版本及构建号。
+- 验证日志为 `codemagic-env-fix-checks.log`、`codemagic-env-fix-build-args.log`，位于上述 artifacts 目录。Windows 未运行 Xcode，云端新版 Flutter 测试、IPA 编译及签名仍需 Codemagic 重跑确认。
