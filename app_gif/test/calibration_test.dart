@@ -7,7 +7,18 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  setUp(() => LanguageSettings.current.value = AppLanguage.chinese);
+  const native = MethodChannel('esp_baji/native');
+  final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  setUp(() {
+    LanguageSettings.current.value = AppLanguage.chinese;
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      native,
+      (_) async => false,
+    );
+  });
+  tearDown(
+    () => binding.defaultBinaryMessenger.setMockMethodCallHandler(native, null),
+  );
   test('alignment angle wraps to one physical revolution', () {
     expect(normalizeAngleTenths(0), 0);
     expect(normalizeAngleTenths(1800), 1800);
@@ -88,10 +99,6 @@ void main() {
     expect(previews, contains(1));
     expect(find.text('0.1°'), findsWidgets);
 
-    await tester.scrollUntilVisible(
-      find.byKey(const ValueKey('alignment-save')),
-      160,
-    );
     await tester.tap(find.byKey(const ValueKey('alignment-save')));
     await tester.pumpAndSettle();
     expect(saved, 1);
@@ -170,12 +177,45 @@ void main() {
     await tester.tap(step);
     await tester.pump(const Duration(milliseconds: 80));
     expect(calls, ['preview:1']);
-    expect(haptics, contains('HapticFeedbackType.selectionClick'));
+    await tester.pumpAndSettle();
+    expect(haptics, contains('HapticFeedbackType.heavyImpact'));
     firstPreview.complete();
     await tester.pumpAndSettle();
     expect(calls, ['preview:1', 'preview:3']);
     await tester.tap(find.byKey(const ValueKey('alignment-save')));
     await tester.pumpAndSettle();
     expect(calls.last, 'save:3');
+  });
+
+  testWidgets('dial accepts taps away from the pointer and page stays fixed', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(360, 640));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AlignmentPage(
+          connected: false,
+          enter: () async =>
+              const CalibrationSnapshot(angleTenths: 0, active: true),
+          preview: (_) async {},
+          save: (_) async {},
+          cancel: () async {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(Scrollable), findsNothing);
+    final dial = find.byKey(const ValueKey('alignment-dial'));
+    final bounds = tester.getRect(dial);
+    await tester.tapAt(bounds.center + Offset(bounds.width * .35, 0));
+    await tester.pumpAndSettle();
+    expect(find.text('90.0°'), findsWidgets);
+    final save = tester.getRect(find.byKey(const ValueKey('alignment-save')));
+    await tester.dragFrom(Offset(24, bounds.top - 8), const Offset(0, -100));
+    await tester.pumpAndSettle();
+    expect(tester.getRect(dial), bounds);
+    expect(tester.getRect(find.byKey(const ValueKey('alignment-save'))), save);
+    expect(tester.takeException(), isNull);
   });
 }

@@ -105,7 +105,7 @@ void main() {
     LanguageSettings.current.value = AppLanguage.english;
     await tester.pumpAndSettle();
     expect(find.byTooltip('Settings'), findsOneWidget);
-    expect(find.text('Home'), findsOneWidget);
+    expect(find.text('Home'), findsWidgets);
     await tester.tap(find.byKey(const ValueKey('find-animation')));
     await tester.pumpAndSettle();
     final search = tester.widget<TextField>(find.byType(TextField));

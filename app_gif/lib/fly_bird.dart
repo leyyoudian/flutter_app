@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'app_language.dart';
 import 'reference_ui.dart';
+import 'interaction_feedback.dart';
 
 /// The P4 renders the game; this page is only its Bluetooth controller.
 class FlyBirdPage extends StatefulWidget {
@@ -97,13 +99,13 @@ class _FlyBirdPageState extends State<FlyBirdPage> {
         _running = accepted;
       });
     }
-    if (accepted) unawaited(HapticFeedback.mediumImpact());
+    if (accepted) unawaited(strongInteractionFeedback());
   }
 
   Future<void> _flap() async {
     if (!_running || _busy || _flapPending) return;
     _flapPending = true;
-    unawaited(HapticFeedback.lightImpact());
+    unawaited(strongInteractionFeedback());
     _flapOperation = _send('flap').then((_) {});
     try {
       await _flapOperation;
@@ -214,10 +216,7 @@ class _FlyBirdPageState extends State<FlyBirdPage> {
                       ),
                     ),
                     child: _busy
-                        ? const SizedBox.square(
-                            dimension: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
+                        ? const _StartingIndicator()
                         : const AppText('开始游戏'),
                   ),
                 ),
@@ -302,6 +301,75 @@ class _FlyBirdPageState extends State<FlyBirdPage> {
         ],
       ),
     ),
+  );
+}
+
+class _StartingIndicator extends StatefulWidget {
+  const _StartingIndicator();
+
+  @override
+  State<_StartingIndicator> createState() => _StartingIndicatorState();
+}
+
+class _StartingIndicatorState extends State<_StartingIndicator>
+    with SingleTickerProviderStateMixin {
+  late final _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _controller.stop();
+      _controller.value = 0;
+    } else if (!_controller.isAnimating) {
+      _controller.repeat();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      const AppText('启动中'),
+      const SizedBox(width: 6),
+      ExcludeSemantics(
+        child: AnimatedBuilder(
+          animation: _controller,
+          builder: (context, _) => Row(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(3, (index) {
+              final phase = (_controller.value - index * 0.16) % 1;
+              final lift = phase < 0.5
+                  ? math.sin(phase * math.pi * 2) * 4
+                  : 0.0;
+              return Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: Transform.translate(
+                  key: ValueKey('game-starting-dot-$index'),
+                  offset: Offset(0, -lift),
+                  child: const DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: Colors.black,
+                      shape: BoxShape.circle,
+                    ),
+                    child: SizedBox.square(dimension: 5),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+      ),
+    ],
   );
 }
 

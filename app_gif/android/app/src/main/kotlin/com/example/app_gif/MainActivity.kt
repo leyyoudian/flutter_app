@@ -44,6 +44,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import android.provider.Settings
 import android.provider.OpenableColumns
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -245,6 +249,26 @@ class MainActivity : FlutterActivity() {
 
     private fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "interactionHaptic" -> {
+                // Follow the system touch-feedback preference. No runtime permission is needed.
+                if (Settings.System.getInt(contentResolver, Settings.System.HAPTIC_FEEDBACK_ENABLED, 1) != 0) {
+                    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                    } else {
+                        @Suppress("DEPRECATION")
+                        (getSystemService(Context.VIBRATOR_SERVICE) as Vibrator)
+                    }
+                    if (vibrator.hasVibrator()) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            vibrator.vibrate(VibrationEffect.createOneShot(40, 220))
+                        } else {
+                            @Suppress("DEPRECATION")
+                            vibrator.vibrate(40)
+                        }
+                    }
+                }
+                result.success(true)
+            }
             "startScan" -> {
                 if (!requestWifiPermissionsIfNeeded()) {
                     result.error("permission", "请允许 Wi-Fi 权限后重试", null)

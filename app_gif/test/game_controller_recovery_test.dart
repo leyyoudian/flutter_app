@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:app_gif/app_language.dart';
 import 'package:app_gif/fly_bird.dart';
 import 'package:app_gif/main.dart';
 import 'package:app_gif/reference_ui.dart';
@@ -13,6 +14,62 @@ void main() {
   tearDown(
     () =>
         binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null),
+  );
+
+  testWidgets(
+    'connection and start waits show a label and three bouncing black dots',
+    (tester) async {
+      final connection = Completer<Map<String, dynamic>>();
+      final start = Completer<bool>();
+      binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+        call,
+      ) async {
+        if (call.method == 'ensureGameBluetooth') return connection.future;
+        if (call.method == 'sendGameControl') return start.future;
+        return null;
+      });
+      await tester.pumpWidget(const MaterialApp(home: FlyBirdPage()));
+      expect(find.text(tr('启动中')), findsOneWidget);
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const ValueKey('game-start')))
+            .onPressed,
+        isNull,
+      );
+      final dot = find.byKey(const ValueKey('game-starting-dot-0'));
+      final before = tester.widget<Transform>(dot).transform.storage[13];
+      for (var index = 0; index < 3; index++) {
+        final decoration =
+            tester
+                    .widget<DecoratedBox>(
+                      find.descendant(
+                        of: find.byKey(ValueKey('game-starting-dot-$index')),
+                        matching: find.byType(DecoratedBox),
+                      ),
+                    )
+                    .decoration
+                as BoxDecoration;
+        expect(decoration.color, Colors.black);
+        expect(decoration.shape, BoxShape.circle);
+      }
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(
+        tester.widget<Transform>(dot).transform.storage[13],
+        lessThan(before),
+      );
+      connection.complete({'connected': true});
+      await tester.pumpAndSettle();
+      expect(find.text(tr('开始游戏')), findsOneWidget);
+      expect(dot, findsNothing);
+      await tester.tap(find.byKey(const ValueKey('game-start')));
+      await tester.pump();
+      expect(find.text(tr('启动中')), findsOneWidget);
+      expect(dot, findsOneWidget);
+      start.complete(true);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('game-touchpad')), findsOneWidget);
+      expect(find.text(tr('启动中')), findsNothing);
+    },
   );
 
   testWidgets('game connects Bluetooth then sends real start, flap and stop', (
@@ -62,6 +119,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('game-touchpad')), findsNothing);
     expect(find.byKey(const ValueKey('game-connection-error')), findsOneWidget);
+    expect(find.text(tr('开始游戏')), findsOneWidget);
+    expect(find.text(tr('重新连接')), findsOneWidget);
+    expect(find.text(tr('启动中')), findsNothing);
   });
 
   testWidgets('rejected start stays idle and shows a useful error', (
@@ -166,6 +226,45 @@ void main() {
       );
     },
   );
+
+  for (final failedAction in ['start', 'stop']) {
+    testWidgets('lost $failedAction ACK allows reconnect and leaving game', (
+      tester,
+    ) async {
+      binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+        call,
+      ) async {
+        if (call.method == 'ensureGameBluetooth') return {'connected': true};
+        if (call.method == 'sendGameControl') {
+          if ((call.arguments as Map)['action'] == failedAction) {
+            throw PlatformException(
+              code: 'bluetooth_disconnected',
+              message: 'Device did not confirm. Reconnect.',
+            );
+          }
+          return true;
+        }
+        return null;
+      });
+      await tester.pumpWidget(const MaterialApp(home: FlyBirdPage()));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('game-start')));
+      await tester.pumpAndSettle();
+      if (failedAction == 'stop') {
+        await tester.tap(find.byKey(const ValueKey('game-stop')));
+        await tester.pumpAndSettle();
+      }
+      expect(find.byKey(const ValueKey('game-touchpad')), findsNothing);
+      expect(find.text(tr('重新连接')), findsOneWidget);
+      expect(
+        tester
+            .widget<PopScope>(find.byWidgetPredicate((w) => w is PopScope))
+            .canPop,
+        isTrue,
+      );
+      expect(tester.takeException(), isNull);
+    });
+  }
 
   testWidgets(
     'brightness, playback and alignment use the same compact back style',

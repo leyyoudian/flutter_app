@@ -121,7 +121,7 @@ void main() {
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(const BadgeApp());
       await tester.pumpAndSettle();
-      await tester.tap(find.text('我的素材'));
+      await tester.tap(find.text('我的库'));
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
         find.byKey(const ValueKey('add-material')),
@@ -158,7 +158,7 @@ void main() {
   );
 
   testWidgets(
-    'angle steps give selection feedback and save gives success feedback',
+    'angle steps give strong feedback and save gives success feedback',
     (tester) async {
       var saved = -1;
       await tester.pumpWidget(
@@ -190,7 +190,7 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey('alignment-plus-step')));
       await tester.pumpAndSettle();
-      expect(haptics, contains('HapticFeedbackType.selectionClick'));
+      expect(haptics, contains('HapticFeedbackType.heavyImpact'));
       await tester.tap(find.byKey(const ValueKey('alignment-save')));
       await tester.pumpAndSettle();
       expect(saved, 1);
@@ -210,8 +210,8 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('game-touchpad')));
     await tester.pumpAndSettle();
     expect(haptics, [
-      'HapticFeedbackType.mediumImpact',
-      'HapticFeedbackType.lightImpact',
+      'HapticFeedbackType.heavyImpact',
+      'HapticFeedbackType.heavyImpact',
     ]);
     expect(find.text('Flappy Bird'), findsOneWidget);
     expect(find.text('重新开始'), findsNothing);

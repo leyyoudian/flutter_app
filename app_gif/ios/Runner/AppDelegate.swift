@@ -13,6 +13,49 @@ import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
 
+// TCP preserves byte order, not message boundaries. The device sends one
+// response line followed by a generic status line; consume only the first.
+struct BadgeTcpLineBuffer {
+  private var bytes = Data()
+  private let maximumBytes = 256
+
+  mutating func append(_ data: Data?, isComplete: Bool) throws -> String? {
+    if let data { bytes.append(data) }
+    if let newline = bytes.firstIndex(of: 0x0a) {
+      let lineBytes = bytes[..<newline]
+      guard lineBytes.count <= maximumBytes else { throw Self.failure("设备响应过长") }
+      guard let text = String(data: Data(lineBytes), encoding: .utf8) else {
+        throw Self.failure("设备响应格式无效")
+      }
+      let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !line.isEmpty else { throw Self.failure("设备未返回响应") }
+      return line
+    }
+    guard bytes.count <= maximumBytes else { throw Self.failure("设备响应过长") }
+    if isComplete {
+      throw Self.failure(bytes.isEmpty ? "设备未返回响应" : "设备响应不完整，请重试")
+    }
+    return nil
+  }
+
+  static func uploadedAssetID(_ response: String) throws -> String? {
+    if response == "OK" { return nil } // Older firmware has no assigned ID.
+    if response.hasPrefix("OK ") {
+      let id = String(response.dropFirst(3))
+      let digits = id.utf8.dropFirst()
+      if id.utf8.count == 4 && id.utf8.first == 0x55 &&
+          digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) {
+        return id
+      }
+    }
+    throw failure(response.isEmpty ? "设备未返回响应" : response)
+  }
+
+  private static func failure(_ message: String) -> NSError {
+    NSError(domain: "DotLoopTcp", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+  }
+}
+
 @main
 @objc class AppDelegate: FlutterAppDelegate, PHPickerViewControllerDelegate {
   private var badgeChannel: FlutterMethodChannel?
@@ -24,7 +67,9 @@ import UIKit
   private var badgeHardware = "esp32p4"
   private var isUploading = false
   private var uploadBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+  private var uploadPreviousIdleTimerDisabled: Bool?
   private lazy var gameBluetooth = GameBluetoothController()
+  private let interactionFeedback = UIImpactFeedbackGenerator(style: .heavy)
 
   override func application(
     _ application: UIApplication,
@@ -47,6 +92,10 @@ import UIKit
   private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
+    case "interactionHaptic":
+      interactionFeedback.impactOccurred(intensity: 1.0)
+      interactionFeedback.prepare()
+      result(true)
     case "startScan":
       startScan()
       result(nil)
@@ -233,7 +282,7 @@ import UIKit
         return manifest.dictionary
       }
     case "downloadFirmware":
-      runFirmwareOperation(result: result) {
+      runFirmwareOperation(result: result, transfer: true) {
         let manifest = try RelayFirmwareManifest(args)
         let directory = try self.cacheDirectory("firmware")
         let target = directory.appendingPathComponent("\(manifest.sha256).bin")
@@ -250,7 +299,7 @@ import UIKit
         return ["assetPath": target.path]
       }
     case "uploadFirmware":
-      runFirmwareOperation(result: result) {
+      runFirmwareOperation(result: result, transfer: true) {
         let manifest = try RelayFirmwareManifest(args)
         guard let path = args["assetPath"] as? String,
               let deviceId = args["deviceId"] as? String,
@@ -1028,7 +1077,9 @@ import UIKit
 
   private func beginUploadBackgroundTask() {
     performOnMainSync {
-      guard uploadBackgroundTask == .invalid else { return }
+      guard uploadPreviousIdleTimerDisabled == nil else { return }
+      uploadPreviousIdleTimerDisabled = UIApplication.shared.isIdleTimerDisabled
+      UIApplication.shared.isIdleTimerDisabled = true
       uploadBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "ESP BAJI Upload") { [weak self] in
         self?.endUploadBackgroundTask()
       }
@@ -1037,6 +1088,9 @@ import UIKit
 
   private func endUploadBackgroundTask() {
     performOnMainSync {
+      guard let previousIdleTimerDisabled = uploadPreviousIdleTimerDisabled else { return }
+      uploadPreviousIdleTimerDisabled = nil
+      UIApplication.shared.isIdleTimerDisabled = previousIdleTimerDisabled
       guard uploadBackgroundTask != .invalid else { return }
       let task = uploadBackgroundTask
       uploadBackgroundTask = .invalid
@@ -1125,55 +1179,43 @@ import UIKit
   }
 
   private func sendSwitchCommand(id: String, crc32: String? = nil) throws -> String {
-    let semaphore = DispatchSemaphore(value: 0)
-    var responseData = Data()
-    var failure: Error?
-    let connection = NWConnection(
-      host: NWEndpoint.Host(activeBadgeHost),
-      port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
-      using: .tcp
-    )
-    connection.stateUpdateHandler = { state in
-      switch state {
-      case .ready:
-        let cmd = crc32.map { "SWITCH \(id) \($0)\n" } ?? "SWITCH \(id)\n"
-        connection.send(
-          content: cmd.data(using: .utf8),
-          completion: .contentProcessed { error in
-            if let error = error {
-              failure = error
-              semaphore.signal()
-              return
-            }
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, receiveError in
-              if let data = data { responseData = data }
-              if let receiveError = receiveError { failure = receiveError }
-              connection.cancel()
-              semaphore.signal()
-            }
+    let command = crc32.map { "SWITCH \(id) \($0)\n" } ?? "SWITCH \(id)\n"
+    return try sendRawTcpCommand(command)
+  }
+
+  private func receiveTcpLine(
+    connection: NWConnection,
+    completion: @escaping (Result<String, Error>) -> Void
+  ) {
+    var buffer = BadgeTcpLineBuffer()
+    func receiveNext() {
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, isComplete, error in
+        if let error { completion(.failure(error)); return }
+        do {
+          if let line = try buffer.append(data, isComplete: isComplete) {
+            completion(.success(line))
+          } else {
+            receiveNext()
           }
-        )
-      case .failed(let error), .waiting(let error):
-        failure = error
-        connection.cancel()
-        semaphore.signal()
-      case .cancelled:
-        semaphore.signal()
-      default:
-        break
+        } catch {
+          completion(.failure(error))
+        }
       }
     }
-    connection.start(queue: .global())
-    _ = semaphore.wait(timeout: .now() + .seconds(5))
-    connection.cancel()
-    if let failure = failure { throw failure }
-    return String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    receiveNext()
   }
 
   private func sendRawTcpCommand(_ command: String) throws -> String {
     let semaphore = DispatchSemaphore(value: 0)
-    var responseData = Data()
-    var failure: Error?
+    let completionLock = NSLock()
+    var response: Result<String, Error>?
+    func finish(_ value: Result<String, Error>) {
+      completionLock.lock()
+      defer { completionLock.unlock() }
+      guard response == nil else { return }
+      response = value
+      semaphore.signal()
+    }
     let connection = NWConnection(
       host: NWEndpoint.Host(activeBadgeHost),
       port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
@@ -1186,33 +1228,28 @@ import UIKit
           content: command.data(using: .utf8),
           completion: .contentProcessed { error in
             if let error = error {
-              failure = error
-              semaphore.signal()
+              finish(.failure(error))
               return
             }
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, receiveError in
-              if let data = data { responseData = data }
-              if let receiveError = receiveError { failure = receiveError }
-              connection.cancel()
-              semaphore.signal()
+            self.receiveTcpLine(connection: connection) { reply in
+              finish(reply)
             }
           }
         )
       case .failed(let error), .waiting(let error):
-        failure = error
-        connection.cancel()
-        semaphore.signal()
-      case .cancelled:
-        semaphore.signal()
+        finish(.failure(error))
       default:
         break
       }
     }
     connection.start(queue: .global())
-    _ = semaphore.wait(timeout: .now() + .seconds(5))
+    if semaphore.wait(timeout: .now() + .seconds(5)) == .timedOut {
+      finish(.failure(BadgeError.message("TCP请求超时")))
+    }
     connection.cancel()
-    if let failure = failure { throw failure }
-    return String(data: responseData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    completionLock.lock()
+    defer { completionLock.unlock() }
+    return try response!.get()
   }
 
   private func transcodeOnServer(
@@ -1288,8 +1325,19 @@ import UIKit
             "frameCount": Int(readLe16(header, 12)), "fps": Int(readLe16(header, 14))]
   }
 
-  private func runFirmwareOperation(result: @escaping FlutterResult, operation: @escaping () throws -> [String: Any]) {
+  private func runFirmwareOperation(result: @escaping FlutterResult, transfer: Bool = false,
+                                    operation: @escaping () throws -> [String: Any]) {
     DispatchQueue.global(qos: .userInitiated).async {
+      if transfer {
+        self.beginUploadBackgroundTask()
+        self.isUploading = true
+      }
+      defer {
+        if transfer {
+          self.isUploading = false
+          self.endUploadBackgroundTask()
+        }
+      }
       do {
         let value = try operation()
         DispatchQueue.main.async { result(value) }
@@ -1542,8 +1590,15 @@ import UIKit
 
   private func uploadAssetOverTcp(package: UploadPackageInfo) throws -> String? {
     let semaphore = DispatchSemaphore(value: 0)
-    var failure: Error?
-    var assignedId: String?
+    let completionLock = NSLock()
+    var response: Result<String?, Error>?
+    func finish(_ value: Result<String?, Error>) {
+      completionLock.lock()
+      defer { completionLock.unlock() }
+      guard response == nil else { return }
+      response = value
+      semaphore.signal()
+    }
     let connection = NWConnection(
       host: NWEndpoint.Host(activeBadgeHost),
       port: NWEndpoint.Port(rawValue: UInt16(BadgeConstants.badgeUploadTcpPort))!,
@@ -1559,62 +1614,53 @@ import UIKit
         appendLe32(&header, package.crc)
         connection.send(content: header, completion: .contentProcessed { error in
           if let error = error {
-            failure = error
-            semaphore.signal()
+            finish(.failure(error))
             return
           }
-          connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { readyData, _, _, readyError in
-            if let readyError {
-              failure = readyError
-              semaphore.signal()
+          self.receiveTcpLine(connection: connection) { readyReply in
+            let readyText: String
+            do {
+              readyText = try readyReply.get()
+            } catch {
+              finish(.failure(error))
               return
             }
-            let readyText = readyData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            guard readyText.hasPrefix("READY") else {
+            guard readyText == "READY" else {
               let trimmedReady = readyText.trimmingCharacters(in: .whitespacesAndNewlines)
-              failure = BadgeError.message(trimmedReady.isEmpty ? "设备未准备好上传" : trimmedReady)
-              semaphore.signal()
+              finish(.failure(BadgeError.message(trimmedReady.isEmpty ? "设备未准备好上传" : trimmedReady)))
               return
             }
             self.sendTcpFileChunks(connection: connection, package: package) { chunkError in
               if let chunkError {
-                failure = chunkError
-                semaphore.signal()
+                finish(.failure(chunkError))
                 return
               }
-              connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { data, _, _, error in
-                if let error = error {
-                  failure = error
-                } else if let data = data, let text = String(data: data, encoding: .utf8) {
-                  if text.hasPrefix("OK") {
-                    let idPart = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                      .replacingOccurrences(of: "OK", with: "")
-                      .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !idPart.isEmpty { assignedId = idPart }
-                  } else {
-                    failure = BadgeError.message(text.trimmingCharacters(in: .whitespacesAndNewlines))
-                  }
+              self.receiveTcpLine(connection: connection) { reply in
+                do {
+                  let text = try reply.get()
+                  finish(.success(try BadgeTcpLineBuffer.uploadedAssetID(text)))
+                } catch {
+                  finish(.failure(error))
                 }
-                semaphore.signal()
               }
             }
           }
         })
-      case .failed(let error):
-        failure = error
-        semaphore.signal()
+      case .failed(let error), .waiting(let error):
+        finish(.failure(error))
       default:
         break
       }
     }
     connection.start(queue: .global(qos: .userInitiated))
     if semaphore.wait(timeout: .now() + .seconds(BadgeConstants.uploadTimeoutSeconds)) == .timedOut {
-      failure = BadgeError.message("TCP上传超时")
+      finish(.failure(BadgeError.message("TCP上传超时")))
     }
     connection.cancel()
     activeUpload = nil
-    if let failure = failure { throw failure }
-    return assignedId
+    completionLock.lock()
+    defer { completionLock.unlock() }
+    return try response!.get()
   }
 
   private func uploadAssetOverHttp(package: UploadPackageInfo) throws {
@@ -2389,9 +2435,9 @@ private final class GameBluetoothController: NSObject, CBCentralManagerDelegate,
     peripheral.setNotifyValue(true, for: characteristic)
   }
   func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-    guard self.peripheral === peripheral, characteristic === control, connectResult != nil else { return }
+    guard self.peripheral === peripheral, characteristic === control else { return }
     guard error == nil && characteristic.isNotifying else { fail("无法订阅蓝牙状态"); return }
-    peripheral.readValue(for: characteristic)
+    if connectResult != nil { peripheral.readValue(for: characteristic) }
   }
   func send(action: String, result: @escaping FlutterResult) {
     guard ["start", "flap", "restart", "pause", "resume", "stop", "status"].contains(action) else {
@@ -2418,22 +2464,26 @@ private final class GameBluetoothController: NSObject, CBCentralManagerDelegate,
     sequence = sequence >= 999999 ? 1 : sequence + 1
     commandResult = result
     deviceReply = isDevice
-    let timeout = DispatchWorkItem { [weak self] in self?.commandError("设备未确认游戏指令，请重试") }
+    // A lost ACK may mean a start was accepted. Disconnect to release game
+    // ownership and let Flutter reconnect; never replay an action blindly.
+    let timeout = DispatchWorkItem { [weak self] in self?.fail("设备未确认游戏指令，请重新连接") }
     commandTimeout = timeout
     DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
     let payload = Data("GB:\(sequence):\(action)".utf8)
     guard payload.count <= device.maximumWriteValueLength(for: .withResponse) else {
-      commandError("蓝牙数据长度不足，请重新连接"); return
+      fail("蓝牙数据长度不足，请重新连接"); return
     }
     device.writeValue(payload, for: characteristic, type: .withResponse)
   }
   func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
     guard self.peripheral === peripheral, characteristic === control else { return }
-    if let error = error { commandError(error.localizedDescription) }
+    if let error = error { fail(error.localizedDescription) }
   }
   func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
     guard self.peripheral === peripheral, characteristic === control else { return }
-    guard error == nil, let data = characteristic.value, let text = String(data: data, encoding: .utf8) else { return }
+    guard error == nil, let data = characteristic.value, let text = String(data: data, encoding: .utf8) else {
+      fail("蓝牙响应读取失败，请重新连接"); return
+    }
     if text.hasPrefix("GB:\(sequence):") {
       commandTimeout?.cancel()
       let result = commandResult; commandResult = nil

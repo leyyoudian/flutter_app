@@ -149,7 +149,7 @@ class ReferenceTopNavigation extends StatelessWidget {
 
 /// The rounded card and circular display are separate clips: user photos must
 /// not fill the square corners or acquire a second black circular outline.
-/// Grids decode only the first frame, even for legacy GIF preview files.
+/// Material grids and large previews show only frame zero, including old GIFs.
 class StaticMaterialPreview extends StatefulWidget {
   const StaticMaterialPreview({super.key, required this.image});
   final ImageProvider image;
@@ -201,7 +201,7 @@ class _StaticMaterialPreviewState extends State<StaticMaterialPreview> {
         }
         // ImageStream transfers ownership of this handle to the listener.
         setState(() => _replaceFrame(frame));
-        // Stop listening after frame zero: no GIF animation in the grid.
+        // Stop listening after frame zero in grids and large previews.
         scheduleMicrotask(() {
           if (_stream == stream) _detach();
         });
@@ -259,6 +259,8 @@ class ReferenceMaterialTile extends StatelessWidget {
     child: InkWell(
       onTap: onTap,
       onLongPress: onLongPress,
+      splashFactory: NoSplash.splashFactory,
+      overlayColor: const WidgetStatePropertyAll(Colors.transparent),
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -606,7 +608,7 @@ class ReferenceBrightnessPage extends StatefulWidget {
 }
 
 class _ReferenceBrightnessPageState extends State<ReferenceBrightnessPage> {
-  late int _value = widget.initialValue;
+  late double _value = widget.initialValue.toDouble();
   @override
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.black,
@@ -632,20 +634,22 @@ class _ReferenceBrightnessPageState extends State<ReferenceBrightnessPage> {
                   ),
                   const Spacer(),
                   AppText(
-                    '$_value%',
+                    '${_value.round()}%',
                     style: const TextStyle(color: referenceMuted, fontSize: 12),
                   ),
                 ],
               ),
               Slider(
-                value: _value.toDouble(),
+                value: _value,
                 min: 0,
                 max: 100,
-                divisions: 100,
                 onChanged: widget.connected
                     ? (value) {
-                        setState(() => _value = value.round());
-                        widget.onChanged(_value);
+                        final previous = _value.round();
+                        setState(() => _value = value);
+                        if (_value.round() != previous) {
+                          widget.onChanged(_value.round());
+                        }
                       }
                     : null,
               ),
@@ -702,17 +706,6 @@ class ReferenceLoopPage extends StatelessWidget {
                     activeTrackColor: const Color(0xff32d583),
                   ),
               ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: AppText(
-              '轮换 $factoryCount 个出厂素材，保留完整的入场与退场动画。',
-              style: const TextStyle(
-                color: referenceMuted,
-                fontSize: 12,
-                height: 1.5,
-              ),
             ),
           ),
         ],

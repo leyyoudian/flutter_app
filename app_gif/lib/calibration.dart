@@ -1,9 +1,11 @@
 import 'app_language.dart';
 import 'reference_ui.dart';
+import 'interaction_feedback.dart';
 import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 
 int normalizeAngleTenths(int value) {
@@ -118,9 +120,9 @@ class _AlignmentPageState extends State<AlignmentPage> {
     final normalized = normalizeAngleTenths(value);
     if (normalized == _angleTenths) return;
     final now = DateTime.now();
-    if (now.difference(_lastHaptic).inMilliseconds >= 55) {
+    if (now.difference(_lastHaptic).inMilliseconds >= 80) {
       _lastHaptic = now;
-      unawaited(HapticFeedback.selectionClick());
+      unawaited(strongInteractionFeedback());
     }
     setState(() => _angleTenths = normalized);
     if (!_entered) return; // Offline wheel is a preview, never a device write.
@@ -211,131 +213,155 @@ class _AlignmentPageState extends State<AlignmentPage> {
         ),
         body: SafeArea(
           top: false,
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
-            children: [
-              AppText(
-                '设备',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.64),
-                  fontSize: 15,
-                ),
-              ),
-              const SizedBox(height: 12),
-              DecoratedBox(
-                decoration: BoxDecoration(
-                  color: const Color(0xff202020),
-                  borderRadius: BorderRadius.circular(24),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.06),
-                  ),
-                ),
+          child: LayoutBuilder(
+            builder: (context, constraints) => FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.topCenter,
+              child: SizedBox(
+                width: constraints.maxWidth,
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 18, 18, 20),
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
                   child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Row(
-                        children: [
-                          const AppText(
-                            '角度校正',
-                            style: TextStyle(
-                              color: Colors.white70,
-                              fontSize: 16,
-                            ),
-                          ),
-                          const Spacer(),
-                          AppText(
-                            _angleLabel,
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 16,
-                            ),
-                          ),
-                        ],
+                      AppText(
+                        '设备',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.64),
+                          fontSize: 15,
+                        ),
                       ),
-                      const SizedBox(height: 20),
-                      if (_loading)
-                        const SizedBox.square(
-                          dimension: 260,
-                          child: Center(child: CircularProgressIndicator()),
-                        )
-                      else
-                        KeyedSubtree(
-                          key: const ValueKey('alignment-dial'),
-                          child: _AlignmentDial(
-                            angleTenths: _angleTenths,
-                            enabled: _error == null && !_saving,
-                            onChanged: _setAngle,
+                      const SizedBox(height: 12),
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: const Color(0xff202020),
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.06),
                           ),
                         ),
-                      const SizedBox(height: 20),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _StepButton(
-                              key: const ValueKey('alignment-minus-step'),
-                              icon: Icons.arrow_back_rounded,
-                              label: '0.1°',
-                              onPressed: _loading || _saving
-                                  ? null
-                                  : () => _setAngle(_angleTenths - 1),
-                            ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(18, 18, 18, 20),
+                          child: Column(
+                            children: [
+                              Row(
+                                children: [
+                                  const AppText(
+                                    '角度校正',
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  AppText(
+                                    _angleLabel,
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 20),
+                              if (_loading)
+                                const SizedBox.square(
+                                  dimension: 260,
+                                  child: Center(
+                                    child: CircularProgressIndicator(),
+                                  ),
+                                )
+                              else
+                                KeyedSubtree(
+                                  key: const ValueKey('alignment-dial'),
+                                  child: _AlignmentDial(
+                                    angleTenths: _angleTenths,
+                                    enabled: _error == null && !_saving,
+                                    onChanged: _setAngle,
+                                  ),
+                                ),
+                              const SizedBox(height: 20),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: _StepButton(
+                                      key: const ValueKey(
+                                        'alignment-minus-step',
+                                      ),
+                                      icon: Icons.arrow_back_rounded,
+                                      label: '0.1°',
+                                      onPressed: _loading || _saving
+                                          ? null
+                                          : () => _setAngle(_angleTenths - 1),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: _StepButton(
+                                      key: const ValueKey('alignment-reset'),
+                                      icon: Icons.refresh_rounded,
+                                      label: '归零',
+                                      onPressed: _loading || _saving
+                                          ? null
+                                          : () => _setAngle(0),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: _StepButton(
+                                      key: const ValueKey(
+                                        'alignment-plus-step',
+                                      ),
+                                      icon: Icons.arrow_forward_rounded,
+                                      label: '0.1°',
+                                      iconAfter: true,
+                                      onPressed: _loading || _saving
+                                          ? null
+                                          : () => _setAngle(_angleTenths + 1),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              if (_error != null) ...[
+                                const SizedBox(height: 14),
+                                AppText(
+                                  _error!,
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    color: Color(0xffff6b6b),
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: _StepButton(
-                              key: const ValueKey('alignment-reset'),
-                              icon: Icons.refresh_rounded,
-                              label: '归零',
-                              onPressed: _loading || _saving
-                                  ? null
-                                  : () => _setAngle(0),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: _StepButton(
-                              key: const ValueKey('alignment-plus-step'),
-                              icon: Icons.arrow_forward_rounded,
-                              label: '0.1°',
-                              iconAfter: true,
-                              onPressed: _loading || _saving
-                                  ? null
-                                  : () => _setAngle(_angleTenths + 1),
-                            ),
-                          ),
-                        ],
-                      ),
-                      if (_error != null) ...[
-                        const SizedBox(height: 14),
-                        AppText(
-                          _error!,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(color: Color(0xffff6b6b)),
                         ),
-                      ],
+                      ),
+                      const SizedBox(height: 14),
+                      SizedBox(
+                        height: 52,
+                        child: FilledButton.icon(
+                          key: const ValueKey('alignment-save'),
+                          onPressed:
+                              _loading || _saving || _error != null || !_entered
+                              ? null
+                              : _save,
+                          icon: _saving
+                              ? const SizedBox.square(
+                                  dimension: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.check_rounded),
+                          label: AppText(_saving ? '保存中' : '保存校正'),
+                        ),
+                      ),
                     ],
                   ),
                 ),
               ),
-              const SizedBox(height: 14),
-              SizedBox(
-                height: 52,
-                child: FilledButton.icon(
-                  key: const ValueKey('alignment-save'),
-                  onPressed: _loading || _saving || _error != null || !_entered
-                      ? null
-                      : _save,
-                  icon: _saving
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.check_rounded),
-                  label: AppText(_saving ? '保存中' : '保存校正'),
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),
@@ -409,7 +435,7 @@ class _AlignmentDial extends StatelessWidget {
     if (!enabled) return;
     final center = Offset(size.width / 2, size.height / 2);
     final delta = localPosition - center;
-    if (delta.distance < 26) return;
+    if (delta.distance < 12) return;
     final radians = math.atan2(delta.dx, -delta.dy);
     onChanged(normalizeAngleTenths((radians * 1800 / math.pi).round()));
   }
@@ -422,6 +448,8 @@ class _AlignmentDial extends StatelessWidget {
         final size = Size.square(side);
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
+          onTapDown: (details) => _update(details.localPosition, size),
+          dragStartBehavior: DragStartBehavior.down,
           onPanStart: (details) => _update(details.localPosition, size),
           onPanUpdate: (details) => _update(details.localPosition, size),
           child: SizedBox.square(

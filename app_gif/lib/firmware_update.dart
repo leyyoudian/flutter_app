@@ -136,7 +136,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage> {
       firmwareIsOlder(manifest.version, widget.currentVersion)
       ? '服务器版本较旧，已禁止降级'
       : !firmwareIsOlder(widget.currentVersion, manifest.version)
-      ? '当前已是最新版本，也可重新安装以修复固件'
+      ? '已是最新版本'
       : '发现新版本 ${manifest.version}';
 
   String _error(Object error) => error is PlatformException
@@ -204,7 +204,7 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage> {
       if (mounted) {
         setState(() {
           _sent = true;
-          _message = '固件校验通过，设备正在重启。重启后重新连接即可查看实际固件版本。';
+          _message = '更新完成，请重新连接设备';
         });
       }
     } catch (error) {
@@ -240,19 +240,10 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              AppText('设备型号：${widget.hardware}'),
-              const SizedBox(height: 12),
               AppText('当前固件：${widget.currentVersion}'),
               if (manifest != null) ...[
                 const SizedBox(height: 12),
-                AppText(
-                  '服务器固件：${manifest.version} · ${(manifest.size / 1048576).toStringAsFixed(2)} MB',
-                ),
-                if (manifest.notes.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 16),
-                    child: AppText(manifest.notes),
-                  ),
+                AppText('最新固件：${manifest.version}'),
               ],
               const SizedBox(height: 24),
               if (_checking || _updating) const LinearProgressIndicator(),
@@ -274,8 +265,6 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage> {
                         : '下载并更新',
                   ),
                 ),
-              const SizedBox(height: 20),
-              const AppText('固件先下载到手机，再通过设备热点传输。更新期间请保持设备供电。'),
             ],
           ),
         ),

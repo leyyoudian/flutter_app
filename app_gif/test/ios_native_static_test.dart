@@ -290,9 +290,9 @@ void main() {
         ),
       );
       expect(tcpSource, contains('appendLe32(&header, UInt32(package.size))'));
-      expect(tcpSource, contains('readyText.hasPrefix("READY")'));
+      expect(tcpSource, contains('readyText == "READY"'));
       expect(
-        tcpSource.indexOf('readyText.hasPrefix("READY")'),
+        tcpSource.indexOf('readyText == "READY"'),
         lessThan(
           tcpSource.indexOf(
             'self.sendTcpFileChunks(connection: connection, package: package)',

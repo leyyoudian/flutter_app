@@ -15,7 +15,7 @@ void main() {
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(const BadgeApp());
       await tester.pumpAndSettle();
-      expect(find.text('首页'), findsOneWidget);
+      expect(find.text('首页'), findsWidgets);
       expect(find.byTooltip('设置'), findsOneWidget);
       expect(find.text('DotLoop'), findsNothing);
       expect(
@@ -58,6 +58,7 @@ void main() {
       ),
     );
     expect(find.byType(Switch), findsNothing);
+    expect(find.textContaining('保留完整的入场与退场动画'), findsNothing);
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
     expect(commands, 0);
   });
@@ -80,7 +81,7 @@ void main() {
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(const BadgeApp());
       await tester.pumpAndSettle();
-      await tester.tap(find.text('我的素材'));
+      await tester.tap(find.text('我的库'));
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
         find.byKey(const ValueKey('add-material')),
@@ -243,7 +244,7 @@ void main() {
     expect(source, contains(r"key: ValueKey('maker-video-${selected.uri}')"));
     expect(
       source,
-      contains(r"key: ValueKey('dial-asset-video-${asset!.sourceUri}')"),
+      isNot(contains(r"key: ValueKey('dial-asset-video-${asset!.sourceUri}')")),
     );
     expect(
       source,
@@ -279,12 +280,6 @@ void main() {
       source,
       contains('if (active && _hasPreviewPath(selected?.animatedPreviewPath))'),
     );
-    expect(
-      source,
-      contains(
-        'else if (active && _hasPreviewPath(asset?.animatedPreviewPath))',
-      ),
-    );
   });
 
   test('history previews hide missing files instead of showing error icons', () {
@@ -316,13 +311,15 @@ void main() {
     expect(source, contains('privacy-policy-link'));
     expect(privacy, contains('ESP Baji Privacy Policy'));
     expect(privacy, contains('本应用不会收集、出售或分享个人信息'));
+    expect(privacy, contains('href="mailto:3280035093@qq.com">3280035093@qq.com</a>'));
+    expect(source, contains("static const _contactEmail = '3280035093@qq.com'"));
   });
 
   test('support page is public for App Store Connect metadata', () {
     final support = File('../docs/support.html').readAsStringSync();
 
     expect(support, contains('ESP Baji Support'));
-    expect(support, contains('ley98752_ley@163.com'));
+    expect(support, contains('href="mailto:3280035093@qq.com">3280035093@qq.com</a>'));
     expect(support, contains('隐私政策'));
   });
 }

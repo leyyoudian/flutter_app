@@ -141,7 +141,7 @@ void main() {
         'leaveDeviceAccessPoint',
         'busy:false',
       ]);
-      expect(find.textContaining('设备正在重启'), findsOneWidget);
+      expect(find.text('更新完成，请重新连接设备'), findsOneWidget);
     },
   );
 

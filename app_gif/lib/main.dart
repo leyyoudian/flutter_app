@@ -11,7 +11,7 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
 import 'factory_catalog_sync.dart';
-import 'preview_player.dart';
+import 'factory_packs.dart';
 import 'device_asset_delete.dart';
 import 'device_control.dart';
 import 'transcode_policy.dart';
@@ -102,11 +102,12 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   static const _channel = MethodChannel('esp_baji/native');
   static const _privacyPolicyUrl =
       'https://leyyoudian.github.io/flutter_app/privacy.html';
+  static const _contactEmail = '3280035093@qq.com';
   static const _backendBaseOverride = String.fromEnvironment(
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.32';
+  static const _appVersion = '1.0.40';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -194,7 +195,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     unawaited(_loadHistory());
     _pendingDeviceDeletesLoad = _loadPendingDeviceDeletes();
     unawaited(_refreshConnectionState());
-    unawaited(_loadFactoryAnimations());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_loadFactoryAnimations());
+    });
     unawaited(_checkRemoteVersion());
     _restartConnectionTimer();
   }
@@ -2155,6 +2158,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
             '导入的图片、GIF 和视频会提交到 ESP Baji 服务器处理；服务器无法连接时可在本机处理。'
             '处理完成后，应用仅在用户操作时通过本地 Wi-Fi 发送到已连接的 ESP 设备。'
             '应用不会上传素材到第三方服务器，也不使用广告或分析 SDK。\n\n'
+            '联系邮箱：$_contactEmail\n\n'
             '公开隐私政策链接：\n$_privacyPolicyUrl',
             style: const TextStyle(height: 1.45),
           ),
@@ -2967,7 +2971,10 @@ class _DisplayLibraryPage extends StatelessWidget {
                   fit: StackFit.expand,
                   children: [
                     Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 26,
+                        vertical: 10,
+                      ),
                       child: GestureDetector(
                         key: const ValueKey('home-circle-preview'),
                         onTap: uploading
@@ -3052,7 +3059,7 @@ class _DisplayLibraryPage extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
                 child: ReferenceSegmentedBar(
-                  labels: [tr('我的素材'), tr('出厂素材'), tr('全部素材')],
+                  labels: [tr('我的库'), tr('首页'), tr('背包')],
                   selectedIndex: tabIndex,
                   onSelected: (index) => onFilter([1, 2, 0][index]),
                 ),
@@ -3060,106 +3067,126 @@ class _DisplayLibraryPage extends StatelessWidget {
               Expanded(
                 child: Stack(
                   children: [
-                    CustomScrollView(
-                      key: const ValueKey('home-material-grid'),
-                      slivers: [
-                        if (userItems.isEmpty &&
-                            factoryItems.isEmpty &&
-                            !addTile)
-                          const SliverToBoxAdapter(
-                            child: Padding(
-                              padding: EdgeInsets.all(24),
-                              child: AppText(
-                                '还没有素材，添加图片或视频开始制作',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: referenceMuted,
-                                  fontSize: 13,
+                    if (filter == 0)
+                      FactoryPackBrowser(
+                        key: const ValueKey('home-pack-browser'),
+                        availableIds: factoryAnims
+                            .map((item) => item.id)
+                            .toSet(),
+                        enabled: !uploading,
+                        materialBuilder: (context, id) {
+                          final anim = factoryAnims.firstWhere(
+                            (item) => item.id == id,
+                          );
+                          return _FactoryGridTile(
+                            key: ValueKey('fac_${anim.id}'),
+                            anim: anim,
+                            selected: selectedFactoryId == anim.id,
+                            onTap: uploading ? null : () => onFactoryTap(anim),
+                          );
+                        },
+                      )
+                    else
+                      CustomScrollView(
+                        key: const ValueKey('home-material-grid'),
+                        slivers: [
+                          if (userItems.isEmpty &&
+                              factoryItems.isEmpty &&
+                              !addTile)
+                            const SliverToBoxAdapter(
+                              child: Padding(
+                                padding: EdgeInsets.all(24),
+                                child: AppText(
+                                  '还没有素材，添加图片或视频开始制作',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: referenceMuted,
+                                    fontSize: 13,
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
-                        SliverPadding(
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 88),
-                          sliver: SliverGrid(
-                            gridDelegate:
-                                const SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: 3,
-                                  mainAxisSpacing: 10,
-                                  crossAxisSpacing: 10,
-                                ),
-                            delegate: SliverChildBuilderDelegate(
-                              (context, gridIndex) {
-                                if (addTile && gridIndex == 0) {
-                                  return Material(
-                                    color: Colors.black,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(14),
-                                      side: const BorderSide(
-                                        color: Color(0xff252525),
-                                      ),
-                                    ),
-                                    child: InkWell(
-                                      key: const ValueKey('add-material'),
-                                      onTap: uploading ? null : onImport,
-                                      borderRadius: BorderRadius.circular(14),
-                                      child: const Center(
-                                        child: Icon(
-                                          Icons.add_circle_outline_rounded,
-                                          color: referenceMuted,
-                                          size: 44,
+                          SliverPadding(
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 88),
+                            sliver: SliverGrid(
+                              gridDelegate:
+                                  const SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 3,
+                                    mainAxisSpacing: 10,
+                                    crossAxisSpacing: 10,
+                                  ),
+                              delegate: SliverChildBuilderDelegate(
+                                (context, gridIndex) {
+                                  if (addTile && gridIndex == 0) {
+                                    return Material(
+                                      color: Colors.black,
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                        side: const BorderSide(
+                                          color: Color(0xff252525),
                                         ),
                                       ),
-                                    ),
-                                  );
-                                }
-                                final index = gridIndex - (addTile ? 1 : 0);
-                                if (index < userItems.length) {
-                                  final entry = userItems[index];
-                                  return _HistoryGridTile(
-                                    key: ValueKey(
-                                      historyEntryIdentity(
-                                        assetPath: entry.assetPath,
-                                        reviewId: entry.reviewId,
-                                        createdAt: entry.createdAt,
-                                      ),
-                                    ),
-                                    active: active,
-                                    entry: entry,
-                                    selected:
-                                        asset != null &&
-                                        uploadMatchesHistory(
-                                          historyAssetPath: entry.assetPath,
-                                          historyReviewId: entry.reviewId,
-                                          uploadedAssetPath: asset!.assetPath,
-                                          uploadedReviewId: asset!.reviewId,
+                                      child: InkWell(
+                                        key: const ValueKey('add-material'),
+                                        onTap: uploading ? null : onImport,
+                                        borderRadius: BorderRadius.circular(14),
+                                        child: const Center(
+                                          child: Icon(
+                                            Icons.add_circle_outline_rounded,
+                                            color: referenceMuted,
+                                            size: 44,
+                                          ),
                                         ),
+                                      ),
+                                    );
+                                  }
+                                  final index = gridIndex - (addTile ? 1 : 0);
+                                  if (index < userItems.length) {
+                                    final entry = userItems[index];
+                                    return _HistoryGridTile(
+                                      key: ValueKey(
+                                        historyEntryIdentity(
+                                          assetPath: entry.assetPath,
+                                          reviewId: entry.reviewId,
+                                          createdAt: entry.createdAt,
+                                        ),
+                                      ),
+                                      active: active,
+                                      entry: entry,
+                                      selected:
+                                          asset != null &&
+                                          uploadMatchesHistory(
+                                            historyAssetPath: entry.assetPath,
+                                            historyReviewId: entry.reviewId,
+                                            uploadedAssetPath: asset!.assetPath,
+                                            uploadedReviewId: asset!.reviewId,
+                                          ),
+                                      onTap: uploading
+                                          ? null
+                                          : () => onHistoryTap(entry),
+                                      onLongPress: () => onHistoryDelete(entry),
+                                    );
+                                  }
+                                  final anim =
+                                      factoryItems[index - userItems.length];
+                                  return _FactoryGridTile(
+                                    key: ValueKey('fac_${anim.id}'),
+                                    anim: anim,
+                                    selected: selectedFactoryId == anim.id,
                                     onTap: uploading
                                         ? null
-                                        : () => onHistoryTap(entry),
-                                    onLongPress: () => onHistoryDelete(entry),
+                                        : () => onFactoryTap(anim),
                                   );
-                                }
-                                final anim =
-                                    factoryItems[index - userItems.length];
-                                return _FactoryGridTile(
-                                  key: ValueKey('fac_${anim.id}'),
-                                  anim: anim,
-                                  selected: selectedFactoryId == anim.id,
-                                  onTap: uploading
-                                      ? null
-                                      : () => onFactoryTap(anim),
-                                );
-                              },
-                              childCount:
-                                  userItems.length +
-                                  factoryItems.length +
-                                  (addTile ? 1 : 0),
+                                },
+                                childCount:
+                                    userItems.length +
+                                    factoryItems.length +
+                                    (addTile ? 1 : 0),
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
                     Positioned(
                       left: 32,
                       right: 32,
@@ -3167,11 +3194,11 @@ class _DisplayLibraryPage extends StatelessWidget {
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(24),
                         child: BackdropFilter(
-                          filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                          filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
                           child: Material(
                             color: const Color(
                               0xff202020,
-                            ).withValues(alpha: .88),
+                            ).withValues(alpha: .45),
                             child: InkWell(
                               key: const ValueKey('find-animation'),
                               onTap: () => _openSearch(context),
@@ -4194,84 +4221,29 @@ class _PreviewDial extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             DecoratedBox(decoration: const BoxDecoration(color: Colors.black)),
-            if (asset == null && media == null && factoryPreview != null)
+            if (media?.previewBytes != null)
+              StaticMaterialPreview(image: MemoryImage(media!.previewBytes!))
+            else if (_hasPreviewPath(asset?.previewPath))
+              StaticMaterialPreview(image: FileImage(File(asset!.previewPath!)))
+            else if (_hasPreviewPath(media?.animatedPreviewPath))
+              StaticMaterialPreview(
+                image: FileImage(File(media!.animatedPreviewPath!)),
+              )
+            else if (_hasPreviewPath(asset?.animatedPreviewPath))
+              _CropTransformView(
+                transform: transform,
+                child: StaticMaterialPreview(
+                  image: FileImage(File(asset!.animatedPreviewPath!)),
+                ),
+              )
+            else if (asset == null && media == null && factoryPreview != null)
               StaticMaterialPreview(
                 key: const ValueKey('factory-preview-fallback'),
                 image: _isLocalFilePath(factoryPreview!)
                     ? FileImage(_fileFromPath(factoryPreview!))
                     : AssetImage(factoryPreview!),
-              ),
-            if (media != null &&
-                _isVideoMime(media!.mime) &&
-                media!.previewBytes != null)
-              Image.memory(
-                media!.previewBytes!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
               )
-            else if (asset != null &&
-                _isVideoMime(asset!.mime) &&
-                _hasPreviewPath(asset!.previewPath))
-              StaticMaterialPreview(
-                image: FileImage(File(asset!.previewPath!)),
-              ),
-            if (active && media != null && _isVideoMime(media!.mime))
-              _VideoPreview(
-                key: ValueKey('dial-media-video-${media!.uri}'),
-                uri: media!.uri,
-                active: active,
-              )
-            else if (active &&
-                asset != null &&
-                _isVideoMime(asset!.mime) &&
-                asset!.sourceUri != null)
-              _CropTransformView(
-                transform: transform,
-                child: _VideoPreview(
-                  key: ValueKey('dial-asset-video-${asset!.sourceUri}'),
-                  uri: asset!.sourceUri!,
-                  active: active,
-                ),
-              )
-            else if (media?.previewBytes != null)
-              Image.memory(
-                media!.previewBytes!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-              )
-            else if (active && _hasPreviewPath(media?.animatedPreviewPath))
-              Image.file(
-                File(media!.animatedPreviewPath!),
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                errorBuilder: _blackPreviewFallback,
-              )
-            else if (active && _hasPreviewPath(asset?.animatedPreviewPath))
-              _CropTransformView(
-                transform: transform,
-                child: Image.file(
-                  File(asset!.animatedPreviewPath!),
-                  fit: BoxFit.cover,
-                  gaplessPlayback: true,
-                  errorBuilder: _blackPreviewFallback,
-                ),
-              )
-            else if (_hasPreviewPath(asset?.previewPath))
-              Image.file(
-                File(asset!.previewPath!),
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                errorBuilder: _blackPreviewFallback,
-              )
-            else if (active && factoryVideo != null)
-              FactoryVideoPreview(
-                currentVideo: factoryVideo!,
-                nextVideo: nextVideo,
-                active: active,
-                looping: looping,
-                onDone: onFactoryVideoDone,
-              )
-            else if (factoryPreview == null)
+            else
               const Center(
                 child: Icon(
                   Icons.perm_media_outlined,
