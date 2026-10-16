@@ -106,7 +106,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.31';
+  static const _appVersion = '1.0.32';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -122,6 +122,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   bool _connected = false;
   bool _bluetoothControl = false;
   String? _deviceFirmwareVersion;
+  String? _deviceFirmwareHardware;
+  FirmwareManifest? _firmwareManifest;
+  Future<FirmwareManifest>? _firmwareCheck;
+  DateTime? _firmwareCheckedAt;
+  int _firmwareSession = 0;
   late final _deviceControl = DeviceControl((command) async {
     final reply = await _channel.invokeMethod<String>(
       'deviceBluetoothCommand',
@@ -167,6 +172,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   int _switchGeneration = 0;
 
   bool get _previewActive => _appActive && !_preparing;
+  bool get _firmwareUpdateAvailable =>
+      _connected &&
+      _bluetoothControl &&
+      !_demoMode &&
+      _deviceFirmwareVersion != null &&
+      _firmwareManifest != null &&
+      firmwareIsOlder(_deviceFirmwareVersion!, _firmwareManifest!.version);
   bool get _hasPendingReviewStatuses => _history.any(
     (entry) =>
         entry.reviewId != null &&
@@ -212,6 +224,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     if (appActive) {
       unawaited(_refreshConnectionState());
       unawaited(_refreshHistoryReviewStatuses());
+      unawaited(_refreshFirmwareAvailability(force: true));
     }
   }
 
@@ -746,6 +759,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   void _enterDemoMode() {
+    _resetFirmwareAvailability();
     setState(() {
       _demoMode = true;
       _devices
@@ -826,8 +840,20 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (info?['connected'] != true) {
         setState(() {
           _connected = false;
+          _deviceFirmwareVersion = null;
+          _resetFirmwareAvailability();
           _status = '蓝牙已断开，请重新连接';
         });
+      } else if (_connected) {
+        final status = info?['status']?.toString() ?? '';
+        final version = RegExp(r'version=([^ ]+)').firstMatch(status)?.group(1);
+        if (version != null && version != _deviceFirmwareVersion) {
+          setState(() {
+            _readDeviceFirmwareStatus(status);
+            _resetFirmwareAvailability();
+          });
+        }
+        unawaited(_refreshFirmwareAvailability());
       }
       return;
     }
@@ -877,6 +903,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       return;
     }
     setState(() {
+      _resetFirmwareAvailability();
+      _deviceFirmwareVersion = null;
       _connectedDeviceKey = null;
       _devices.clear();
       _scanning = true;
@@ -905,9 +933,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         _connectedHardware = 'esp32p4';
         _sdAvailable = status.contains('sd=1');
         _connectedAddress = info?['address']?.toString();
-        _deviceFirmwareVersion = RegExp(
-          r'version=([^ ]+)',
-        ).firstMatch(status)?.group(1);
+        _readDeviceFirmwareStatus(status);
         _status = '蓝牙已连接';
       });
       unawaited(_refreshAlignmentAngle());
@@ -915,6 +941,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       unawaited(_reconcilePendingDeviceDeletes());
       unawaited(_loadFactoryAnimations());
       unawaited(_refreshBrightness());
+      unawaited(_refreshFirmwareAvailability());
     } on PlatformException catch (error) {
       _showSnack(error.message ?? error.code);
       setState(() => _scanning = false);
@@ -922,6 +949,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _connect(BadgeDevice device) async {
+    _resetFirmwareAvailability();
+    _deviceFirmwareVersion = null;
     _connectedDeviceKey = null;
     _bluetoothControl = false; // Explicit S3/legacy Wi-Fi entry.
     if (_demoMode) {
@@ -947,6 +976,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _disconnect() async {
+    setState(() {
+      _resetFirmwareAvailability();
+      _deviceFirmwareVersion = null;
+    });
     _connectedDeviceKey = null;
     if (_demoMode) {
       setState(() {
@@ -1493,7 +1526,68 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   List<Uri> get _backendBases =>
       backendBaseCandidates(overrideBase: _backendBaseOverride);
 
-  void _openSettings() => setState(() => _pageIndex = 4);
+  void _openSettings() {
+    setState(() => _pageIndex = 4);
+    unawaited(_refreshFirmwareAvailability());
+  }
+
+  void _readDeviceFirmwareStatus(String status) {
+    _deviceFirmwareVersion = RegExp(
+      r'version=(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?: |$)',
+    ).firstMatch(status)?.group(1);
+    final hardware = RegExp(r'hardware=([^ ]+)').firstMatch(status)?.group(1);
+    // Existing P4 control firmware reports its chip name for the 2.8-inch board.
+    _deviceFirmwareHardware = switch (hardware) {
+      'esp32p4' || 'esp32p4-2.8' => 'esp32p4-2.8',
+      'esp32p4-2.5' => 'esp32p4-2.5',
+      _ => null,
+    };
+  }
+
+  void _resetFirmwareAvailability() {
+    ++_firmwareSession;
+    _firmwareManifest = null;
+    _firmwareCheck = null;
+    _firmwareCheckedAt = null;
+  }
+
+  Future<void> _refreshFirmwareAvailability({bool force = false}) async {
+    if (!_connected ||
+        !_bluetoothControl ||
+        _demoMode ||
+        !_appActive ||
+        _uploading ||
+        _preparing ||
+        _deviceFirmwareVersion == null ||
+        _deviceFirmwareHardware == null ||
+        _firmwareCheck != null) {
+      return;
+    }
+    final now = DateTime.now();
+    final checkedAt = _firmwareCheckedAt;
+    final interval = _firmwareManifest == null
+        ? const Duration(seconds: 30)
+        : const Duration(minutes: 5);
+    if (!force && checkedAt != null && now.difference(checkedAt) < interval) {
+      return;
+    }
+    final session = _firmwareSession;
+    _firmwareCheckedAt = now;
+    final request = checkFirmwareManifest(
+      hardware: _deviceFirmwareHardware!,
+      backendBases: _backendBases,
+    );
+    _firmwareCheck = request;
+    try {
+      final manifest = await request;
+      if (!mounted || session != _firmwareSession) return;
+      setState(() => _firmwareManifest = manifest);
+    } catch (_) {
+      // Background checks stay quiet; the update page exposes errors and retry.
+    } finally {
+      if (session == _firmwareSession) _firmwareCheck = null;
+    }
+  }
 
   void _openBrightness() {
     Navigator.of(context).push(
@@ -1541,12 +1635,15 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xff202020),
-        title: const AppText('版本'),
+        title: const AppText('设备版本'),
         content: AppText(
-          'DotLoop $_appVersion\n设备：$_connectedHardware\n固件：${_deviceFirmwareVersion ?? (_connected ? '读取中' : '未连接')}\n${_bluetoothControl ? '控制：蓝牙 · 文件：Wi-Fi 热点' : '控制：Wi-Fi'}\n连接 P4 设备后，可先将固件下载到手机，再通过设备热点更新。',
+          'DotLoop $_appVersion\n设备：$_connectedHardware\n固件：${_deviceFirmwareVersion ?? (_connected ? '读取中' : '未连接')}${_firmwareUpdateAvailable ? '\n发现新版本 ${_firmwareManifest!.version}' : ''}',
         ),
         actions: [
-          if (_connected && _bluetoothControl && !_demoMode)
+          if (_connected &&
+              _bluetoothControl &&
+              !_demoMode &&
+              _deviceFirmwareHardware != null)
             TextButton(
               onPressed: _uploading || _preparing
                   ? null
@@ -1554,7 +1651,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
                       Navigator.pop(context);
                       _openFirmwareUpdate();
                     },
-              child: const AppText('检查固件更新'),
+              child: AppText(_firmwareUpdateAvailable ? '查看固件更新' : '检查固件更新'),
             ),
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -1572,13 +1669,28 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   );
 
   void _openFirmwareUpdate() {
-    if (!_connected || !_bluetoothControl || _uploading || _preparing) return;
+    if (!_connected ||
+        !_bluetoothControl ||
+        _uploading ||
+        _preparing ||
+        _deviceFirmwareHardware == null) {
+      return;
+    }
+    final session = _firmwareSession;
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => FirmwareUpdatePage(
-          hardware: 'esp32p4-2.8',
+          hardware: _deviceFirmwareHardware!,
           currentVersion: _deviceFirmwareVersion ?? '0.0.0',
           backendBases: _backendBases,
+          initialManifest: _firmwareManifest,
+          onManifest: (manifest) {
+            if (!mounted || session != _firmwareSession) return;
+            setState(() {
+              _firmwareManifest = manifest;
+              _firmwareCheckedAt = DateTime.now();
+            });
+          },
           prepareTransfer: () async {
             await _channel.invokeMethod<void>('gameCommand', {
               'action': 'stop',
@@ -2568,6 +2680,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onSupport: _openSupport,
         onVersion: _openVersionInfo,
         version: _appVersion,
+        firmwareUpdateAvailable: _firmwareUpdateAvailable,
         demoMode: _demoMode,
         onDemo: () => _demoMode ? _exitDemoMode() : _enterDemoMode(),
         onLanguage: _openLanguage,

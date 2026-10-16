@@ -63,6 +63,27 @@ bool firmwareIsOlder(String latest, String current) {
   return false;
 }
 
+Future<FirmwareManifest> checkFirmwareManifest({
+  required String hardware,
+  required List<Uri> backendBases,
+  MethodChannel channel = const MethodChannel('esp_baji/native'),
+}) async {
+  return withBackendFailover<FirmwareManifest>(
+    backendBases,
+    (base) async {
+      final map = await channel.invokeMapMethod<dynamic, dynamic>(
+        'checkFirmwareUpdate',
+        {'hardware': hardware, 'backendBase': base.toString()},
+      );
+      if (map == null) throw const FormatException('服务器没有返回固件清单');
+      return FirmwareManifest.fromMap(map, hardware);
+    },
+    shouldRetry: (error) =>
+        isRetryableBackendError(error) ||
+        error is PlatformException && error.code == 'firmware_unavailable',
+  );
+}
+
 class FirmwareUpdatePage extends StatefulWidget {
   const FirmwareUpdatePage({
     super.key,
@@ -72,6 +93,8 @@ class FirmwareUpdatePage extends StatefulWidget {
     required this.prepareTransfer,
     required this.setBusy,
     required this.deviceIdentity,
+    this.initialManifest,
+    this.onManifest,
     this.channel = const MethodChannel('esp_baji/native'),
   });
 
@@ -82,6 +105,8 @@ class FirmwareUpdatePage extends StatefulWidget {
   final void Function(bool) setBusy;
   final Future<String?> Function() deviceIdentity;
   final MethodChannel channel;
+  final FirmwareManifest? initialManifest;
+  final ValueChanged<FirmwareManifest>? onManifest;
 
   @override
   State<FirmwareUpdatePage> createState() => _FirmwareUpdatePageState();
@@ -97,8 +122,22 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage> {
   @override
   void initState() {
     super.initState();
-    unawaited(_check());
+    final initial = widget.initialManifest;
+    if (initial != null && initial.hardware == widget.hardware) {
+      _manifest = initial;
+      _checking = false;
+      _message = _versionMessage(initial);
+    } else {
+      unawaited(_check());
+    }
   }
+
+  String _versionMessage(FirmwareManifest manifest) =>
+      firmwareIsOlder(manifest.version, widget.currentVersion)
+      ? '服务器版本较旧，已禁止降级'
+      : !firmwareIsOlder(widget.currentVersion, manifest.version)
+      ? '当前已是最新版本，也可重新安装以修复固件'
+      : '发现新版本 ${manifest.version}';
 
   String _error(Object error) => error is PlatformException
       ? error.message ?? error.code
@@ -110,27 +149,17 @@ class _FirmwareUpdatePageState extends State<FirmwareUpdatePage> {
       _message = '正在检查固件版本…';
     });
     try {
-      final map = await withBackendFailover<Map<dynamic, dynamic>?>(
-        widget.backendBases,
-        (base) => widget.channel.invokeMethod<Map<dynamic, dynamic>>(
-          'checkFirmwareUpdate',
-          {'hardware': widget.hardware, 'backendBase': base.toString()},
-        ),
-        shouldRetry: (error) =>
-            isRetryableBackendError(error) ||
-            error is PlatformException && error.code == 'firmware_unavailable',
+      final manifest = await checkFirmwareManifest(
+        hardware: widget.hardware,
+        backendBases: widget.backendBases,
+        channel: widget.channel,
       );
-      if (map == null) throw const FormatException('服务器没有返回固件清单');
-      final manifest = FirmwareManifest.fromMap(map, widget.hardware);
       if (!mounted) return;
       setState(() {
         _manifest = manifest;
-        _message = firmwareIsOlder(manifest.version, widget.currentVersion)
-            ? '服务器版本较旧，已禁止降级'
-            : manifest.version == widget.currentVersion
-            ? '当前已是最新版本，也可重新安装以修复固件'
-            : '发现新版本 ${manifest.version}';
+        _message = _versionMessage(manifest);
       });
+      widget.onManifest?.call(manifest);
     } catch (error) {
       if (mounted) setState(() => _message = _error(error));
     } finally {

@@ -452,12 +452,14 @@ class ReferenceSettingsPage extends StatelessWidget {
     required this.onLanguage,
     required this.onGame,
     required this.onDeviceStatus,
+    this.firmwareUpdateAvailable = false,
   });
   final VoidCallback onAlignment, onBrightness, onMode, onDevice, onLibrary;
   final VoidCallback onPrivacy, onSupport, onVersion, onDemo;
   final VoidCallback onLanguage, onGame, onDeviceStatus;
   final String version;
   final bool demoMode;
+  final bool firmwareUpdateAvailable;
   @override
   Widget build(BuildContext context) => ListView(
     padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
@@ -475,7 +477,12 @@ class ReferenceSettingsPage extends StatelessWidget {
         _row('播放模式', onMode),
       ]),
       _group('设备', [
-        _row('版本', onVersion),
+        _row(
+          '设备版本',
+          onVersion,
+          key: const ValueKey('settings-device-version'),
+          updateAvailable: firmwareUpdateAvailable,
+        ),
         _row(
           '设备状态',
           onDeviceStatus,
@@ -542,7 +549,12 @@ class ReferenceSettingsPage extends StatelessWidget {
       ],
     ),
   );
-  Widget _row(String title, VoidCallback action, {Key? key}) => InkWell(
+  Widget _row(
+    String title,
+    VoidCallback action, {
+    Key? key,
+    bool updateAvailable = false,
+  }) => InkWell(
     key: key,
     onTap: action,
     child: SizedBox(
@@ -550,12 +562,28 @@ class ReferenceSettingsPage extends StatelessWidget {
       width: double.infinity,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 22),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: AppText(
-            title,
-            style: const TextStyle(fontSize: 14, color: Color(0xffcccccc)),
-          ),
+        child: Row(
+          children: [
+            AppText(
+              title,
+              style: const TextStyle(fontSize: 14, color: Color(0xffcccccc)),
+            ),
+            if (updateAvailable) ...[
+              const SizedBox(width: 8),
+              Semantics(
+                label: tr('有新固件'),
+                child: Container(
+                  key: const ValueKey('settings-firmware-update-dot'),
+                  width: 8,
+                  height: 8,
+                  decoration: const BoxDecoration(
+                    color: Color(0xffff453a),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+            ],
+          ],
         ),
       ),
     ),

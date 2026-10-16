@@ -1,6 +1,19 @@
 // English, Traditional Chinese, Japanese, Russian.
 const appTranslations = <String, List<String>>{
   "设置": ["Settings", "設定", "設定", "Настройки"],
+  "设备版本": ["Device version", "裝置版本", "デバイスのバージョン", "Версия устройства"],
+  "有新固件": [
+    "Firmware update available",
+    "有新韌體",
+    "ファームウェアの更新があります",
+    "Доступно обновление прошивки",
+  ],
+  "查看固件更新": [
+    "View firmware update",
+    "查看韌體更新",
+    "ファームウェアの更新を表示",
+    "Посмотреть обновление прошивки",
+  ],
   "视频帧读取失败": [
     "Could not read video frame",
     "影片影格讀取失敗",
