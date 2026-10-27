@@ -11,6 +11,8 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
 import 'factory_catalog_sync.dart';
+import 'factory_device_install.dart';
+import 'factory_device_preload.dart';
 import 'factory_packs.dart';
 import 'device_asset_delete.dart';
 import 'device_control.dart';
@@ -20,8 +22,11 @@ import 'calibration.dart';
 import 'reference_ui.dart';
 import 'app_language.dart';
 import 'fly_bird.dart';
+import 'remote_games.dart';
 import 'firmware_update.dart';
 import 'p4_asset_target.dart';
+import 'preview_player.dart';
+import 'startup_logo_splash.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -84,7 +89,7 @@ class BadgeApp extends StatelessWidget {
             overlayColor: Colors.white.withValues(alpha: 0.12),
           ),
         ),
-        home: const BadgeHomePage(),
+        home: const StartupLogoSplash(child: BadgeHomePage()),
       ),
     );
   }
@@ -107,15 +112,28 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.40';
+  static const _appVersion = '1.0.50';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
+  double _makerCoverFrame = 0;
+  Uint8List? _makerCoverFramePreview;
+  Timer? _makerCoverFrameTimer;
+  int _makerCoverFrameRequest = 0;
+  int _makerSelectionRevision = 0;
   Timer? _brightnessTimer;
   Timer? _connectionTimer;
+  Timer? _autoConnectCooldown;
+  bool _autoConnectSuppressed = false;
+  bool _autoConnectAttempted = false;
+  bool _connectionRefreshInFlight = false;
+  FactoryDevicePreload? _factoryPreload;
+  bool _factoryCatalogSyncing = false;
+  DateTime? _factoryCatalogRefreshedAt;
   final Map<String, Completer<String?>> _assetPreviewWaiters = {};
   int _pageIndex = 1;
-  int _libraryFilter = 0;
+  // Open on 首页.  The segmented bar maps 2 to 首页; 0 is the backpack.
+  int _libraryFilter = 2;
   int _alignmentAngleTenths = 0;
   int _brightness = 70;
   bool _scanning = false;
@@ -194,7 +212,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     _channel.setMethodCallHandler(_handleNativeCall);
     unawaited(_loadHistory());
     _pendingDeviceDeletesLoad = _loadPendingDeviceDeletes();
-    unawaited(_refreshConnectionState());
+    unawaited(_refreshAndAutoConnect());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(_loadFactoryAnimations());
     });
@@ -207,6 +225,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     WidgetsBinding.instance.removeObserver(this);
     _brightnessTimer?.cancel();
     _connectionTimer?.cancel();
+    _makerCoverFrameTimer?.cancel();
+    _autoConnectCooldown?.cancel();
+    unawaited(_factoryPreload?.pause() ?? Future<void>.value());
     for (final waiter in _assetPreviewWaiters.values) {
       if (!waiter.isCompleted) {
         waiter.complete(null);
@@ -223,9 +244,16 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       return;
     }
     setState(() => _appActive = appActive);
+    if (!appActive) {
+      ++_switchGeneration;
+      _autoConnectCooldown?.cancel();
+      _autoConnectCooldown = null;
+    }
     _restartConnectionTimer();
     if (appActive) {
-      unawaited(_refreshConnectionState());
+      _refreshFactoryCatalogIfDue();
+      _resumeFactoryPreload();
+      unawaited(_refreshAndAutoConnect());
       unawaited(_refreshHistoryReviewStatuses());
       unawaited(_refreshFirmwareAvailability(force: true));
     }
@@ -241,13 +269,41 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (!_appActive || _preparing || _uploading) {
         return;
       }
+      _refreshFactoryCatalogIfDue();
+      _resumeFactoryPreload();
       if (_hasPendingReviewStatuses) {
         unawaited(_refreshHistoryReviewStatuses());
       }
-      if (_connected || _connecting) {
-        unawaited(_refreshConnectionState());
-      }
+      unawaited(_refreshAndAutoConnect());
     });
+  }
+
+  Future<void> _refreshAndAutoConnect() async {
+    if (_connectionRefreshInFlight || !mounted || !_appActive) return;
+    _connectionRefreshInFlight = true;
+    try {
+      await _refreshConnectionState();
+      if (!mounted ||
+          !_appActive ||
+          _demoMode ||
+          _autoConnectSuppressed ||
+          _connected ||
+          _connecting ||
+          _scanning ||
+          _preparing ||
+          _uploading ||
+          (_autoConnectCooldown?.isActive ?? false)) {
+        return;
+      }
+      _autoConnectCooldown = Timer(const Duration(seconds: 20), () {});
+      await _scan(automatic: true);
+    } on PlatformException {
+      // Automatic connection checks stay quiet; manual connect shows errors.
+    } on MissingPluginException {
+      // Desktop previews/tests need not have a device bridge.
+    } finally {
+      _connectionRefreshInFlight = false;
+    }
   }
 
   Future<void> _handleNativeCall(MethodCall call) async {
@@ -276,6 +332,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       case 'connectionState':
         if (_bluetoothControl) {
           break; // AP bulk transport is not the control connection.
+        }
+        if (event['connected'] != true) {
+          ++_switchGeneration;
         }
         final wasConnected = _connected;
         final previousHardware = _connectedHardware;
@@ -373,55 +432,128 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _loadFactoryAnimations() async {
-    final builtIn = <Map<String, dynamic>>[];
+    if (_factoryCatalogSyncing || !_canPreloadFactory) return;
+    _factoryCatalogSyncing = true;
+    _factoryCatalogRefreshedAt = DateTime.now();
     try {
-      final jsonStr = await DefaultAssetBundle.of(
-        context,
-      ).loadString('assets/factory_previews/manifest.json');
-      final list = json.decode(jsonStr) as List<dynamic>;
-      builtIn.addAll(list.map((item) => _asStringMap(item)));
-      if (!mounted) return;
-      setState(() {
-        _factoryAnims = builtIn
-            .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
-            .toList();
-        if (_asset == null &&
-            _selectedFactoryId == null &&
-            _factoryAnims.isNotEmpty) {
-          _selectedFactoryId = _factoryAnims.first.id;
-          final video =
-              _factoryAnims.first.firstVideo ?? _factoryAnims.first.loopVideo;
-          _videoQueue = video == null ? [] : [video];
-          _videoIndex = 0;
-        }
-      });
-    } catch (_) {
-      // Fallback: manifest not found, leave empty
-    }
-    try {
-      final cacheRoot = await _invokeNative<String>('factoryCacheRoot');
-      if (cacheRoot == null || cacheRoot.isEmpty) {
-        return;
+      final builtIn = <Map<String, dynamic>>[];
+      try {
+        final jsonStr = await DefaultAssetBundle.of(
+          context,
+        ).loadString('assets/factory_previews/manifest.json');
+        final list = json.decode(jsonStr) as List<dynamic>;
+        builtIn.addAll(
+          list
+              .map((item) => _asStringMap(item))
+              .where(
+                (item) => !FactoryCatalogSync.retiredIds.contains(item['id']),
+              ),
+        );
+        if (!mounted) return;
+        setState(() {
+          _factoryAnims = builtIn
+              .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
+              .toList();
+          if (_asset == null &&
+              _selectedFactoryId == null &&
+              _factoryAnims.isNotEmpty) {
+            _selectedFactoryId = _factoryAnims.first.id;
+            final video =
+                _factoryAnims.first.firstVideo ?? _factoryAnims.first.loopVideo;
+            _videoQueue = video == null ? [] : [video];
+            _videoIndex = 0;
+          }
+        });
+      } catch (_) {
+        // Fallback: manifest not found, leave empty
       }
-      final synced = await FactoryCatalogSync.syncOnce(
-        backendBases: _backendBases,
-        cacheRoot: Directory(cacheRoot),
-        builtIn: builtIn,
-        hardware: _connectedHardware,
-      );
-      if (!mounted) return;
-      setState(() {
-        _factoryAnims = synced
-            .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
-            .toList();
-      });
-    } catch (_) {
-      // Network/cache failures should not block built-in factory animations.
+      try {
+        final cacheRoot = await _invokeNative<String>('factoryCacheRoot');
+        if (cacheRoot == null || cacheRoot.isEmpty) {
+          return;
+        }
+        final synced = await FactoryCatalogSync.syncOnce(
+          backendBases: _backendBases,
+          cacheRoot: Directory(cacheRoot),
+          builtIn: builtIn,
+          hardware: _connectedHardware,
+        );
+        if (!mounted) return;
+        setState(() {
+          _factoryAnims = synced
+              .map((item) => FactoryAnimation.fromMap(_asStringMap(item)))
+              .toList();
+        });
+        _factoryPreload ??= FactoryDevicePreload(
+          cacheRoot: Directory(cacheRoot),
+          backendBases: _backendBases,
+          canRun: () => _canPreloadFactory,
+          onDiagnostic: debugPrint,
+        );
+        _resumeFactoryPreload();
+      } catch (_) {
+        // Network/cache failures should not block built-in factory animations.
+      }
+    } finally {
+      _factoryCatalogSyncing = false;
+    }
+  }
+
+  bool get _canPreloadFactory =>
+      mounted &&
+      _appActive &&
+      !_demoMode &&
+      !_uploading &&
+      !_preparing &&
+      _connectedHardware == 'esp32p4' &&
+      (_bluetoothControl || !_connected) &&
+      (ModalRoute.of(context)?.isCurrent ?? true);
+
+  void _refreshFactoryCatalogIfDue() {
+    if (_canPreloadFactory &&
+        (_factoryCatalogRefreshedAt == null ||
+            DateTime.now().difference(_factoryCatalogRefreshedAt!) >=
+                const Duration(minutes: 5))) {
+      unawaited(_loadFactoryAnimations());
+    }
+  }
+
+  void _resumeFactoryPreload() {
+    if (_canPreloadFactory) {
+      unawaited(_factoryPreload?.start() ?? Future<void>.value());
     }
   }
 
   Future<void> _switchToFactory(FactoryAnimation anim) async {
     final switchGeneration = ++_switchGeneration;
+    if (_uploading || _preparing) return;
+    final packageKey = anim.devicePackageKey;
+    var requiresDeviceInstall = false;
+    if (!_demoMode && _connected && anim.isLoop && packageKey != null) {
+      var deviceKey = _connectedDeviceKey;
+      if (deviceKey == null || deviceKey.isEmpty) {
+        try {
+          deviceKey = await _invokeNative<String>('getDeviceIdentity');
+          if (deviceKey != null && deviceKey.isNotEmpty) {
+            _connectedDeviceKey = deviceKey;
+          }
+        } catch (error) {
+          debugPrint(
+            'FACTORY ${anim.id} device identity deferred ${error.runtimeType}',
+          );
+        }
+      }
+      final preload = _factoryPreload;
+      requiresDeviceInstall =
+          deviceKey == null ||
+          deviceKey.isEmpty ||
+          preload == null ||
+          !await preload.deliveredToDevice(anim.id, packageKey, deviceKey);
+      debugPrint(
+        'FACTORY ${anim.id} device install required=$requiresDeviceInstall '
+        'identity=${deviceKey == null ? 'missing' : 'present'}',
+      );
+    }
     // The device switches from a user asset directly to the factory first
     // half; there is no factory exit animation to preview in that case.
     final leavingUserAsset = _asset != null;
@@ -437,8 +569,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         orElse: () => null,
       );
       if (current?.isLoop != true && !targetIsLoop) {
-        isThirdHalf = current?.transitions.containsKey(anim.id) ?? false;
-        final exitVid = current?.exitVideo(anim.id);
+        final sharinganLink = current?.isSharingan == true && anim.isSharingan
+            ? anim.transitionVideo
+            : null;
+        isThirdHalf =
+            sharinganLink != null ||
+            (current?.transitions.containsKey(anim.id) ?? false);
+        final exitVid = sharinganLink ?? current?.exitVideo(anim.id);
         if (exitVid != null) queue.add(exitVid);
       }
     }
@@ -452,7 +589,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     // Dispatch the device command before rebuilding the video preview.  The
     // preview can tear down/create video controllers and hold the Flutter
     // event loop long enough to make the physical switch feel delayed.
-    final dispatchSwitch = !_demoMode && _connected
+    final dispatchSwitch =
+        !requiresDeviceInstall &&
+            !_demoMode &&
+            _connected &&
+            anim.supportsDeviceSwitch
         ? _invokeNative<dynamic>('switchToAsset', {'id': anim.id})
         : null;
     setState(() {
@@ -466,11 +607,25 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       setState(() => _status = '演示切换 ${anim.name}');
       return;
     }
+    if (requiresDeviceInstall) {
+      await _installFactoryAnimation(anim);
+      return;
+    }
     // Send switch command to device
-    if (dispatchSwitch == null) return;
+    if (dispatchSwitch == null) {
+      if (!_demoMode && _connected && !anim.supportsDeviceSwitch) {
+        // Remote factory previews can be added without a firmware asset. They
+        // are still fully usable in the App preview, but sending Sxxx (or any
+        // other App-only ID) to SWITCH would produce bad_control on old/new
+        // firmware alike.
+        setState(() => _status = '已切换预览（手机素材）');
+      }
+      return;
+    }
     setState(() => _status = '切换中...');
     try {
       final result = await dispatchSwitch;
+      debugPrint('DotLoop SWITCH ${anim.id}: $result');
       if (!mounted || switchGeneration != _switchGeneration) return;
       if (result == true) {
         setState(() => _status = '已切换');
@@ -480,12 +635,139 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         // surface as a false timeout in the app.
         setState(() => _status = '切换已提交');
       } else if (result is Map && result['needsUpload'] == true) {
-        _showSnack('设备缺少该素材，需先上传');
-        setState(() => _status = '素材缺失');
+        await _installFactoryAnimation(anim);
       }
     } catch (e) {
       if (!mounted || switchGeneration != _switchGeneration) return;
       _showSnack('切换失败: $e');
+    }
+  }
+
+  Future<void> _installFactoryAnimation(FactoryAnimation anim) async {
+    final installWatch = Stopwatch()..start();
+    debugPrint('FACTORY ${anim.id} UI install begin');
+    setState(() {
+      _uploading = true;
+      _uploadProgress = 0;
+      _status = '下载设备素材';
+    });
+    try {
+      await _factoryPreload?.pause();
+      // Leave any old transfer network before accessing the public catalog.
+      if (_bluetoothControl) {
+        await _channel.invokeMethod<void>('leaveDeviceAccessPoint');
+      }
+      debugPrint(
+        'FACTORY ${anim.id} UI network released ${installWatch.elapsedMilliseconds}ms',
+      );
+      final root = await _channel.invokeMethod<String>('factoryCacheRoot');
+      if (root == null) throw const FileSystemException('素材缓存不可用');
+      _factoryPreload ??= FactoryDevicePreload(
+        cacheRoot: Directory(root),
+        backendBases: _backendBases,
+        canRun: () => _canPreloadFactory,
+        onDiagnostic: debugPrint,
+      );
+      final package =
+          await FactoryDeviceInstall.readPrepared(
+            id: anim.id,
+            cacheRoot: Directory(root),
+          ) ??
+          await FactoryDeviceInstall.prepare(
+            id: anim.id,
+            backendBases: _backendBases,
+            cacheRoot: Directory(root),
+            onProgress: (value) {
+              if (mounted) setState(() => _uploadProgress = value * .4);
+            },
+            onStage: (stage) {
+              if (!mounted) return;
+              setState(() {
+                _status = switch (stage) {
+                  FactoryInstallStage.downloading => '下载设备素材',
+                  FactoryInstallStage.verifying => '校验设备素材',
+                  FactoryInstallStage.packaging => '整理设备素材',
+                  FactoryInstallStage.ready => '素材已准备好',
+                };
+                if (stage == FactoryInstallStage.packaging) {
+                  _uploadProgress = .42;
+                }
+                if (stage == FactoryInstallStage.ready) _uploadProgress = .45;
+              });
+            },
+            onDiagnostic: debugPrint,
+          );
+      debugPrint(
+        'FACTORY ${anim.id} UI prepared ${installWatch.elapsedMilliseconds}ms',
+      );
+      if (mounted) {
+        setState(() {
+          _uploadProgress = .45;
+          _status = '素材已准备好';
+        });
+      }
+      if (!mounted ||
+          !await _prepareDeviceTransfer(requireConfirmation: false)) {
+        return;
+      }
+      debugPrint(
+        'FACTORY ${anim.id} UI hotspot ready ${installWatch.elapsedMilliseconds}ms',
+      );
+      if (!mounted) return;
+      setState(() => _status = '安装设备素材');
+      final reply = await _channel.invokeMapMethod<String, dynamic>(
+        'installFactoryPackage',
+        {...package, 'deviceKey': _connectedDeviceKey},
+      );
+      if (reply?['installed'] != true ||
+          reply?['id'] != anim.id ||
+          reply?['deviceKey'] != _connectedDeviceKey) {
+        throw const FormatException('设备未确认素材安装成功');
+      }
+      try {
+        await _factoryPreload?.installed(
+          package,
+          deviceKey: _connectedDeviceKey,
+        );
+      } catch (error) {
+        // Installation succeeded. Retain files if cleanup cannot complete.
+        debugPrint(
+          'FACTORY ${anim.id} cache cleanup deferred ${error.runtimeType}',
+        );
+      }
+      final switched = await _invokeNative<dynamic>('switchToAsset', {
+        'id': anim.id,
+      });
+      if (switched != true) throw const FormatException('素材已安装，请重新点选动画');
+      debugPrint('DotLoop INSTALL ${anim.id}: installed and switched');
+      debugPrint(
+        'FACTORY ${anim.id} UI complete ${installWatch.elapsedMilliseconds}ms',
+      );
+      if (mounted) {
+        setState(() {
+          _uploadProgress = 1;
+          _status = '已切换';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() => _status = '安装失败');
+        _showSnack(
+          error is PlatformException
+              ? (error.message ?? error.code)
+              : error.toString(),
+        );
+      }
+    } finally {
+      if (_bluetoothControl) {
+        try {
+          await _channel.invokeMethod<void>('leaveDeviceAccessPoint');
+        } catch (_) {
+          /* Keep original error. */
+        }
+      }
+      if (mounted) setState(() => _uploading = false);
+      _resumeFactoryPreload();
     }
   }
 
@@ -900,7 +1182,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
-  Future<void> _scan() async {
+  Future<void> _scan({bool automatic = false}) async {
+    if (_scanning || _connecting || _preparing || _uploading) return;
+    if (!automatic) _autoConnectSuppressed = false;
     if (_demoMode) {
       await _simulateDemoScan();
       return;
@@ -914,8 +1198,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _status = '扫描 DotLoop';
     });
     try {
+      final requestPermissions = !automatic || !_autoConnectAttempted;
+      _autoConnectAttempted = true;
       final info = await _channel.invokeMapMethod<String, dynamic>(
         'ensureDeviceBluetooth',
+        {'automatic': automatic, 'requestPermissions': requestPermissions},
       );
       if (!mounted) return;
       final status = info?['status']?.toString() ?? '';
@@ -946,8 +1233,14 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       unawaited(_refreshBrightness());
       unawaited(_refreshFirmwareAvailability());
     } on PlatformException catch (error) {
-      _showSnack(error.message ?? error.code);
-      setState(() => _scanning = false);
+      if (!mounted) return;
+      if (!automatic) _showSnack(error.message ?? error.code);
+      setState(() {
+        _scanning = false;
+        if (!_connected) _status = '未连接';
+      });
+    } on MissingPluginException {
+      if (mounted) setState(() => _scanning = false);
     }
   }
 
@@ -979,6 +1272,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _disconnect() async {
+    ++_switchGeneration;
+    _autoConnectSuppressed = true;
+    _autoConnectCooldown?.cancel();
     setState(() {
       _resetFirmwareAvailability();
       _deviceFirmwareVersion = null;
@@ -1006,32 +1302,47 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     await _refreshConnectionState();
   }
 
-  Future<bool> _prepareDeviceTransfer({bool firmware = false}) async {
+  Future<bool> _prepareDeviceTransfer({
+    bool firmware = false,
+    bool requireConfirmation = true,
+  }) async {
+    await _factoryPreload?.pause();
+    if (!mounted) return false;
     if (!_bluetoothControl || _demoMode) return true;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xff202020),
-        title: const AppText('连接设备传输热点'),
-        content: AppText(
-          '${firmware ? '固件已下载并校验。' : '素材已准备好。'}接下来设备会开启 DotLoop Wi-Fi，允许系统连接后即可传输。传输期间没有互联网是正常的，蓝牙控制仍保持连接。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const AppText('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const AppText('连接并传输'),
-          ),
-        ],
-      ),
-    );
+    final confirmed = requireConfirmation
+        ? await showDialog<bool>(
+            context: context,
+            builder: (context) => AlertDialog(
+              backgroundColor: const Color(0xff202020),
+              title: const AppText('连接设备传输热点'),
+              content: AppText(
+                '${firmware ? '固件已下载并校验。' : '素材已准备好。'}接下来设备会开启 DotLoop Wi-Fi，允许系统连接后即可传输。传输期间没有互联网是正常的，蓝牙控制仍保持连接。',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const AppText('取消'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const AppText('连接并传输'),
+                ),
+              ],
+            ),
+          )
+        : true;
     if (confirmed != true || !mounted) return false;
     final key = await _invokeNative<String>('getDeviceIdentity');
+    debugPrint('FACTORY transfer requesting device hotspot');
     await _invokeNative<String>('startTransferAccessPoint');
-    await _channel.invokeMethod<bool>('joinDeviceAccessPoint');
+    debugPrint('FACTORY transfer joining DotLoop Wi-Fi');
+    final joined = await _channel.invokeMethod<bool>('joinDeviceAccessPoint');
+    if (joined != true) {
+      throw PlatformException(
+        code: 'wifi_connect',
+        message: '未能连接 DotLoop 传输热点，请确认热点已开启并检查附近设备/Wi-Fi 权限',
+      );
+    }
     if (!_connected) {
       throw PlatformException(
         code: 'device_disconnected',
@@ -1047,6 +1358,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       );
     }
     _connectedDeviceKey = key;
+    debugPrint('FACTORY transfer connected to verified device hotspot');
     return true;
   }
 
@@ -1058,12 +1370,15 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       }
       final media = SelectedMedia.fromMap(_asStringMap(picked));
       setState(() {
-        if (_draftAssetName.trim().isEmpty || _draftAssetName == _media?.name) {
-          _draftAssetName = media.name;
-        }
+        _draftAssetName = '';
+        ++_makerSelectionRevision;
         _media = media;
         _asset = null;
         _cropTransform = const CropTransform();
+        _makerCoverFrame = 0;
+        _makerCoverFramePreview = media.previewBytes;
+        _makerCoverFrameTimer?.cancel();
+        ++_makerCoverFrameRequest;
         _prepareProgress = 0;
         _pageIndex = 2;
         _status = '素材已导入';
@@ -1098,9 +1413,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       _showSnack('请先导入 GIF、图片或视频');
       return;
     }
-    final assetName = _draftAssetName.trim().isEmpty
-        ? media.name
-        : _draftAssetName.trim();
+    final requestedName = _draftAssetName.trim();
+    final now = DateTime.now();
+    final assetName = requestedName.isEmpty
+        ? '动画_${now.year}${_twoDigits(now.month)}${_twoDigits(now.day)}_'
+              '${_twoDigits(now.hour)}${_twoDigits(now.minute)}'
+              '${_twoDigits(now.second)}_${now.millisecond.toString().padLeft(3, '0')}'
+        : requestedName;
     setState(() {
       _preparing = true;
       _prepareProgress = 0;
@@ -1150,9 +1469,15 @@ class _BadgeHomePageState extends State<BadgeHomePage>
             );
           }
           final actualFps = resolveServerTranscodeFps(transcodeResult['fps']);
+          var previewPath = _readNullableString(transcodeResult['previewPath']);
+          if (_supportsCoverFrames(media.mime)) {
+            previewPath = await _saveMakerAnimatedCover(media, _cropTransform);
+          }
+          if (!mounted) return;
           final asset = PreparedAsset(
             assetPath: '',
-            previewPath: _readNullableString(transcodeResult['previewPath']),
+            previewPath: previewPath,
+            previewCropApplied: _supportsCoverFrames(media.mime),
             animatedPreviewPath: media.animatedPreviewPath,
             sourceUri: media.uri,
             mime: media.mime,
@@ -1204,6 +1529,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           'cropScale': _cropTransform.scale,
           'cropOffsetX': _cropTransform.offset.dx,
           'cropOffsetY': _cropTransform.offset.dy,
+          'coverFrame': _cropTransform.coverFrame,
           'warmPreviewPath': _isDefaultCrop ? media.animatedPreviewPath : null,
         },
       );
@@ -1220,6 +1546,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         if (!mounted) {
           return;
         }
+      }
+      if (_supportsCoverFrames(media.mime)) {
+        final coverPath = await _saveMakerAnimatedCover(media, _cropTransform);
+        asset = asset.copyWith(
+          previewPath: coverPath,
+          previewCropApplied: true,
+        );
       }
       try {
         setState(() => _status = '同步素材到服务器');
@@ -1265,7 +1598,76 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
+  Future<String?> _saveMakerAnimatedCover(
+    SelectedMedia media,
+    CropTransform transform,
+  ) async {
+    final result =
+        await _invokeNative<Map<dynamic, dynamic>>('videoFramePreview', {
+          'uri': media.uri,
+          'coverFrame': transform.coverFrame,
+          'cropScale': transform.scale,
+          'cropOffsetX': transform.offset.dx,
+          'cropOffsetY': transform.offset.dy,
+        });
+    final bytes = result?['previewBytes'] as Uint8List?;
+    if (bytes == null) {
+      throw PlatformException(
+        code: 'cover_preview_empty',
+        message: '无法生成所选封面帧',
+      );
+    }
+    final path = await _invokeNative<String>('saveMaterialCover', {
+      'bytes': bytes,
+    });
+    if (path == null || path.isEmpty) {
+      throw PlatformException(code: 'cover_save_failed', message: '封面保存失败');
+    }
+    return path;
+  }
+
+  void _updateMakerCoverFrame(double value) {
+    final media = _media;
+    if (media == null || !_supportsCoverFrames(media.mime)) return;
+    final request = ++_makerCoverFrameRequest;
+    final transform = _cropTransform.copyWith(coverFrame: value);
+    setState(() {
+      _makerCoverFrame = transform.coverFrame;
+      _cropTransform = transform;
+    });
+    _makerCoverFrameTimer?.cancel();
+    _makerCoverFrameTimer = Timer(const Duration(milliseconds: 120), () {
+      unawaited(_renderMakerCoverFrame(media, transform, request));
+    });
+  }
+
+  Future<void> _renderMakerCoverFrame(
+    SelectedMedia media,
+    CropTransform transform,
+    int request,
+  ) async {
+    try {
+      final result =
+          await _invokeNative<Map<dynamic, dynamic>>('videoFramePreview', {
+            'uri': media.uri,
+            'coverFrame': transform.coverFrame,
+            'cropScale': transform.scale,
+            'cropOffsetX': transform.offset.dx,
+            'cropOffsetY': transform.offset.dy,
+          });
+      final bytes = result?['previewBytes'] as Uint8List?;
+      if (mounted && request == _makerCoverFrameRequest && bytes != null) {
+        setState(() => _makerCoverFramePreview = bytes);
+      }
+    } on PlatformException catch (error) {
+      if (mounted && request == _makerCoverFrameRequest) {
+        _showSnack(error.message ?? '读取封面帧失败');
+      }
+    }
+  }
+
   Future<void> _uploadAsset(PreparedAsset asset) async {
+    ++_switchGeneration;
     if (_uploading || _preparing) return;
     if (!_connected) {
       _showSnack('请先连接设备');
@@ -1344,6 +1746,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       approvedAsset = PreparedAsset(
         assetPath: downloadedPath,
         previewPath: approvedAsset.previewPath,
+        previewCropApplied: approvedAsset.previewCropApplied,
         animatedPreviewPath: approvedAsset.animatedPreviewPath,
         sourceUri: approvedAsset.sourceUri,
         mime: approvedAsset.mime,
@@ -2042,8 +2445,11 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (rebuilt == null) return original;
       final asset = PreparedAsset(
         assetPath: '',
-        previewPath:
-            _readNullableString(rebuilt['previewPath']) ?? original.previewPath,
+        previewPath: original.previewCropApplied
+            ? original.previewPath
+            : _readNullableString(rebuilt['previewPath']) ??
+                  original.previewPath,
+        previewCropApplied: original.previewCropApplied,
         animatedPreviewPath: original.animatedPreviewPath,
         sourceUri: original.sourceUri,
         mime: original.mime,
@@ -2203,6 +2609,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   Future<void> _uploadHistoryEntry(HistoryEntry entry) async {
+    final operationGeneration = ++_switchGeneration;
     if (_preparing || _uploading) {
       return;
     }
@@ -2218,7 +2625,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
     // If already uploaded, just switch to it
     if (entry.deviceId != null && _connected) {
-      final switchGeneration = ++_switchGeneration;
+      final switchGeneration = operationGeneration;
       // Tombstone cleanup is best-effort background work. It must not delay
       // the user-selected asset switch behind identity/delete network calls.
       if (_pendingDeviceDeletes.isNotEmpty) {
@@ -2234,6 +2641,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       final reviewed = PreparedAsset(
         assetPath: entry.assetPath,
         previewPath: entry.previewPath,
+        previewCropApplied: entry.previewCropApplied,
         animatedPreviewPath: entry.animatedPreviewPath,
         sourceUri: entry.sourceUri,
         mime: entry.mime,
@@ -2283,6 +2691,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
             _asset = PreparedAsset(
               assetPath: entry.assetPath,
               previewPath: entry.previewPath,
+              previewCropApplied: entry.previewCropApplied,
               animatedPreviewPath: entry.animatedPreviewPath,
               sourceUri: entry.sourceUri,
               mime: entry.mime,
@@ -2309,6 +2718,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     final asset = PreparedAsset(
       assetPath: entry.assetPath,
       previewPath: entry.previewPath,
+      previewCropApplied: entry.previewCropApplied,
       animatedPreviewPath: entry.animatedPreviewPath,
       sourceUri: entry.sourceUri,
       mime: entry.mime,
@@ -2447,7 +2857,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
   }
 
   void _resetCrop() {
-    setState(() => _cropTransform = const CropTransform());
+    setState(
+      () => _cropTransform = CropTransform(coverFrame: _makerCoverFrame),
+    );
   }
 
   void _showSnack(String message) {
@@ -2648,17 +3060,23 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onImport: () => setState(() => _pageIndex = 2),
       ),
       _MakerPage(
-        key: ValueKey('maker-${_media?.uri ?? "empty"}'),
+        key: ValueKey(
+          'maker-${_media?.uri ?? "empty"}-$_makerSelectionRevision',
+        ),
         active: previewActive && _pageIndex == 2,
         media: _media,
         asset: _asset,
         cropTransform: _cropTransform,
+        coverFrame: _makerCoverFrame,
+        coverFramePreview: _makerCoverFramePreview,
+        videoDurationMs: _media?.durationMs ?? 0,
         preparing: _preparing,
         uploading: _uploading,
         prepareProgress: _prepareProgress,
         onPick: _pickMedia,
         onSave: _saveMakerAsset,
         onCropChanged: (value) => setState(() => _cropTransform = value),
+        onCoverFrameChanged: _updateMakerCoverFrame,
         onResetCrop: _resetCrop,
         draftName: _draftAssetName,
         onNameChanged: (value) => _draftAssetName = value,
@@ -2690,7 +3108,10 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         onLanguage: _openLanguage,
         onGame: () => Navigator.of(context).push<void>(
           MaterialPageRoute(
-            builder: (_) => GamesPage(onFlyBird: () => unawaited(_openGame())),
+            builder: (_) => RemoteGamesPage(
+              backendBases: _backendBases,
+              onFlyBird: () => unawaited(_openGame()),
+            ),
           ),
         ),
         onDeviceStatus: _openDeviceStatus,
@@ -2731,9 +3152,14 @@ class _BadgeHomePageState extends State<BadgeHomePage>
                   child: ReferenceTopNavigation(
                     selectedIndex: _pageIndex,
                     connected: _connected,
-                    onSelected: (index) => index == 4
-                        ? _openSettings()
-                        : setState(() => _pageIndex = index),
+                    onSelected: (index) {
+                      ++_switchGeneration;
+                      if (index == 4) {
+                        _openSettings();
+                      } else {
+                        setState(() => _pageIndex = index);
+                      }
+                    },
                   ),
                 ),
                 if (_pageIndex == 2) ...[
@@ -2993,22 +3419,12 @@ class _DisplayLibraryPage extends StatelessWidget {
                                 media: null,
                                 asset: asset,
                                 factoryPreview: selectedFactory?.previewAsset,
-                                factoryVideo:
-                                    videoQueue.isNotEmpty &&
-                                        videoIndex < videoQueue.length
-                                    ? videoQueue[videoIndex]
-                                    : null,
-                                nextVideo:
-                                    videoQueue.isNotEmpty &&
-                                        videoIndex + 1 < videoQueue.length
-                                    ? videoQueue[videoIndex + 1]
-                                    : null,
-                                looping: selectedFactory?.isLoop == true,
-                                onFactoryVideoDone:
-                                    selectedFactory?.isLoop == true ||
-                                        videoQueue.isEmpty
-                                    ? null
-                                    : onVideoDone,
+                                // 首页大预览始终使用静态封面。动态切换仍在
+                                // 设备页/制作页使用，避免首页每次切换又闪回视频。
+                                factoryVideo: null,
+                                nextVideo: null,
+                                looping: false,
+                                onFactoryVideoDone: null,
                                 preparing: uploading,
                                 progress: uploadProgress,
                               ),
@@ -3049,6 +3465,7 @@ class _DisplayLibraryPage extends StatelessWidget {
                         right: 24,
                         bottom: 0,
                         child: LinearProgressIndicator(
+                          key: const ValueKey('home-transfer-progress'),
                           value: _clamp01(uploadProgress),
                           minHeight: 2,
                         ),
@@ -3239,12 +3656,16 @@ class _MakerPage extends StatefulWidget {
     required this.media,
     required this.asset,
     required this.cropTransform,
+    required this.coverFrame,
+    required this.coverFramePreview,
+    required this.videoDurationMs,
     required this.preparing,
     required this.uploading,
     required this.prepareProgress,
     required this.onPick,
     required this.onSave,
     required this.onCropChanged,
+    required this.onCoverFrameChanged,
     required this.onResetCrop,
     required this.draftName,
     required this.onNameChanged,
@@ -3254,9 +3675,13 @@ class _MakerPage extends StatefulWidget {
   final SelectedMedia? media;
   final PreparedAsset? asset;
   final CropTransform cropTransform;
+  final double coverFrame;
+  final Uint8List? coverFramePreview;
+  final int videoDurationMs;
   final double prepareProgress;
   final VoidCallback onPick, onSave, onResetCrop, onClose;
   final ValueChanged<CropTransform> onCropChanged;
+  final ValueChanged<double> onCoverFrameChanged;
   final String draftName;
   final ValueChanged<String> onNameChanged;
   @override
@@ -3264,6 +3689,13 @@ class _MakerPage extends StatefulWidget {
 }
 
 class _MakerPageState extends State<_MakerPage> {
+  bool _choosingCover = false;
+
+  void _changeCrop(CropTransform transform) {
+    widget.onCropChanged(transform);
+    if (_choosingCover) widget.onCoverFrameChanged(widget.coverFrame);
+  }
+
   late final _name = TextEditingController(text: widget.draftName);
   late int _kind =
       widget.media != null &&
@@ -3363,7 +3795,7 @@ class _MakerPageState extends State<_MakerPage> {
           enabled: !disabled,
           onChanged: widget.onNameChanged,
           decoration: InputDecoration(
-            hintText: tr('为这个动画取个名字'),
+            hintText: tr('填写名称，留空则自动生成'),
             hintStyle: const TextStyle(fontSize: 13, color: Color(0xff555555)),
             filled: true,
             fillColor: const Color(0xff111111),
@@ -3432,15 +3864,18 @@ class _MakerPageState extends State<_MakerPage> {
               media: widget.media,
               asset: widget.asset,
               transform: widget.cropTransform,
+              choosingCover: _choosingCover,
+              coverFramePreview: widget.coverFramePreview,
               preparing: widget.preparing,
               progress: widget.prepareProgress,
-              onChanged: disabled ? null : widget.onCropChanged,
+              onChanged: disabled ? null : _changeCrop,
             ),
           ),
         const SizedBox(height: 12),
         if (widget.media != null) ...[
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 8,
             children: [
               TextButton(
                 onPressed: disabled ? null : widget.onPick,
@@ -3449,29 +3884,89 @@ class _MakerPageState extends State<_MakerPage> {
                   style: TextStyle(color: referenceMuted, fontSize: 12),
                 ),
               ),
-              const SizedBox(width: 20),
               TextButton(
-                onPressed: disabled ? null : widget.onResetCrop,
+                onPressed: disabled
+                    ? null
+                    : () {
+                        widget.onResetCrop();
+                        if (_choosingCover) {
+                          widget.onCoverFrameChanged(widget.coverFrame);
+                        }
+                      },
                 child: const AppText(
                   '重置裁剪',
                   style: TextStyle(color: referenceMuted, fontSize: 12),
                 ),
               ),
+              if (_supportsCoverFrames(widget.media!.mime))
+                Semantics(
+                  selected: _choosingCover,
+                  child: TextButton(
+                    key: const ValueKey('maker-cover-mode'),
+                    onPressed: disabled
+                        ? null
+                        : () {
+                            setState(() => _choosingCover = !_choosingCover);
+                            if (_choosingCover) {
+                              widget.onCoverFrameChanged(widget.coverFrame);
+                            }
+                          },
+                    style: TextButton.styleFrom(
+                      foregroundColor: _choosingCover
+                          ? const Color(0xff66cc88)
+                          : referenceMuted,
+                      side: BorderSide(
+                        color: _choosingCover
+                            ? const Color(0xff66cc88)
+                            : Colors.transparent,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    child: const AppText('封面帧', style: TextStyle(fontSize: 12)),
+                  ),
+                ),
             ],
           ),
           Slider(
+            key: const ValueKey('maker-zoom-slider'),
             value: widget.cropTransform.scale,
-            min: 1,
+            min: .5,
             max: 4,
-            divisions: 30,
+            divisions: 35,
+            label: '${widget.cropTransform.scale.toStringAsFixed(1)}×',
+            semanticFormatterCallback: (value) => '${(value * 100).round()}%',
             onChanged: disabled
                 ? null
-                : (value) => widget.onCropChanged(
-                    widget.cropTransform.copyWith(scale: value),
-                  ),
+                : (value) =>
+                      _changeCrop(widget.cropTransform.copyWith(scale: value)),
           ),
+          if (_supportsCoverFrames(widget.media!.mime) && _choosingCover) ...[
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                '${_formatVideoTime(widget.videoDurationMs * widget.coverFrame)} / '
+                '${_formatVideoTime(widget.videoDurationMs.toDouble())}',
+                style: const TextStyle(
+                  color: referenceMuted,
+                  fontSize: 11,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+            Slider(
+              key: const ValueKey('maker-cover-frame-slider'),
+              value: widget.coverFrame.clamp(0.0, 1.0),
+              min: 0,
+              max: 1,
+              semanticFormatterCallback: (value) =>
+                  _formatVideoTime(widget.videoDurationMs * value),
+              onChanged: disabled ? null : widget.onCoverFrameChanged,
+            ),
+          ],
           const AppText(
-            '拖动、双指缩放调整画面',
+            '可缩小或放大；拖动、双指缩放调整画面',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 11, color: referenceMuted),
           ),
@@ -3865,7 +4360,9 @@ class _HistoryGridTile extends StatelessWidget {
               active: active,
               entry: entry,
               previewPath: previewPath,
-              transform: entry.cropTransform,
+              transform: entry.previewCropApplied && entry.previewPath != null
+                  ? const CropTransform()
+                  : entry.cropTransform,
             ),
             if (overlayColor != null) ColoredBox(color: overlayColor),
             if (reviewLabel != null)
@@ -3903,6 +4400,8 @@ class _CropPreview extends StatefulWidget {
     required this.media,
     required this.asset,
     required this.transform,
+    this.choosingCover = false,
+    this.coverFramePreview,
     required this.preparing,
     required this.progress,
     required this.onChanged,
@@ -3912,6 +4411,8 @@ class _CropPreview extends StatefulWidget {
   final SelectedMedia? media;
   final PreparedAsset? asset;
   final CropTransform transform;
+  final bool choosingCover;
+  final Uint8List? coverFramePreview;
   final bool preparing;
   final double progress;
   final ValueChanged<CropTransform>? onChanged;
@@ -3957,7 +4458,7 @@ class _CropPreviewState extends State<_CropPreview> {
     final focalPoint = _currentFocalPoint();
     final scaleDelta = _currentPointerDistance() / _startPointerDistance;
     final nextScale = (_startTransform.scale * scaleDelta)
-        .clamp(1.0, 4.0)
+        .clamp(0.5, 4.0)
         .toDouble();
     final delta = focalPoint - _startFocalPoint;
     final nextOffset =
@@ -4050,11 +4551,19 @@ class _CropPreviewState extends State<_CropPreview> {
                       decoration: const BoxDecoration(color: Colors.black),
                     ),
                     _TransformedPreviewMedia(
-                      active: widget.active,
+                      active: widget.active && !widget.choosingCover,
                       media: widget.media,
                       asset: widget.asset,
                       transform: widget.transform,
                     ),
+                    if (widget.choosingCover &&
+                        widget.coverFramePreview != null)
+                      Image.memory(
+                        widget.coverFramePreview!,
+                        key: const ValueKey('maker-cover-preview'),
+                        fit: BoxFit.cover,
+                        gaplessPlayback: true,
+                      ),
                     if (widget.media == null &&
                         widget.asset == null &&
                         !widget.preparing)
@@ -4249,6 +4758,16 @@ class _PreviewDial extends StatelessWidget {
                   Icons.perm_media_outlined,
                   size: 72,
                   color: Colors.white,
+                ),
+              ),
+            if (factoryVideo != null)
+              Positioned.fill(
+                child: FactoryVideoPreview(
+                  currentVideo: factoryVideo!,
+                  nextVideo: nextVideo,
+                  active: active,
+                  looping: looping,
+                  onDone: onFactoryVideoDone,
                 ),
               ),
             if (preparing)
@@ -4466,6 +4985,7 @@ class SelectedMedia {
     required this.name,
     required this.size,
     required this.mime,
+    this.durationMs = 0,
     required this.previewBytes,
     required this.animatedPreviewPath,
   });
@@ -4476,6 +4996,7 @@ class SelectedMedia {
       name: (map['name'] as String?) ?? '素材',
       size: (map['size'] as num?)?.toInt() ?? 0,
       mime: (map['mime'] as String?) ?? 'image/*',
+      durationMs: (map['durationMs'] as num?)?.toInt() ?? 0,
       previewBytes: map['previewBytes'] as Uint8List?,
       animatedPreviewPath: _readNullableString(map['animatedPreviewPath']),
     );
@@ -4485,6 +5006,7 @@ class SelectedMedia {
   final String name;
   final int size;
   final String mime;
+  final int durationMs;
   final Uint8List? previewBytes;
   final String? animatedPreviewPath;
 
@@ -4494,6 +5016,7 @@ class SelectedMedia {
       name: name,
       size: size,
       mime: mime,
+      durationMs: durationMs,
       previewBytes: previewBytes,
       animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
     );
@@ -4504,6 +5027,7 @@ class PreparedAsset {
   const PreparedAsset({
     required this.assetPath,
     required this.previewPath,
+    this.previewCropApplied = false,
     required this.animatedPreviewPath,
     required this.sourceUri,
     required this.mime,
@@ -4523,6 +5047,7 @@ class PreparedAsset {
     return PreparedAsset(
       assetPath: (map['assetPath'] as String?) ?? '',
       previewPath: _readNullableString(map['previewPath']),
+      previewCropApplied: map['previewCropApplied'] == true,
       animatedPreviewPath: _readNullableString(map['animatedPreviewPath']),
       sourceUri: _readNullableString(map['sourceUri']),
       mime: (map['mime'] as String?) ?? 'application/octet-stream',
@@ -4541,6 +5066,7 @@ class PreparedAsset {
 
   final String assetPath;
   final String? previewPath;
+  final bool previewCropApplied;
   final String? animatedPreviewPath;
   final String? sourceUri;
   final String mime;
@@ -4556,6 +5082,8 @@ class PreparedAsset {
   final String reviewStatus;
 
   PreparedAsset copyWith({
+    String? previewPath,
+    bool? previewCropApplied,
     CropTransform? cropTransform,
     String? animatedPreviewPath,
     String? reviewId,
@@ -4563,7 +5091,8 @@ class PreparedAsset {
   }) {
     return PreparedAsset(
       assetPath: assetPath,
-      previewPath: previewPath,
+      previewPath: previewPath ?? this.previewPath,
+      previewCropApplied: previewCropApplied ?? this.previewCropApplied,
       animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
       sourceUri: sourceUri,
       mime: mime,
@@ -4589,15 +5118,21 @@ class PreparedAsset {
 }
 
 class CropTransform {
-  const CropTransform({this.scale = 1, this.offset = Offset.zero});
+  const CropTransform({
+    this.scale = 1,
+    this.offset = Offset.zero,
+    this.coverFrame = 0,
+  });
 
   final double scale;
   final Offset offset;
+  final double coverFrame;
 
-  CropTransform copyWith({double? scale, Offset? offset}) {
+  CropTransform copyWith({double? scale, Offset? offset, double? coverFrame}) {
     return CropTransform(
-      scale: (scale ?? this.scale).clamp(1.0, 4.0).toDouble(),
+      scale: (scale ?? this.scale).clamp(.5, 4.0).toDouble(),
       offset: _clampCropOffset(offset ?? this.offset),
+      coverFrame: (coverFrame ?? this.coverFrame).clamp(0.0, 1.0).toDouble(),
     );
   }
 }
@@ -4606,6 +5141,7 @@ class HistoryEntry {
   const HistoryEntry({
     required this.assetPath,
     required this.previewPath,
+    this.previewCropApplied = false,
     required this.animatedPreviewPath,
     required this.sourceUri,
     required this.mime,
@@ -4631,6 +5167,7 @@ class HistoryEntry {
     return HistoryEntry(
       assetPath: asset.assetPath,
       previewPath: asset.previewPath,
+      previewCropApplied: asset.previewCropApplied,
       animatedPreviewPath: asset.animatedPreviewPath,
       sourceUri: asset.sourceUri,
       mime: asset.mime,
@@ -4652,6 +5189,7 @@ class HistoryEntry {
     return HistoryEntry(
       assetPath: (map['assetPath'] as String?) ?? '',
       previewPath: _readNullableString(map['previewPath']),
+      previewCropApplied: map['previewCropApplied'] == true,
       animatedPreviewPath: _readNullableString(map['animatedPreviewPath']),
       sourceUri: _readNullableString(map['sourceUri']),
       mime: (map['mime'] as String?) ?? 'application/octet-stream',
@@ -4675,6 +5213,7 @@ class HistoryEntry {
     return {
       'assetPath': assetPath,
       'previewPath': previewPath,
+      'previewCropApplied': previewCropApplied,
       'animatedPreviewPath': animatedPreviewPath,
       'sourceUri': sourceUri,
       'mime': mime,
@@ -4696,6 +5235,7 @@ class HistoryEntry {
 
   final String assetPath;
   final String? previewPath;
+  final bool previewCropApplied;
   final String? animatedPreviewPath;
   final String? sourceUri;
   final String mime;
@@ -4736,6 +5276,7 @@ class HistoryEntry {
     return HistoryEntry(
       assetPath: assetPath ?? this.assetPath,
       previewPath: previewPath,
+      previewCropApplied: previewCropApplied,
       animatedPreviewPath: animatedPreviewPath ?? this.animatedPreviewPath,
       sourceUri: sourceUri,
       mime: mime,
@@ -4771,6 +5312,16 @@ double _readDouble(Object? value) {
 }
 
 double _clamp01(double value) => value.clamp(0.0, 1.0).toDouble();
+
+String _twoDigits(int value) => value.toString().padLeft(2, '0');
+
+String _formatVideoTime(double milliseconds) {
+  final totalSeconds = (milliseconds / 1000).floor();
+  final minutes = totalSeconds ~/ 60;
+  final seconds = totalSeconds % 60;
+  final hundredths = (milliseconds ~/ 10) % 100;
+  return '$minutes:${_twoDigits(seconds)}.${_twoDigits(hundredths)}';
+}
 
 Offset _clampCropOffset(Offset value) {
   return Offset(
@@ -4855,6 +5406,9 @@ Widget _blackPreviewFallback(
   return const ColoredBox(color: Colors.black);
 }
 
+bool _supportsCoverFrames(String mime) =>
+    _isVideoMime(mime) || mime == 'image/gif';
+
 bool _isVideoMime(String mime) => mime.toLowerCase().startsWith('video/');
 
 String? _guessMimeFromPath(String? path) {
@@ -4879,7 +5433,10 @@ class FactoryAnimation {
     this.firstVideo,
     this.secondVideo,
     this.loopVideo,
+    this.transitionVideo,
     this.protected = false,
+    this.deviceFileCount,
+    this.devicePackageKey,
     this.transitions = const {},
   });
 
@@ -4890,12 +5447,26 @@ class FactoryAnimation {
   final String? firstVideo;
   final String? secondVideo;
   final String? loopVideo;
+  final String? transitionVideo;
   final bool protected;
+  final int? deviceFileCount;
+  final String? devicePackageKey;
   final Map<String, String> transitions;
 
   bool get isLoop => type == 'loop';
+  bool get isSharingan => RegExp(r'^S(?:00[1-9]|010)$').hasMatch(id);
+
+  /// F001-F023 are already installed on the device SD card. Their legacy
+  /// catalog has no downloadable device files, which does not make them
+  /// App-only. New IDs require a device payload for the selected hardware.
+  bool get supportsDeviceSwitch =>
+      RegExp(r'^F(?:00[1-9]|01[0-9]|02[0-3])$').hasMatch(id) ||
+      (deviceFileCount ?? 0) > 0;
 
   factory FactoryAnimation.fromMap(Map<String, dynamic> map) {
+    final files = map['deviceFiles'];
+    final hasDevicePackage =
+        map['revision'] is int && files is List && files.isNotEmpty;
     return FactoryAnimation(
       id: (map['id'] as String?) ?? '',
       name: (map['name'] as String?) ?? '',
@@ -4904,7 +5475,16 @@ class FactoryAnimation {
       firstVideo: _readNullableString(map['firstVideo']),
       secondVideo: _readNullableString(map['secondVideo']),
       loopVideo: _readNullableString(map['loopVideo']),
+      transitionVideo: _readNullableString(map['transitionVideo']),
       protected: map['protected'] == true,
+      deviceFileCount: map.containsKey('deviceFiles')
+          ? (map['deviceFiles'] is List
+                ? (map['deviceFiles'] as List).length
+                : 0)
+          : null,
+      devicePackageKey: hasDevicePackage
+          ? FactoryDeviceInstall.catalogKey(map)
+          : null,
       transitions: _asStringMap(
         map['transitions'],
       ).map((k, v) => MapEntry(k, v.toString())),

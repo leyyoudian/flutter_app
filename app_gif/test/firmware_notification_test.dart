@@ -75,11 +75,14 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(const BadgeApp());
     await tester.pumpAndSettle();
-    expect(calls.where((call) => call == 'checkFirmwareUpdate'), isEmpty);
     await tester.tap(find.byKey(const ValueKey('nav-0')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('连接设备'));
-    await tester.pumpAndSettle();
+    // App launch now establishes BLE automatically. Keep a manual attempt
+    // only for rejection cases (unsupported device/version fixtures).
+    if (find.text('连接设备').evaluate().isNotEmpty) {
+      await tester.tap(find.text('连接设备'));
+      await tester.pumpAndSettle();
+    }
   }
 
   Future<void> settings(WidgetTester tester) async {

@@ -16,14 +16,6 @@
     "transitions": {}
   },
   {
-    "id": "F003",
-    "name": "F003",
-    "previewAsset": "assets/factory_previews/F003.png",
-    "firstVideo": "assets/factory_previews/F003_first.mp4",
-    "secondVideo": "assets/factory_previews/F003_second.mp4",
-    "transitions": {}
-  },
-  {
     "id": "F004",
     "name": "F004",
     "previewAsset": "assets/factory_previews/F004.png",
@@ -185,6 +177,116 @@
     "type": "loop",
     "previewAsset": "assets/factory_previews/F023.png",
     "loopVideo": "assets/factory_previews/F023_loop.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S001",
+    "name": "S001",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S001.png",
+    "firstVideo": "assets/sharingan/S001_first.mp4",
+    "secondVideo": "assets/sharingan/S001_second.mp4",
+    "transitionVideo": "assets/sharingan/S001_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S002",
+    "name": "S002",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S002.png",
+    "firstVideo": "assets/sharingan/S002_first.mp4",
+    "secondVideo": "assets/sharingan/S002_second.mp4",
+    "transitionVideo": "assets/sharingan/S002_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S003",
+    "name": "S003",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S003.png",
+    "firstVideo": "assets/sharingan/S003_first.mp4",
+    "secondVideo": "assets/sharingan/S003_second.mp4",
+    "transitionVideo": "assets/sharingan/S003_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S004",
+    "name": "S004",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S004.png",
+    "firstVideo": "assets/sharingan/S004_first.mp4",
+    "secondVideo": "assets/sharingan/S004_second.mp4",
+    "transitionVideo": "assets/sharingan/S004_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S005",
+    "name": "S005",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S005.png",
+    "firstVideo": "assets/sharingan/S005_first.mp4",
+    "secondVideo": "assets/sharingan/S005_second.mp4",
+    "transitionVideo": "assets/sharingan/S005_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S006",
+    "name": "S006",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S006.png",
+    "firstVideo": "assets/sharingan/S006_first.mp4",
+    "secondVideo": "assets/sharingan/S006_second.mp4",
+    "transitionVideo": "assets/sharingan/S006_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S007",
+    "name": "S007",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S007.png",
+    "firstVideo": "assets/sharingan/S007_first.mp4",
+    "secondVideo": "assets/sharingan/S007_second.mp4",
+    "transitionVideo": "assets/sharingan/S007_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S008",
+    "name": "S008",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S008.png",
+    "firstVideo": "assets/sharingan/S008_first.mp4",
+    "secondVideo": "assets/sharingan/S008_second.mp4",
+    "transitionVideo": "assets/sharingan/S008_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S009",
+    "name": "S009",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S009.png",
+    "firstVideo": "assets/sharingan/S009_first.mp4",
+    "secondVideo": "assets/sharingan/S009_second.mp4",
+    "transitionVideo": "assets/sharingan/S009_link.mp4",
+    "transitions": {}
+  },
+  {
+    "id": "S010",
+    "name": "S010",
+    "pack": "sharingan",
+    "protected": true,
+    "previewAsset": "assets/sharingan/S010.png",
+    "firstVideo": "assets/sharingan/S010_first.mp4",
+    "secondVideo": "assets/sharingan/S010_second.mp4",
+    "transitionVideo": "assets/sharingan/S010_link.mp4",
     "transitions": {}
   }
 ]

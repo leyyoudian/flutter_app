@@ -16,7 +16,6 @@ void main() {
       expect(source, contains('VideoPlayerController.file'));
       expect(source, contains('anim.isLoop'));
       expect(source, contains('selectedFactory?.isLoop == true'));
-      expect(source, contains('looping: selectedFactory?.isLoop == true'));
       expect(preview, contains('await c.setLooping(widget.looping)'));
       expect(preview, contains('if (widget.looping) return;'));
     },

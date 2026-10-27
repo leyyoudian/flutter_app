@@ -20,7 +20,18 @@ const factoryPacks = [
     name: 'Sharingan',
     subtitle: "The Uchiha's Cursed Eye",
     cover: 'assets/pack_covers/sharingan.jpg',
-    materialIds: [], // Contents will be chosen later; keep the cover available.
+    materialIds: [
+      'S001',
+      'S002',
+      'S003',
+      'S004',
+      'S005',
+      'S006',
+      'S007',
+      'S008',
+      'S009',
+      'S010',
+    ],
   ),
   FactoryPack(
     id: 'faceit',

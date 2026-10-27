@@ -9,6 +9,8 @@ class FactoryCatalogSync {
   const FactoryCatalogSync._();
 
   static const installFileName = 'factory_catalog_install.json';
+  // Replaced by the complete S001-S010 pack; retain firmware IDs unchanged.
+  static const retiredIds = {'F003'};
 
   static List<Map<String, dynamic>> mergeCatalogForTest({
     required List<Map<String, dynamic>> builtIn,
@@ -113,6 +115,7 @@ class FactoryCatalogSync {
       });
     }
 
+    result.removeWhere((id, _) => retiredIds.contains(id));
     final items = result.values.toList();
     items.sort(
       (a, b) => _factorySortKey(
@@ -164,6 +167,9 @@ class FactoryCatalogSync {
     final loopVideo = appFiles['loopVideo'] is Map
         ? Map<String, dynamic>.from(appFiles['loopVideo'] as Map)
         : <String, dynamic>{};
+    final transitionVideo = appFiles['transitionVideo'] is Map
+        ? Map<String, dynamic>.from(appFiles['transitionVideo'] as Map)
+        : <String, dynamic>{};
     return _normalizeAnimationMap({
       'id': id,
       'name': _readString(item['title']).isEmpty
@@ -178,6 +184,11 @@ class FactoryCatalogSync {
       'firstVideo': _preferredVideoPath(firstVideo),
       'secondVideo': _preferredVideoPath(secondVideo),
       'loopVideo': _preferredVideoPath(loopVideo),
+      'transitionVideo': _preferredVideoPath(transitionVideo),
+      // Keep the device side of the catalog separate from App-only previews.
+      // New downloadable items need a payload. Legacy F001-F023 are already
+      // installed on the device, even when the server has no download files.
+      'deviceFiles': item['deviceFiles'] is List ? item['deviceFiles'] : null,
       'transitions': item['transitions'] ?? <String, String>{},
     });
   }
@@ -191,6 +202,9 @@ class FactoryCatalogSync {
     Map<String, dynamic> item,
   ) {
     final id = _readString(item['id']);
+    final previewAsset = id == 'F022' || id == 'F023'
+        ? 'assets/factory_previews/$id.png'
+        : _readString(item['previewAsset']);
     final type = _readString(item['type']).isEmpty
         ? 'split'
         : _readString(item['type']);
@@ -200,14 +214,21 @@ class FactoryCatalogSync {
           ? id
           : _readString(item['name']),
       'type': type,
+      if (item['revision'] is int) 'revision': item['revision'],
       'protected': item['protected'] == true || _isProtectedBaseline(id),
-      'previewAsset': _readString(item['previewAsset']),
+      'previewAsset': previewAsset,
       if (_readString(item['firstVideo']).isNotEmpty)
         'firstVideo': _readString(item['firstVideo']),
       if (_readString(item['secondVideo']).isNotEmpty)
         'secondVideo': _readString(item['secondVideo']),
       if (_readString(item['loopVideo']).isNotEmpty)
         'loopVideo': _readString(item['loopVideo']),
+      if (_readString(item['transitionVideo']).isNotEmpty)
+        'transitionVideo': _readString(item['transitionVideo']),
+      if (item.containsKey('deviceFiles'))
+        'deviceFiles': item['deviceFiles'] is List
+            ? List<dynamic>.from(item['deviceFiles'] as List)
+            : <dynamic>[],
       'transitions': item['transitions'] is Map
           ? Map<String, dynamic>.from(item['transitions'] as Map)
           : <String, dynamic>{},
@@ -371,6 +392,7 @@ class FactoryCatalogSync {
   }
 
   static bool _isProtectedBaseline(String id) {
+    if (RegExp(r'^S(?:00[1-9]|010)$').hasMatch(id)) return true;
     final match = RegExp(r'^F(\d{3})$').firstMatch(id);
     if (match == null) return false;
     final number = int.tryParse(match.group(1) ?? '') ?? 0;

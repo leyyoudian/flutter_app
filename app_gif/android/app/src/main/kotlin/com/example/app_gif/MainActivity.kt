@@ -103,6 +103,10 @@ class MainActivity : FlutterActivity() {
     @Volatile private var badgeSdAvailable = false
     @Volatile private var badgeHardware = "esp32p4"
     @Volatile private var badgeWifiManagedRequest = false
+    // Hold the requested AP across the OS dialog, identity check and upload.
+    // A resume-triggered firmware check must not unregister this request.
+    @Volatile private var badgeTransferLease = false
+    private val transferNetworkLock = Any()
     @Volatile private var badgeDirectIpMode = false
     @Volatile private var activeBadgeHost = BADGE_AP_HOST
     @Volatile private var connectionStatusMisses = 0
@@ -112,7 +116,9 @@ class MainActivity : FlutterActivity() {
     private var uploadWifiLock: WifiManager.WifiLock? = null
     private var tcpUploadSocket: Socket? = null
     private val gameBluetooth by lazy { GameBluetoothController(this) }
+    private val swingMotion by lazy { PhoneSwingController(this) }
     private var pendingGamePermission: MethodChannel.Result? = null
+    private var pendingGameAutomatic = false
     private var pendingApPermission: MethodChannel.Result? = null
     private class BackendUnavailable(message: String) : java.io.IOException(message)
 
@@ -147,7 +153,13 @@ class MainActivity : FlutterActivity() {
         requestWifiPermissionsIfNeeded()
     }
 
+    override fun onPause() {
+        swingMotion.stop()
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        swingMotion.stop()
         gameBluetooth.close()
         stopScan()
         stopUploadKeepAlive()
@@ -201,6 +213,7 @@ class MainActivity : FlutterActivity() {
                     "name" to name,
                     "size" to if (size >= 0) size else (bytes?.size ?: 0),
                     "mime" to mime,
+                    "durationMs" to mediaDurationMs(uri, mime, bytes),
                     "previewBytes" to previewBytes,
                     "animatedPreviewPath" to animatedPreviewPath,
                 )
@@ -232,7 +245,7 @@ class MainActivity : FlutterActivity() {
             val pending = pendingGamePermission
             pendingGamePermission = null
             if (pending != null) {
-                if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) gameBluetooth.connect(pending)
+                if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) gameBluetooth.connect(pending, automatic = pendingGameAutomatic)
                 else pending.error("bluetooth_permission", "请允许附近设备／蓝牙权限后重试", null)
             }
             return
@@ -314,9 +327,10 @@ class MainActivity : FlutterActivity() {
                 val permissions = if (Build.VERSION.SDK_INT >= 31) listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
                     else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
                 if (Build.VERSION.SDK_INT >= 23 && permissions.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
-                    if (pendingGamePermission != null) result.error("bluetooth_busy", "正在等待蓝牙权限", null)
-                    else { pendingGamePermission = result; requestPermissions(permissions.toTypedArray(), 8103) }
-                } else gameBluetooth.connect(result)
+                    if (call.argument<Boolean>("requestPermissions") == false) result.error("bluetooth_permission", "请允许附近设备／蓝牙权限后重试", null)
+                    else if (pendingGamePermission != null) result.error("bluetooth_busy", "正在等待蓝牙权限", null)
+                    else { pendingGamePermission = result; pendingGameAutomatic = call.argument<Boolean>("automatic") == true; requestPermissions(permissions.toTypedArray(), 8103) }
+                } else gameBluetooth.connect(result, automatic = call.argument<Boolean>("automatic") == true)
             }
             "gameCommand" -> gameBluetooth.send(call.argument<String>("action") ?: "status", result)
             "releaseGameBluetooth" -> { gameBluetooth.close(); result.success(null) }
@@ -328,17 +342,20 @@ class MainActivity : FlutterActivity() {
                     else { pendingApPermission = result; requestPermissions(requiredAppPermissions().toTypedArray(), 8104) }
                 } else joinDeviceAccessPoint(result)
             }
-            "leaveDeviceAccessPoint" -> { releaseBadgeWifi(); result.success(null) }
+            "leaveDeviceAccessPoint" -> { synchronized(transferNetworkLock) { badgeTransferLease = false; releaseBadgeWifi() }; result.success(null) }
             "checkFirmwareUpdate", "downloadFirmware", "uploadFirmware" -> {
                 val method = call.method
                 val args = (call.arguments as? Map<*, *>)?.entries
                     ?.associate { it.key.toString() to it.value } ?: emptyMap()
-                if (isUploading) { result.error("firmware_busy", "设备正在传输文件", null); return }
+                if (isUploading || (badgeTransferLease && method != "uploadFirmware")) { result.error("firmware_busy", "设备正在传输文件", null); return }
                 val uploadingFirmware = method == "uploadFirmware"
                 if (uploadingFirmware) isUploading = true
                 Thread {
                     try {
-                        if (!uploadingFirmware) releaseBadgeWifi()
+                        if (!uploadingFirmware) synchronized(transferNetworkLock) {
+                            check(!badgeTransferLease) { "设备正在传输文件" }
+                            releaseBadgeWifi()
+                        }
                         val transfer = FirmwareTransfer(
                             File(filesDir, "firmware"),
                             internet = { url -> url.openConnection() as HttpURLConnection },
@@ -372,6 +389,34 @@ class MainActivity : FlutterActivity() {
             }
             "cancelCalibration" -> calibrationCommand("cancel", null, false, result)
             "pickMedia" -> pickMedia(result)
+            "videoFramePreview" -> {
+                val uri = call.argument<String>("uri")
+                if (uri.isNullOrBlank()) {
+                    result.error("bad_uri", "素材地址为空", null)
+                    return
+                }
+                val frame = (call.argument<Double>("coverFrame") ?: 0.0).coerceIn(0.0, 1.0)
+                val crop = CropTransform(
+                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(0.5, 4.0),
+                    offsetX = (call.argument<Double>("cropOffsetX") ?: 0.0).coerceIn(-1.5, 1.5),
+                    offsetY = (call.argument<Double>("cropOffsetY") ?: 0.0).coerceIn(-1.5, 1.5),
+                )
+                videoFramePreview(uri, frame, crop, result)
+            }
+            "saveMaterialCover" -> {
+                val bytes = call.argument<ByteArray>("bytes")
+                if (bytes == null || bytes.isEmpty()) {
+                    result.error("bad_cover", "封面为空", null)
+                    return
+                }
+                try {
+                    val file = File(persistentAssetDirectory("ebaj"), "${UUID.randomUUID()}_cover.png")
+                    file.writeBytes(bytes)
+                    result.success(file.absolutePath)
+                } catch (error: Exception) {
+                    result.error("cover_save_failed", error.message ?: "封面保存失败", null)
+                }
+            }
             "warmVideoAnimatedPreview" -> {
                 val uri = call.argument<String>("uri")
                 if (uri.isNullOrBlank()) {
@@ -393,12 +438,77 @@ class MainActivity : FlutterActivity() {
                     ?: resolveBadgePackageBudget(badgeSdAvailable))
                     .coerceAtLeast(HEADER_SIZE + FRAME_ENTRY_SIZE + PALETTE_BYTES + STREAM_240_PIXELS)
                 val crop = CropTransform(
-                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(1.0, 4.0),
+                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(0.5, 4.0),
                     offsetX = (call.argument<Double>("cropOffsetX") ?: 0.0).coerceIn(-1.5, 1.5),
                     offsetY = (call.argument<Double>("cropOffsetY") ?: 0.0).coerceIn(-1.5, 1.5),
                 )
+                val coverFrame = (call.argument<Double>("coverFrame") ?: 0.0).coerceIn(0.0, 1.0)
                 val warmPreviewPath = call.argument<String>("warmPreviewPath")
-                prepareAsset(uri, name, fps, maxPackageBytes, crop, warmPreviewPath, result)
+                prepareAsset(uri, name, fps, maxPackageBytes, crop, coverFrame, warmPreviewPath, result)
+            }
+            "startSwingMotion" -> { gameBluetooth.setInteractive(true); result.success(swingMotion.start()) }
+            "readSwingMotion" -> result.success(swingMotion.read())
+            "calibrateSwingMotion" -> { swingMotion.calibrate(); result.success(null) }
+            "stopSwingMotion" -> { swingMotion.stop(); gameBluetooth.setInteractive(false); result.success(null) }
+            "installFactoryPackage", "installGamePackage" -> {
+                val isGame = call.method == "installGamePackage"
+                val path = call.argument<String>("assetPath")
+                val expectedKey = call.argument<String>("deviceKey")
+                val expectedHash = call.argument<String>("sha256")
+                val id = call.argument<String>("id")
+                if (path == null || expectedKey == null || expectedHash == null || id == null || isUploading) {
+                    result.error("factory_invalid", "素材参数无效或设备正在传输", null); return
+                }
+                isUploading = true
+                Thread {
+                    try {
+                        acquireUploadWifiLock()
+                        val file = File(path)
+                        val digest = java.security.MessageDigest.getInstance("SHA-256")
+                        file.inputStream().use { input -> val buffer = ByteArray(65536); while (true) { val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) } }
+                        val actual = digest.digest().joinToString("") { "%02x".format(it) }
+                        require(actual == expectedHash && file.length() in 1..(if (isGame) 131072L else 64L * 1024 * 1024 + 8200)) { "素材包校验失败" }
+                        require(readDeviceIdentity() == expectedKey) { "热点设备身份不一致" }
+                        val network = activeBadgeNetworkForRequest(fastUpload = true)
+                        val endpoint = if (isGame) "games" else "factory"
+                        val url = java.net.URL("http://$activeBadgeHost/$endpoint/install")
+                        val probe = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+                        try {
+                            probe.connectTimeout = 10000; probe.readTimeout = 15000; probe.instanceFollowRedirects = false
+                            require(probe.responseCode == 200) { "设备固件尚不支持手机安装出厂素材，需要先更新固件" }
+                            val capability = org.json.JSONObject(probe.inputStream.bufferedReader().use { it.readText() })
+                            require(capability.optInt("protocol") == 1 && capability.optString("deviceKey") == expectedKey) { "设备安装协议或身份不一致" }
+                        } finally { probe.disconnect() }
+                        val connection = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+                        try {
+                            connection.requestMethod = "POST"; connection.doOutput = true
+                            connection.connectTimeout = 15000; connection.readTimeout = 120000; connection.instanceFollowRedirects = false
+                            connection.setRequestProperty("Content-Type", "application/octet-stream")
+                            connection.setRequestProperty("X-Device-Key", expectedKey)
+                            if (isGame) {
+                                require(id.matches(Regex("[a-z0-9_]{1,24}"))) { "游戏编号无效" }
+                                connection.setRequestProperty("X-Game-Id", id)
+                                connection.setRequestProperty("X-Content-SHA256", expectedHash)
+                            }
+                            connection.setFixedLengthStreamingMode(file.length())
+                            connection.outputStream.use { output -> file.inputStream().use { input ->
+                                val buffer = ByteArray(65536); var sent = 0L
+                                while (true) { val n = input.read(buffer); if (n < 0) break; output.write(buffer,0,n); sent += n
+                                    sendEvent(mapOf("type" to "uploadProgress", "progress" to (.45 + .5 * sent / file.length()), "message" to "安装设备素材")) }
+                            } }
+                            val status = connection.responseCode
+                            if (status == 404) error("设备固件尚不支持手机安装出厂素材，需要先更新固件")
+                            val text = (if (status in 200..299) connection.inputStream else connection.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                            require(status in 200..299) { "设备安装失败 ($status): ${text.take(160)}" }
+                            val reply = org.json.JSONObject(text)
+                            require(reply.optBoolean("installed") && reply.optString("id") == id && reply.optString("deviceKey") == expectedKey) { "设备安装确认无效" }
+                            isUploading = false
+                            mainHandler.post { result.success(mapOf("installed" to true,"id" to id,"deviceKey" to expectedKey)) }
+                        } finally { connection.disconnect() }
+                    } catch (error: Exception) {
+                        mainHandler.post { result.error("factory_install_failed", error.message ?: "安装失败，请重新点选重试", null) }
+                    } finally { isUploading = false; releaseUploadWifiLock(keepIfConnected = true) }
+                }.start()
             }
             "uploadAsset" -> {
                 val assetPath = call.argument<String>("assetPath")
@@ -417,7 +527,7 @@ class MainActivity : FlutterActivity() {
                 val name = call.argument<String>("name") ?: "asset"
                 val maxFps = (call.argument<Int>("maxFps") ?: 80).coerceIn(1, 80)
                 val crop = CropTransform(
-                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(1.0, 4.0),
+                    scale = (call.argument<Double>("cropScale") ?: 1.0).coerceIn(0.5, 4.0),
                     offsetX = (call.argument<Double>("cropOffsetX") ?: 0.0).coerceIn(-1.5, 1.5),
                     offsetY = (call.argument<Double>("cropOffsetY") ?: 0.0).coerceIn(-1.5, 1.5),
                 )
@@ -1018,12 +1128,49 @@ class MainActivity : FlutterActivity() {
         startActivityForResult(intent, REQUEST_PICK_MEDIA)
     }
 
+    private fun videoDurationMs(uri: Uri): Long {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(this, uri)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } finally {
+            retriever.release()
+        }
+    }
+
+    private fun mediaDurationMs(uri: Uri, mime: String, source: ByteArray? = null): Long {
+        if (isVideoMime(mime)) return videoDurationMs(uri)
+        if (mime != "image/gif") return 0L
+        val bytes = source ?: readUriBytes(uri)
+        val movie = Movie.decodeByteArray(bytes, 0, bytes.size)
+        return max(1L, movie?.duration()?.toLong() ?: 0L)
+    }
+
+    // Keep the original bridge name compatible while supporting GIF timelines too.
+    private fun videoFramePreview(uriText: String, frameFraction: Double, crop: CropTransform, result: MethodChannel.Result) {
+        Thread {
+            try {
+                val uri = Uri.parse(uriText)
+                val mime = normalizeMime(contentResolver.getType(uri), queryName(uri))
+                val source = if (isVideoMime(mime)) null else readUriBytes(uri)
+                val duration = mediaDurationMs(uri, mime, source)
+                val timeMs = (duration * frameFraction).toLong().coerceIn(0L, max(0L, duration - 1L))
+                val bytes = buildPreviewBytes(uri, mime, source, crop, timeMs)
+                    ?: throw IllegalArgumentException("无法读取所选视频帧")
+                mainHandler.post { result.success(mapOf("previewBytes" to bytes, "durationMs" to duration, "timeMs" to timeMs)) }
+            } catch (error: Exception) {
+                mainHandler.post { result.error("frame_preview_failed", error.message ?: "视频帧读取失败", null) }
+            }
+        }.start()
+    }
+
     private fun prepareAsset(
         uriText: String,
         displayName: String,
         fps: Int,
         maxPackageBytes: Int,
         crop: CropTransform,
+        coverFrame: Double,
         warmPreviewPath: String?,
         result: MethodChannel.Result,
     ) {
@@ -1031,8 +1178,8 @@ class MainActivity : FlutterActivity() {
             try {
                 val totalStartMs = System.currentTimeMillis()
                 val uri = Uri.parse(uriText)
-                preparingVideoUri.set(if (isVideoMime(normalizeMime(contentResolver.getType(uri), displayName))) uriText else null)
-                val mime = normalizeMime(contentResolver.getType(uri), displayName)
+                val mime = normalizeMime(contentResolver.getType(uri), queryName(uri))
+                preparingVideoUri.set(if (isVideoMime(mime)) uriText else null)
                 val size = querySize(uri)
                 if (isVideoMime(mime) && size > MAX_VIDEO_INPUT_BYTES) {
                     throw IllegalArgumentException("视频文件过大")
@@ -1049,7 +1196,13 @@ class MainActivity : FlutterActivity() {
                 file.writeBytes(encoded.packageBytes)
                 val writeMs = System.currentTimeMillis() - writeStartMs
                 val previewStartMs = System.currentTimeMillis()
-                val previewPath = buildPreviewBytes(uri, mime, null, crop)?.let { preview ->
+                val coverTimeMs = if (isVideoMime(mime) || mime == "image/gif") {
+                    val duration = mediaDurationMs(uri, mime)
+                    (duration * coverFrame).toLong().coerceIn(0L, max(0L, duration - 1L))
+                } else {
+                    0L
+                }
+                val previewPath = buildPreviewBytes(uri, mime, null, crop, coverTimeMs)?.let { preview ->
                     File(directory, "$stem.png").also { it.writeBytes(preview) }.absolutePath
                 }
                 val animatedPreviewPath = if (isVideoMime(mime)) {
@@ -1921,6 +2074,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun joinDeviceAccessPoint(result: MethodChannel.Result) {
+        synchronized(transferNetworkLock) { badgeTransferLease = true }
         Thread {
             try {
                 releaseBadgeWifi()
@@ -1928,6 +2082,8 @@ class MainActivity : FlutterActivity() {
                 ensureBadgeWifiNetwork(fastUpload = true, forceAp = true)
                 runOnUiThread { result.success(true) }
             } catch (e: Exception) {
+                badgeTransferLease = false
+                releaseBadgeWifi()
                 runOnUiThread { result.error("wifi_connect", e.message ?: "请连接 DotLoop 热点后重试", null) }
             }
         }.start()
@@ -2872,15 +3028,16 @@ class MainActivity : FlutterActivity() {
         mime: String,
         source: ByteArray?,
         crop: CropTransform,
+        frameTimeMs: Long = 0L,
     ): ByteArray? {
         val bitmap = runCatching {
                 if (isVideoMime(mime)) {
-                    renderVideoFrame(this, uri, PREVIEW_SIZE, PREVIEW_SIZE, crop)
+                    renderVideoFrame(this, uri, PREVIEW_SIZE, PREVIEW_SIZE, crop, frameTimeMs)
                 } else {
                     val bytes = source ?: readUriBytes(uri)
                     val movie = Movie.decodeByteArray(bytes, 0, bytes.size)
                 if (movie != null && movie.width() > 0 && movie.height() > 0) {
-                    movie.setTime(0)
+                    movie.setTime(frameTimeMs.coerceIn(0L, max(0L, movie.duration().toLong() - 1L)).toInt())
                     renderMovieFrame(movie, PREVIEW_SIZE, PREVIEW_SIZE, crop)
                 } else {
                     val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
@@ -3027,6 +3184,7 @@ class MainActivity : FlutterActivity() {
         return mapOf(
                 "assetPath" to item.optString("assetPath"),
                 "previewPath" to item.optString("previewPath"),
+                "previewCropApplied" to item.optBoolean("previewCropApplied", false),
                 "animatedPreviewPath" to item.optString("animatedPreviewPath"),
                 "sourceUri" to item.optString("sourceUri"),
                 "mime" to item.optString("mime"),
@@ -3057,7 +3215,7 @@ class MainActivity : FlutterActivity() {
         val name = repaired.optString("name").ifBlank { "asset" }
         val mime = normalizeMime(repaired.optString("mime"), name)
         val crop = CropTransform(
-            scale = repaired.optDouble("cropScale", 1.0).coerceIn(1.0, 4.0),
+            scale = repaired.optDouble("cropScale", 1.0).coerceIn(0.5, 4.0),
             offsetX = repaired.optDouble("cropOffsetX", 0.0).coerceIn(-1.5, 1.5),
             offsetY = repaired.optDouble("cropOffsetY", 0.0).coerceIn(-1.5, 1.5),
         )
@@ -3148,6 +3306,7 @@ class MainActivity : FlutterActivity() {
             val item = JSONObject()
             item.put("assetPath", map["assetPath"])
             item.put("previewPath", map["previewPath"])
+            item.put("previewCropApplied", map["previewCropApplied"] == true)
             item.put("animatedPreviewPath", map["animatedPreviewPath"])
             item.put("sourceUri", map["sourceUri"])
             item.put("mime", map["mime"])
@@ -4370,10 +4529,11 @@ class MainActivity : FlutterActivity() {
             width: Int,
             height: Int,
             crop: CropTransform,
+            frameTimeMs: Long = 0L,
         ): Bitmap {
             val retriever = createRetriever(context, uri)
             try {
-                val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                val frame = retriever.getFrameAtTime(frameTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST)
                     ?: throw IllegalArgumentException("无法读取视频预览")
                 return renderBitmapFrame(frame, width, height, crop)
             } finally {

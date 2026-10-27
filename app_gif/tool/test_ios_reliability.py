@@ -53,10 +53,11 @@ class CBPeripheral: NSObject {
 class CBCentralManager: NSObject {
   var state = CBManagerState.poweredOn
   var cancellations = 0
+  var connectedPeripheral: CBPeripheral?
   init(delegate: CBCentralManagerDelegate, queue: DispatchQueue) {}
   func scanForPeripherals(withServices ids: [CBUUID]) {}
   func stopScan() {}
-  func connect(_ peripheral: CBPeripheral) {}
+  func connect(_ peripheral: CBPeripheral) { connectedPeripheral = peripheral }
   func cancelPeripheralConnection(_ peripheral: CBPeripheral) { cancellations += 1 }
 }
 var checks = 0
@@ -66,6 +67,42 @@ func check(_ condition: @autoclosure () -> Bool, _ label: String) {
 '''
 
 BLE_FIXTURES = r'''
+func reconnectSelectionChecks() {
+  let key = "dotloop_last_bluetooth_device"
+  let original = UserDefaults.standard.string(forKey: key)
+  defer {
+    if let original = original { UserDefaults.standard.set(original, forKey: key) }
+    else { UserDefaults.standard.removeObject(forKey: key) }
+  }
+  let remembered = CBPeripheral(), other = CBPeripheral()
+  func attempt(_ devices: [CBPeripheral], automatic: Bool) -> CBCentralManager {
+    let session = GameBluetoothController()
+    session.connect(automatic: automatic) { _ in }
+    session.scan()
+    for device in devices { session.candidates[device.identifier] = device }
+    let central = session.central!
+    session.scanEnd!.perform()
+    session.close()
+    return central
+  }
+  UserDefaults.standard.set(remembered.identifier.uuidString, forKey: key)
+  check(attempt([remembered, other], automatic: true).connectedPeripheral === remembered, "Reconnect remembered device among several")
+  let fastSession = GameBluetoothController()
+  fastSession.connect(automatic: true) { _ in }
+  fastSession.scan()
+  let fastDevice = CBPeripheral()
+  UserDefaults.standard.set(fastDevice.identifier.uuidString, forKey: key)
+  fastSession.centralManager(fastSession.central!, didDiscover: fastDevice, advertisementData: [:], rssi: 0)
+  check(fastSession.central?.connectedPeripheral === fastDevice, "Connect immediately when remembered device advertises")
+  fastSession.close()
+  check(attempt([other], automatic: true).connectedPeripheral == nil, "Never automatically connect a different board")
+  check(attempt([other], automatic: false).connectedPeripheral === other, "Manual connect permits replacement board")
+  UserDefaults.standard.removeObject(forKey: key)
+  check(attempt([remembered, other], automatic: true).connectedPeripheral == nil, "First connection with several devices stays unselected")
+  check(attempt([other], automatic: true).connectedPeripheral === other, "First connection with one device")
+}
+reconnectSelectionChecks()
+
 func connected() -> (GameBluetoothController, CBPeripheral, CBCharacteristic) {
   let controller = GameBluetoothController()
   let device = CBPeripheral(), characteristic = CBCharacteristic()

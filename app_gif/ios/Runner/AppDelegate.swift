@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreBluetooth
 import CoreGraphics
+import CoreMotion
 import CoreMedia
 import CoreVideo
 import CryptoKit
@@ -70,6 +71,7 @@ struct BadgeTcpLineBuffer {
   private var uploadPreviousIdleTimerDisabled: Bool?
   private lazy var gameBluetooth = GameBluetoothController()
   private let interactionFeedback = UIImpactFeedbackGenerator(style: .heavy)
+  private let swingMotion = DotLoopSwingMotion()
 
   override func application(
     _ application: UIApplication,
@@ -126,7 +128,7 @@ struct BadgeTcpLineBuffer {
       UserDefaults.standard.set(language, forKey: "app_language")
       result(nil)
     case "ensureGameBluetooth", "ensureDeviceBluetooth":
-      gameBluetooth.connect(result: result)
+      gameBluetooth.connect(automatic: args["automatic"] as? Bool ?? false, result: result)
     case "deviceBluetoothState":
       gameBluetooth.connectionInfo(result: result)
     case "deviceBluetoothCommand":
@@ -197,6 +199,32 @@ struct BadgeTcpLineBuffer {
       }
     case "pickMedia":
       pickMedia(result: result)
+    case "videoFramePreview":
+      guard let uriText = args["uri"] as? String else {
+        result(FlutterError(code: "bad_uri", message: "素材地址为空", details: nil))
+        return
+      }
+      videoFramePreview(
+        uriText: uriText,
+        frameFraction: args["coverFrame"] as? Double ?? 0,
+        crop: CropTransform(
+          scale: min(4.0, max(0.5, args["cropScale"] as? Double ?? 1.0)),
+          offsetX: min(1.5, max(-1.5, args["cropOffsetX"] as? Double ?? 0.0)),
+          offsetY: min(1.5, max(-1.5, args["cropOffsetY"] as? Double ?? 0.0))
+        ),
+        result: result
+      )
+    case "saveMaterialCover":
+      guard let bytes = (args["bytes"] as? FlutterStandardTypedData)?.data, !bytes.isEmpty else {
+        result(FlutterError(code: "bad_cover", message: "封面为空", details: nil))
+        return
+      }
+      do {
+        let path = try writeCacheFile(data: bytes, directoryName: "ebaj", stem: "\(UUID().uuidString)_cover", ext: "png")
+        result(path)
+      } catch {
+        result(FlutterError(code: "cover_save_failed", message: error.localizedDescription, details: nil))
+      }
     case "warmVideoAnimatedPreview":
       guard let uri = args["uri"] as? String else {
         result(FlutterError(code: "bad_uri", message: "素材地址为空", details: nil))
@@ -216,19 +244,30 @@ struct BadgeTcpLineBuffer {
         BadgeConstants.headerSize + BadgeConstants.frameEntrySize + BadgeConstants.paletteBytes + BadgeConstants.stream240Pixels
       )
       let crop = CropTransform(
-        scale: min(4.0, max(1.0, args["cropScale"] as? Double ?? 1.0)),
+        scale: min(4.0, max(0.5, args["cropScale"] as? Double ?? 1.0)),
         offsetX: min(1.5, max(-1.5, args["cropOffsetX"] as? Double ?? 0.0)),
         offsetY: min(1.5, max(-1.5, args["cropOffsetY"] as? Double ?? 0.0))
       )
+      let coverFrame = min(1.0, max(0.0, args["coverFrame"] as? Double ?? 0.0))
       prepareAsset(
         uriText: uri,
         displayName: name,
         fps: fps,
         maxPackageBytes: maxPackageBytes,
         crop: crop,
+        coverFrame: coverFrame,
         warmPreviewPath: args["warmPreviewPath"] as? String,
+        outputDirectoryName: "ebaj",
         result: result
       )
+    case "startSwingMotion": result(swingMotion.start())
+    case "readSwingMotion": result(swingMotion.read())
+    case "calibrateSwingMotion": swingMotion.calibrate(); result(nil)
+    case "stopSwingMotion": swingMotion.stop(); result(nil)
+    case "installGamePackage":
+      installFactoryPackage(args: args, isGame: true, result: result)
+    case "installFactoryPackage":
+      installFactoryPackage(args: args, result: result)
     case "uploadAsset":
       guard let path = args["assetPath"] as? String else {
         result(FlutterError(code: "bad_asset", message: "素材包为空", details: nil))
@@ -243,7 +282,7 @@ struct BadgeTcpLineBuffer {
       let name = args["name"] as? String ?? "asset"
       let maxFps = min(80, max(1, args["maxFps"] as? Int ?? 80))
       let crop = CropTransform(
-        scale: min(4.0, max(1.0, args["cropScale"] as? Double ?? 1.0)),
+        scale: min(4.0, max(0.5, args["cropScale"] as? Double ?? 1.0)),
         offsetX: min(1.5, max(-1.5, args["cropOffsetX"] as? Double ?? 0.0)),
         offsetY: min(1.5, max(-1.5, args["cropOffsetY"] as? Double ?? 0.0))
       )
@@ -863,14 +902,58 @@ struct BadgeTcpLineBuffer {
     } else {
       animatedPreviewPath = nil
     }
+    let durationMs = mediaDurationMs(local, mime: mime)
     return [
       "uri": local.absoluteString,
       "name": local.lastPathComponent,
       "size": size,
       "mime": mime,
+      "durationMs": durationMs,
       "previewBytes": FlutterStandardTypedData(bytes: previewBytes),
       "animatedPreviewPath": nullable(animatedPreviewPath),
     ]
+  }
+
+  private func videoDurationMs(_ url: URL) -> Int {
+    let seconds = CMTimeGetSeconds(AVAsset(url: url).duration)
+    return seconds.isFinite ? max(0, Int(seconds * 1000.0)) : 0
+  }
+
+  private func gifFrameDelaysMs(_ source: CGImageSource) -> [Int] {
+    return (0..<CGImageSourceGetCount(source)).map { index in
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+      let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+      let unclamped = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? NSNumber)?.doubleValue ?? 0
+      let clamped = (gif?[kCGImagePropertyGIFDelayTime] as? NSNumber)?.doubleValue ?? 0
+      let seconds = unclamped.isFinite && unclamped > 0 ? unclamped : clamped
+      return seconds.isFinite && seconds > 0 ? max(1, Int((seconds * 1000).rounded())) : 100
+    }
+  }
+
+  private func mediaDurationMs(_ url: URL, mime: String) -> Int {
+    if isVideoMime(mime) { return videoDurationMs(url) }
+    guard mime == "image/gif", let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return 0 }
+    return gifFrameDelaysMs(source).reduce(0, +)
+  }
+
+  private func videoFramePreview(uriText: String, frameFraction: Double, crop: CropTransform, result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let url = try self.url(from: uriText)
+        let mime = self.mimeType(for: url)
+        let durationMs = self.mediaDurationMs(url, mime: mime)
+        let fraction = min(1.0, max(0.0, frameFraction))
+        let timeMs = min(max(0, durationMs - 1), Int(Double(durationMs) * fraction))
+        let bytes = try self.buildPreviewData(url: url, mime: mime, crop: crop, frameTimeMs: timeMs)
+        DispatchQueue.main.async {
+          result(["previewBytes": FlutterStandardTypedData(bytes: bytes), "durationMs": durationMs, "timeMs": timeMs])
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "frame_preview_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
   }
 
   private func loadPickedMediaFile(
@@ -936,7 +1019,9 @@ struct BadgeTcpLineBuffer {
     fps: Int,
     maxPackageBytes: Int,
     crop: CropTransform,
+    coverFrame: Double,
     warmPreviewPath: String?,
+    outputDirectoryName: String,
     result: @escaping FlutterResult
   ) {
     DispatchQueue.global(qos: .userInitiated).async {
@@ -952,10 +1037,12 @@ struct BadgeTcpLineBuffer {
         }
         let encoded = try encoder.encode(url: url, mime: mime, requestedFps: fps, maxPackageBytes: maxPackageBytes, crop: crop)
         let stem = "\(Int(Date().timeIntervalSince1970 * 1000))_\(self.safeFileName(displayName))"
-        let assetPath = try self.writeCacheFile(data: encoded.packageBytes, directoryName: "ebaj", stem: stem, ext: "ebaj")
+        let assetPath = try self.writeCacheFile(data: encoded.packageBytes, directoryName: outputDirectoryName, stem: stem, ext: "ebaj")
+        let durationMs = self.mediaDurationMs(url, mime: mime)
+        let coverTimeMs = min(max(0, durationMs - 1), Int(Double(durationMs) * coverFrame))
         let previewPath = try? self.writeCacheFile(
-          data: self.buildPreviewData(url: url, mime: mime, crop: crop),
-          directoryName: "ebaj",
+          data: self.buildPreviewData(url: url, mime: mime, crop: crop, frameTimeMs: coverTimeMs),
+          directoryName: outputDirectoryName,
           stem: stem,
           ext: "png"
         )
@@ -964,12 +1051,12 @@ struct BadgeTcpLineBuffer {
           if let warmPreviewPath,
              FileManager.default.fileExists(atPath: URL(fileURLWithPath: warmPreviewPath).path) {
             let gifData = try Data(contentsOf: URL(fileURLWithPath: warmPreviewPath))
-            animatedPreviewPath = try self.writeCacheFile(data: gifData, directoryName: "ebaj", stem: stem, ext: "gif")
+            animatedPreviewPath = try self.writeCacheFile(data: gifData, directoryName: outputDirectoryName, stem: stem, ext: "gif")
           } else {
             animatedPreviewPath = nil
           }
         } else if self.isGif(url) {
-          animatedPreviewPath = try self.copyAnimatedPreview(source: url, directoryName: "ebaj", stem: stem)
+          animatedPreviewPath = try self.copyAnimatedPreview(source: url, directoryName: outputDirectoryName, stem: stem)
         } else {
           animatedPreviewPath = nil
         }
@@ -991,7 +1078,7 @@ struct BadgeTcpLineBuffer {
           self.scheduleVideoAnimatedPreview(
             url: url,
             uriText: url.absoluteString,
-            directoryName: "ebaj",
+            directoryName: outputDirectoryName,
             stem: stem,
             crop: crop,
             eventType: "assetPreviewReady",
@@ -1038,6 +1125,102 @@ struct BadgeTcpLineBuffer {
       } catch {
       }
     }
+  }
+
+  private func installFactoryPackage(args: [String: Any], isGame: Bool = false, result: @escaping FlutterResult) {
+    guard let path = args["assetPath"] as? String,
+          let key = args["deviceKey"] as? String,
+          let expectedHash = args["sha256"] as? String,
+          let id = args["id"] as? String, !isUploading else {
+      result(FlutterError(code: "factory_invalid", message: "素材参数无效或设备正在传输", details: nil))
+      return
+    }
+    isUploading = true
+    DispatchQueue.global(qos: .userInitiated).async {
+      self.beginUploadBackgroundTask()
+      defer { self.isUploading = false; self.endUploadBackgroundTask() }
+      do {
+        let file = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: file, options: .mappedIfSafe)
+        let actualHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard data.count > 0, data.count <= (isGame ? 131072 : 64 * 1024 * 1024 + 8200), actualHash == expectedHash,
+              self.parseDeviceKey(try self.sendRawTcpCommand("IDENTITY\n")) == key,
+              let url = URL(string: "http://\(self.activeBadgeHost)/\(isGame ? "games" : "factory")/install") else {
+          throw transferFailure("factory_invalid", "素材校验失败或热点设备身份不一致")
+        }
+        let capability = try self.factoryInstallRequest(URLRequest(url: url))
+        guard capability["protocol"] as? Int == 1, capability["deviceKey"] as? String == key else {
+          throw transferFailure("factory_invalid", "设备安装协议或身份不一致")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(key, forHTTPHeaderField: "X-Device-Key")
+        if isGame {
+          guard id.range(of: "^[a-z0-9_]{1,24}$", options: .regularExpression) != nil else {
+            throw transferFailure("game_invalid", "游戏编号无效")
+          }
+          request.setValue(id, forHTTPHeaderField: "X-Game-Id")
+          request.setValue(expectedHash, forHTTPHeaderField: "X-Content-SHA256")
+        }
+        request.setValue(String(data.count), forHTTPHeaderField: "Content-Length")
+        let reply = try self.factoryInstallRequest(request, uploadFile: file)
+        guard reply["installed"] as? Bool == true, reply["id"] as? String == id,
+              reply["deviceKey"] as? String == key else {
+          throw transferFailure("factory_invalid", "设备安装确认无效")
+        }
+        self.sendEvent(["type": "uploadProgress", "progress": 0.98, "message": "素材已安装"])
+        self.isUploading = false
+        DispatchQueue.main.async { result(reply) }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "factory_install_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
+  private func factoryInstallRequest(_ original: URLRequest, uploadFile: URL? = nil) throws -> [String: Any] {
+    var request = original
+    request.timeoutInterval = 150
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForResource = 180
+    var progress = RelayInstallProgress()
+    let delegate = RelayNoRedirectDelegate(onUploadProgress: { [weak self] sent, total in
+      guard let value = progress.update(sent: sent, total: total,
+                                        now: ProcessInfo.processInfo.systemUptime) else { return }
+      self?.sendEvent(["type": "uploadProgress", "progress": value, "message": "安装设备素材"])
+    })
+    let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+    defer { session.invalidateAndCancel() }
+    let semaphore = DispatchSemaphore(value: 0)
+    var output = Data()
+    var status = 0
+    var failure: Error?
+    let completion: (Data?, URLResponse?, Error?) -> Void = { data, response, error in
+      output = data ?? Data(); status = (response as? HTTPURLResponse)?.statusCode ?? 0
+      failure = error; semaphore.signal()
+    }
+    let task: URLSessionTask = uploadFile == nil
+      ? session.dataTask(with: request, completionHandler: completion)
+      : session.uploadTask(with: request, fromFile: uploadFile!, completionHandler: completion)
+    task.resume()
+    guard semaphore.wait(timeout: .now() + 185) != .timedOut else {
+      task.cancel()
+      throw transferFailure("factory_timeout", "素材传输超时，请重新点选重试")
+    }
+    if let failure { throw failure }
+    guard (200...299).contains(status) else {
+      throw transferFailure("factory_rejected", status == 404
+        ? "设备固件尚不支持手机安装出厂素材，需要先更新固件"
+        : "设备安装失败 (\(status))，请重新点选重试")
+    }
+    guard output.count <= 8192,
+          let reply = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any] else {
+      throw transferFailure("factory_invalid", "设备安装响应无效，请重新点选确认")
+    }
+    return reply
   }
 
   private func uploadAsset(assetPath: String, result: @escaping FlutterResult) {
@@ -1777,8 +1960,8 @@ struct BadgeTcpLineBuffer {
     return output
   }
 
-  private func buildPreviewData(url: URL, mime: String, crop: CropTransform) throws -> Data {
-    let image = try renderFirstFrame(url: url, mime: mime, size: BadgeConstants.previewSize, crop: crop)
+  private func buildPreviewData(url: URL, mime: String, crop: CropTransform, frameTimeMs: Int = 0) throws -> Data {
+    let image = try renderFirstFrame(url: url, mime: mime, size: BadgeConstants.previewSize, crop: crop, frameTimeMs: frameTimeMs)
     let data = NSMutableData()
     guard
       let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)
@@ -1879,16 +2062,31 @@ struct BadgeTcpLineBuffer {
     return videoComposition
   }
 
-  private func renderFirstFrame(url: URL, mime: String, size: Int, crop: CropTransform) throws -> CGImage {
+  private func renderFirstFrame(url: URL, mime: String, size: Int, crop: CropTransform, frameTimeMs: Int = 0) throws -> CGImage {
     if isVideoMime(mime) {
       let generator = AVAssetImageGenerator(asset: AVAsset(url: url))
       generator.appliesPreferredTrackTransform = true
-      let image = try generator.copyCGImage(at: .zero, actualTime: nil)
+      generator.requestedTimeToleranceBefore = .zero
+      generator.requestedTimeToleranceAfter = .zero
+      let time = CMTime(value: CMTimeValue(max(0, frameTimeMs)), timescale: 1000)
+      let image = try generator.copyCGImage(at: time, actualTime: nil)
       return renderImage(image, width: size, height: size, crop: crop)
     }
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+      throw BadgeError.message("无法读取素材")
+    }
+    var frameIndex = 0
+    if mime == "image/gif" {
+      var elapsed = 0
+      let delays = gifFrameDelaysMs(source)
+      for (index, delay) in delays.enumerated() {
+        frameIndex = index
+        elapsed += delay
+        if frameTimeMs < elapsed { break }
+      }
+    }
     guard
-      let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-      let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+      let image = CGImageSourceCreateImageAtIndex(source, frameIndex, nil)
     else {
       throw BadgeError.message("无法读取素材")
     }
@@ -2363,13 +2561,15 @@ private final class GameBluetoothController: NSObject, CBCentralManagerDelegate,
   private var sequence = 0
   private var lastStatus = ""
   private var deviceReply = false
+  private var automaticConnect = false
 
-  func connect(result: @escaping FlutterResult) {
+  func connect(automatic: Bool = false, result: @escaping FlutterResult) {
     if ready { result(info()); return }
     guard connectResult == nil else {
       result(FlutterError(code: "bluetooth_busy", message: "正在连接蓝牙，请稍候", details: nil)); return
     }
     connectResult = result
+    automaticConnect = automatic
     candidates.removeAll()
     let timeout = DispatchWorkItem { [weak self] in self?.fail("未找到可连接的 P4 蓝牙设备，请确认设备已开机") }
     connectTimeout = timeout
@@ -2393,12 +2593,14 @@ private final class GameBluetoothController: NSObject, CBCentralManagerDelegate,
     let end = DispatchWorkItem { [weak self] in
       guard let self = self else { return }
       self.central?.stopScan()
-      guard self.candidates.count == 1, let device = self.candidates.values.first else {
+      let previous = UserDefaults.standard.string(forKey: "dotloop_last_bluetooth_device")
+      let remembered = previous.flatMap { UUID(uuidString: $0) }.flatMap { self.candidates[$0] }
+      let single = self.candidates.count == 1 ? self.candidates.values.first : nil
+      guard let device = remembered ?? ((self.automaticConnect && previous != nil) ? nil : single) else {
+        if self.automaticConnect && previous != nil { self.fail("未发现上次连接的 DotLoop"); return }
         self.fail(self.candidates.isEmpty ? "未发现 DotLoop 蓝牙设备" : "附近有多个 DotLoop，请只保留目标设备开机后重试"); return
       }
-      self.peripheral = device
-      device.delegate = self
-      self.central?.connect(device)
+      self.connect(device)
     }
     scanEnd = end
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: end)
@@ -2406,6 +2608,18 @@ private final class GameBluetoothController: NSObject, CBCentralManagerDelegate,
   func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                       advertisementData: [String: Any], rssi RSSI: NSNumber) {
     candidates[peripheral.identifier] = peripheral
+    let previous = UserDefaults.standard.string(forKey: "dotloop_last_bluetooth_device")
+    if automaticConnect, previous == peripheral.identifier.uuidString, connectResult != nil {
+      scanEnd?.cancel()
+      central.stopScan()
+      connect(peripheral)
+    }
+  }
+  private func connect(_ device: CBPeripheral) {
+    guard connectResult != nil, self.peripheral == nil else { return }
+    peripheral = device
+    device.delegate = self
+    central?.connect(device)
   }
   func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
     guard self.peripheral === peripheral, connectResult != nil else { return }
@@ -2494,6 +2708,9 @@ private final class GameBluetoothController: NSObject, CBCentralManagerDelegate,
       lastStatus = text
       if connectResult != nil && characteristic.isNotifying {
         ready = true; connectTimeout?.cancel()
+        if text.contains("dc=1") {
+          UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: "dotloop_last_bluetooth_device")
+        }
         let result = connectResult; connectResult = nil
         result?(info())
       }
@@ -2906,12 +3123,37 @@ private func nativeTransferError(_ error: Error, fallback: String) -> FlutterErr
     message: ns.localizedDescription, details: nil)
 }
 
+/// Match Android's 45–95% upload range. Reaching the wire's last byte does not
+/// mean the device has checked and installed it; only the response confirms it.
+private struct RelayInstallProgress {
+  private var lastSent: Int64 = -1
+  private var lastTime: TimeInterval = -Double.infinity
+
+  mutating func update(sent: Int64, total: Int64, now: TimeInterval) -> Double? {
+    guard total > 0, sent >= 0, now.isFinite else { return nil }
+    let bounded = min(sent, total)
+    guard bounded > lastSent else { return nil }
+    guard lastSent < 0 || now - lastTime >= 0.1 || bounded == total else { return nil }
+    lastSent = bounded
+    lastTime = now
+    return 0.45 + 0.5 * Double(bounded) / Double(total)
+  }
+}
+
 private final class RelayNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
   private(set) var sentBytes: Int64 = 0
+  private let onUploadProgress: ((Int64, Int64) -> Void)?
+
+  init(onUploadProgress: ((Int64, Int64) -> Void)? = nil) {
+    self.onUploadProgress = onUploadProgress
+    super.init()
+  }
+
   func urlSession(_ session: URLSession, task: URLSessionTask,
                   didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
                   totalBytesExpectedToSend: Int64) {
     sentBytes = totalBytesSent
+    onUploadProgress?(totalBytesSent, totalBytesExpectedToSend)
   }
   func urlSession(_ session: URLSession, task: URLSessionTask,
                   willPerformHTTPRedirection response: HTTPURLResponse,
@@ -3334,4 +3576,55 @@ private func readLe32(_ data: Data, _ offset: Int) -> UInt32 {
     (UInt32(data[offset + 1]) << 8) |
     (UInt32(data[offset + 2]) << 16) |
     (UInt32(data[offset + 3]) << 24)
+}
+
+// All callbacks are on the main queue, including Flutter's read-and-consume.
+private final class DotLoopSwingMotion {
+  private let manager = CMMotionManager()
+  private var base: [Double]?, current: [Double]?
+  private var x = 0.0, y = 0.0, roll = 0.0, lastHit = 0.0
+  private var pending = 0, direction = 1, first = true
+  private var observer: NSObjectProtocol?
+  init() {
+    observer = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.stop() }
+  }
+  deinit { if let observer { NotificationCenter.default.removeObserver(observer) }; manager.stopDeviceMotionUpdates() }
+  func start() -> Bool {
+    stop(); guard manager.isDeviceMotionAvailable else { return false }
+    base=nil; current=nil; first=true; lastHit=ProcessInfo.processInfo.systemUptime
+    manager.deviceMotionUpdateInterval = 1.0/60.0
+    manager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) { [weak self] motion, _ in
+      guard let self, let motion else { return }
+      let q=motion.attitude.quaternion
+      let v=[q.w,q.x,q.y,q.z]
+      self.current=v
+      if self.base == nil { self.base=v }
+      let b=self.base!
+      let w=b[0]*v[0]+b[1]*v[1]+b[2]*v[2]+b[3]*v[3]
+      let a=b[0]*v[1]-b[1]*v[0]-b[2]*v[3]+b[3]*v[2]
+      let c=b[0]*v[2]+b[1]*v[3]-b[2]*v[0]-b[3]*v[1]
+      let d=b[0]*v[3]-b[1]*v[2]+b[2]*v[1]-b[3]*v[0]
+      let dx=2*(a*d+w*c), dy=2*(c*d-w*a), dz=1-2*(a*a+c*c)
+      let px=max(-1,min(1,atan2(dx,dz)/0.62))
+      let py=max(-1,min(1,-atan2(-dy,sqrt(dx*dx+dz*dz))/0.50))
+      let pr=max(-1,min(1,atan2(2*(w*d+a*c),1-2*(a*a+d*d))/0.9))
+      let alpha=self.first ? 1.0 : 0.55
+      self.x += (px-self.x)*alpha; self.y += (py-self.y)*alpha; self.roll += (pr-self.roll)*alpha
+      self.first=false
+      let gx=motion.rotationRate.x, gy=motion.rotationRate.y
+      if abs(gy)>0.35 { self.direction=gy<0 ? -1 : 1 }
+      let strength=max(sqrt(gx*gx+gy*gy)/2.2,abs(motion.userAcceleration.z)*9.81/3.6)
+      let now=ProcessInfo.processInfo.systemUptime
+      if strength>=1, now-self.lastHit>=0.17 {
+        self.pending=self.direction*min(1000,Int(450+strength*170)); self.lastHit=now
+      }
+    }
+    return true
+  }
+  func stop() { manager.stopDeviceMotionUpdates(); pending=0 }
+  func calibrate() { base=current; first=true; x=0; y=0; roll=0; pending=0; lastHit=ProcessInfo.processInfo.systemUptime }
+  func read() -> [String: Any] {
+    let pulse=pending; pending=0
+    return ["available": manager.isDeviceMotionActive && current != nil, "x": x, "y": y, "roll": roll, "swing": pulse]
+  }
 }

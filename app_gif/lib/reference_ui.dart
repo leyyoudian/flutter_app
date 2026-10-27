@@ -499,17 +499,20 @@ class ReferenceSettingsPage extends StatelessWidget {
         _row('语言', onLanguage, key: const ValueKey('settings-language')),
         _row('游戏', onGame, key: const ValueKey('settings-games')),
         _row(demoMode ? '退出演示模式' : '审核演示', onDemo),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
-          child: Row(
-            children: [
-              const AppText('App 版本', style: TextStyle(fontSize: 14)),
-              const Spacer(),
-              AppText(
-                version,
-                style: const TextStyle(color: referenceMuted, fontSize: 13),
-              ),
-            ],
+        InkWell(
+          key: const ValueKey('app-version'),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+            child: Row(
+              children: [
+                const AppText('App 版本', style: TextStyle(fontSize: 14)),
+                const Spacer(),
+                AppText(
+                  version,
+                  style: const TextStyle(color: referenceMuted, fontSize: 13),
+                ),
+              ],
+            ),
           ),
         ),
       ]),
@@ -558,7 +561,9 @@ class ReferenceSettingsPage extends StatelessWidget {
     bool updateAvailable = false,
   }) => InkWell(
     key: key,
-    onTap: action,
+    onTap: () {
+      action();
+    },
     child: SizedBox(
       height: 48,
       width: double.infinity,
@@ -609,6 +614,14 @@ class ReferenceBrightnessPage extends StatefulWidget {
 
 class _ReferenceBrightnessPageState extends State<ReferenceBrightnessPage> {
   late double _value = widget.initialValue.toDouble();
+  Timer? _hapticCooldown;
+
+  @override
+  void dispose() {
+    _hapticCooldown?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.black,
@@ -648,6 +661,13 @@ class _ReferenceBrightnessPageState extends State<ReferenceBrightnessPage> {
                         final previous = _value.round();
                         setState(() => _value = value);
                         if (_value.round() != previous) {
+                          if (_hapticCooldown?.isActive != true) {
+                            unawaited(HapticFeedback.selectionClick());
+                            _hapticCooldown = Timer(
+                              const Duration(milliseconds: 80),
+                              () {},
+                            );
+                          }
                           widget.onChanged(_value.round());
                         }
                       }

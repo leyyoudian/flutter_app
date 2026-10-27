@@ -35,8 +35,10 @@ workflows:
           python3 -m unittest discover -s tool -p test_ios_ci_version.py
           python3 tool/test_ios_tcp_protocol.py
           python3 tool/test_ios_reliability.py
+          python3 tool/test_ios_factory_transfer.py
+          python3 tool/test_ios_media_cover.py
           flutter analyze lib test
-          flutter test test/firmware_notification_test.dart test/reference_material_test.dart test/interaction_parity_test.dart test/app_language_test.dart test/p4_priority_ui_test.dart test/calibration_test.dart test/device_control_test.dart test/firmware_update_test.dart test/game_controller_recovery_test.dart test/ios_priority_parity_test.dart test/ios_native_static_test.dart test/ios_firmware_static_test.dart test/ios_tcp_response_test.dart test/ios_transfer_reliability_test.dart test/package_identity_test.dart test/p4_asset_target_test.dart test/preview_player_test.dart
+          flutter test
       - name: Set up App Store code signing
         script: |
           xcode-project use-profiles
@@ -80,11 +82,16 @@ workflows:
       - name: Install pods
         script: |
           find . -name "Podfile" -execdir pod install \;
-      - name: Check iOS TCP response framing
+      - name: Check shared UI and iOS feature contracts
         script: |
           set -euo pipefail
+          python3 -m unittest discover -s tool -p test_ios_ci_version.py
           python3 tool/test_ios_tcp_protocol.py
           python3 tool/test_ios_reliability.py
+          python3 tool/test_ios_factory_transfer.py
+          python3 tool/test_ios_media_cover.py
+          flutter analyze lib test
+          flutter test
       - name: Build ad-hoc iOS release IPA for sideloading
         script: |
           flutter build ios --release --no-codesign --build-name="$DOTLOOP_BUILD_NAME" --build-number="$DOTLOOP_BUILD_NUMBER"

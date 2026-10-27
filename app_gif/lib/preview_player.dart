@@ -216,13 +216,21 @@ class _FactoryVideoPreviewState extends State<FactoryVideoPreview> {
   Widget build(BuildContext context) {
     final c = _active?.controller;
     if (c == null || !c.value.isInitialized) return const SizedBox.expand();
-    return RepaintBoundary(
-      child: FittedBox(
-        fit: BoxFit.cover,
-        child: SizedBox(
-          width: c.value.size.width,
-          height: c.value.size.height,
-          child: VideoPlayer(c),
+    // Keep the static cover underneath while the decoder attaches, then fade
+    // the first frame in. This removes the one-frame black flash on the larger
+    // Sharingan/BWM files without dropping the already visible previous frame.
+    return AnimatedOpacity(
+      opacity: c.value.isInitialized ? 1 : 0,
+      duration: const Duration(milliseconds: 120),
+      curve: Curves.easeOut,
+      child: RepaintBoundary(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: c.value.size.width,
+            height: c.value.size.height,
+            child: VideoPlayer(c),
+          ),
         ),
       ),
     );

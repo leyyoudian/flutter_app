@@ -35,6 +35,12 @@ void main() {
     expect(find.text('未连接'), findsOneWidget);
     await tester.tap(find.text('完成'));
     await tester.pumpAndSettle();
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'factoryCacheRoot') {
+        throw PlatformException(code: 'cache_unavailable');
+      }
+      return null;
+    });
     await tester.ensureVisible(find.byKey(const ValueKey('settings-games')));
     await tester.tap(find.byKey(const ValueKey('settings-games')));
     await tester.pumpAndSettle();

@@ -5,6 +5,45 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
+    'BLE switches every factory family and preserves protected operations',
+    () async {
+      final sent = <String>[];
+      final control = DeviceControl((command) async {
+        sent.add(command);
+        return 'OK';
+      });
+      for (final id in [
+        'F001',
+        'F022',
+        'F023',
+        ...List.generate(10, (i) => 'S${(i + 1).toString().padLeft(3, '0')}'),
+      ]) {
+        expect(await control.invoke('switchToAsset', {'id': id}), true);
+        expect(sent.last, 'SWITCH $id');
+      }
+      final count = sent.length;
+      for (final id in ['S003', 'F003']) {
+        for (final method in ['statDeviceAsset', 'deleteDeviceAsset']) {
+          await expectLater(
+            control.invoke(method, {'id': id, 'crc32': '1234abcd'}),
+            throwsA(isA<PlatformException>()),
+          );
+        }
+        await expectLater(
+          control.invoke('switchToAsset', {'id': id, 'crc32': '1234abcd'}),
+          throwsA(isA<PlatformException>()),
+        );
+      }
+      for (final id in ['S01', 'S0003', 'S003\nAP', 'X003', 'U003']) {
+        await expectLater(
+          control.invoke('switchToAsset', {'id': id}),
+          throwsA(isA<PlatformException>()),
+        );
+      }
+      expect(sent.length, count);
+    },
+  );
+  test(
     'brightness read validates the device value and preserves zero',
     () async {
       for (final value in [0, 17, 100]) {

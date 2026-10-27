@@ -1,0 +1,525 @@
+{
+  "schemaVersion": 1,
+  "hardware": "esp32p4",
+  "catalogRevision": 4,
+  "publishedAt": "2026-10-18T18:16:28.426Z",
+  "items": [
+    {
+      "id": "F001",
+      "title": "F001",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F002",
+      "title": "F002",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F003",
+      "title": "F003",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F004",
+      "title": "F004",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F005",
+      "title": "F005",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F006",
+      "title": "F006",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F007",
+      "title": "F007",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F008",
+      "title": "F008",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F009",
+      "title": "F009",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F010",
+      "title": "F010",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F011",
+      "title": "F011",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F012",
+      "title": "F012",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F013",
+      "title": "F013",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F014",
+      "title": "F014",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F015",
+      "title": "F015",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F016",
+      "title": "F016",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F017",
+      "title": "F017",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F018",
+      "title": "F018",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F019",
+      "title": "F019",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F020",
+      "title": "F020",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F021",
+      "title": "F021",
+      "type": "split",
+      "protected": true,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.0",
+      "deviceFiles": []
+    },
+    {
+      "id": "F022",
+      "title": "F022",
+      "type": "loop",
+      "protected": false,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.44",
+      "deviceFiles": []
+    },
+    {
+      "id": "F023",
+      "title": "F023",
+      "type": "loop",
+      "protected": false,
+      "revision": 1,
+      "minFirmwareVersion": "0.1.44",
+      "deviceFiles": []
+    },
+    {
+      "id": "S001",
+      "title": "\u5199\u8f6e\u773c 1",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S001.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S001/2/device/esp32p4/first_half/S001.eb5",
+          "size": 1147731,
+          "sha256": "f10317351412fd2b89ec27380e7fbe80d54b90f7efdd20f1c96faa95f170f054"
+        },
+        {
+          "path": "second_half/S001.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S001/2/device/esp32p4/second_half/S001.eb5",
+          "size": 1063931,
+          "sha256": "0b5b9903d17887514ef1aeea3e3583e6ac1322c1167fd9266a05eb8322e465bd"
+        },
+        {
+          "path": "third_half/S001.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S001/2/device/esp32p4/third_half/S001.eb5",
+          "size": 1045328,
+          "sha256": "2f5f928f5ec18bd86cb8793d4db918110a10a1560722244e07aa27077cf0966d"
+        }
+      ]
+    },
+    {
+      "id": "S002",
+      "title": "\u5199\u8f6e\u773c 2",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S002.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S002/2/device/esp32p4/first_half/S002.eb5",
+          "size": 885769,
+          "sha256": "a63da39d99f2c222bb4b153073b505a884d02afa84f6af36f67820420e71b536"
+        },
+        {
+          "path": "second_half/S002.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S002/2/device/esp32p4/second_half/S002.eb5",
+          "size": 905494,
+          "sha256": "6a2f0adec08149bb8d195c4450f1519b6f25592c83fbe0894e9d6906612d7904"
+        },
+        {
+          "path": "third_half/S002.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S002/2/device/esp32p4/third_half/S002.eb5",
+          "size": 885002,
+          "sha256": "1c4268aef3f8f30daf8fd18c3a605bca762d6f7299f3b99e16f6903511704d26"
+        }
+      ]
+    },
+    {
+      "id": "S003",
+      "title": "\u5199\u8f6e\u773c 3",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S003.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S003/2/device/esp32p4/first_half/S003.eb5",
+          "size": 2005984,
+          "sha256": "77bfe0de7845cdd4d7cae498d35e5a3f7cec493fea3e989b2f1aef71a0a358d4"
+        },
+        {
+          "path": "second_half/S003.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S003/2/device/esp32p4/second_half/S003.eb5",
+          "size": 2138606,
+          "sha256": "ff96f022f39b5def31fd05ff5812b675375908bece6263a4f2b02ce81ea86c91"
+        },
+        {
+          "path": "third_half/S003.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S003/2/device/esp32p4/third_half/S003.eb5",
+          "size": 2115549,
+          "sha256": "cbe322cc868e752ccb3012ae29de6e4f1f34642db7d15104d68af8c5d232ddcb"
+        }
+      ]
+    },
+    {
+      "id": "S004",
+      "title": "\u5199\u8f6e\u773c 4",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S004.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S004/2/device/esp32p4/first_half/S004.eb5",
+          "size": 1930330,
+          "sha256": "933bf2db39e9136a1f702ad21deb440c320b4a3cafcbdedffe3587fef7c11651"
+        },
+        {
+          "path": "second_half/S004.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S004/2/device/esp32p4/second_half/S004.eb5",
+          "size": 1984109,
+          "sha256": "c91208383b3079ffe1f4fab2a9b3457d9d80b3b85df5b00fdf265a1363b86c8f"
+        },
+        {
+          "path": "third_half/S004.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S004/2/device/esp32p4/third_half/S004.eb5",
+          "size": 2095427,
+          "sha256": "0a6cdb74a1fa61be7c0d89e271a5489628ffae23ad9ac4b5718c87f63eebcaf5"
+        }
+      ]
+    },
+    {
+      "id": "S005",
+      "title": "\u5199\u8f6e\u773c 5",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S005.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S005/2/device/esp32p4/first_half/S005.eb5",
+          "size": 1787440,
+          "sha256": "1e8e5e8911b50221489896d7daa529761386738d620aa495a9943e88affaf282"
+        },
+        {
+          "path": "second_half/S005.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S005/2/device/esp32p4/second_half/S005.eb5",
+          "size": 1981571,
+          "sha256": "f6c458ecfd6f8159b317a22c18edb2adce598c098047628aaa2bc901c851cb45"
+        },
+        {
+          "path": "third_half/S005.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S005/2/device/esp32p4/third_half/S005.eb5",
+          "size": 1819419,
+          "sha256": "a6da915643f5cbfd983c6a6bd1f36c9d3bbe5ad5fd78fefd915cfa0f93959398"
+        }
+      ]
+    },
+    {
+      "id": "S006",
+      "title": "\u5199\u8f6e\u773c 6",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S006.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S006/2/device/esp32p4/first_half/S006.eb5",
+          "size": 1229959,
+          "sha256": "804973b39ad687677930d668b1be3567d498ae57b177b026670c68d525cf9693"
+        },
+        {
+          "path": "second_half/S006.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S006/2/device/esp32p4/second_half/S006.eb5",
+          "size": 1329241,
+          "sha256": "040c0be2aa6ce2d44568e1e3cef1b0be8c4c3fb5e8f9187bcb3dfc74d34d2748"
+        },
+        {
+          "path": "third_half/S006.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S006/2/device/esp32p4/third_half/S006.eb5",
+          "size": 1242887,
+          "sha256": "72f75ce137a819ca9b49d4356d0af205e81723cfb86df78fe1c820c592a36e7d"
+        }
+      ]
+    },
+    {
+      "id": "S007",
+      "title": "\u5199\u8f6e\u773c 7",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S007.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S007/2/device/esp32p4/first_half/S007.eb5",
+          "size": 1182214,
+          "sha256": "0accbbe871a9391977c45e6d5bb87c9509d734f4fb5e9edb3b5baa8ef74429d9"
+        },
+        {
+          "path": "second_half/S007.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S007/2/device/esp32p4/second_half/S007.eb5",
+          "size": 1281520,
+          "sha256": "276c59b3759be80004b4cd02122817675ad8511b3ecc29856c9733e8b365109e"
+        },
+        {
+          "path": "third_half/S007.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S007/2/device/esp32p4/third_half/S007.eb5",
+          "size": 1041261,
+          "sha256": "549d0a9d5bd3a0d0be378df72a243554fc58a83798ed8f77c2b0e52a16772893"
+        }
+      ]
+    },
+    {
+      "id": "S008",
+      "title": "\u5199\u8f6e\u773c 8",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S008.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S008/2/device/esp32p4/first_half/S008.eb5",
+          "size": 1500360,
+          "sha256": "e40712013efb582da45e9b95022583d01653ef30bae0f2361c98aea4a28fc92c"
+        },
+        {
+          "path": "second_half/S008.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S008/2/device/esp32p4/second_half/S008.eb5",
+          "size": 1660588,
+          "sha256": "ed5bb860688661ff38a3b31b3f7be1444b33e82e9e4c8b3971b8bce759b2249b"
+        },
+        {
+          "path": "third_half/S008.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S008/2/device/esp32p4/third_half/S008.eb5",
+          "size": 1549920,
+          "sha256": "56051bd89c0c4cbd35429d74bca55c1b17fd084b4c2f1b82f4d8561f5d546433"
+        }
+      ]
+    },
+    {
+      "id": "S009",
+      "title": "\u5199\u8f6e\u773c 9",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S009.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S009/2/device/esp32p4/first_half/S009.eb5",
+          "size": 2478093,
+          "sha256": "827ef12b4f160fb9653a25217b80840e277ad10e262ac137d630a487d2ce164a"
+        },
+        {
+          "path": "second_half/S009.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S009/2/device/esp32p4/second_half/S009.eb5",
+          "size": 2777585,
+          "sha256": "b8939ef16c2ecf0c5e7337fbf91cbbedc81802a8f71ed94f4757b96aadd43dc2"
+        },
+        {
+          "path": "third_half/S009.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S009/2/device/esp32p4/third_half/S009.eb5",
+          "size": 2527499,
+          "sha256": "5f476cd0a6f3dde0b0252ddbfabee76419a8eed326909868f86aa920bfef3a6e"
+        }
+      ]
+    },
+    {
+      "id": "S010",
+      "title": "\u5199\u8f6e\u773c 10",
+      "type": "split",
+      "protected": true,
+      "revision": 2,
+      "minFirmwareVersion": "0.2.6",
+      "deviceFiles": [
+        {
+          "path": "first_half/S010.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S010/2/device/esp32p4/first_half/S010.eb5",
+          "size": 2793923,
+          "sha256": "e1021fca0fda2a3e99e98109773d8abc5c3c91137bdcfdd96c039e8d40003a88"
+        },
+        {
+          "path": "second_half/S010.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S010/2/device/esp32p4/second_half/S010.eb5",
+          "size": 3071532,
+          "sha256": "3d17a06561adecf210c499368aeb1fa297993224cb4b0b7b5e1796a1ee1b12f4"
+        },
+        {
+          "path": "third_half/S010.eb5",
+          "hardware": "esp32p4",
+          "url": "/downloads/factory/S010/2/device/esp32p4/third_half/S010.eb5",
+          "size": 2913895,
+          "sha256": "8b1b931f9121d8b7e6557d44da419815c2f383c08c4278fa89ad5c4a541455fc"
+        }
+      ]
+    }
+  ]
+}

@@ -26,26 +26,33 @@ class GameBluetoothController(private val context: Context) {
     private var ready = false
     private var lastStatus = ""
     private var deviceReply = false
+    private var automaticConnect = false
+    private val preferences = context.getSharedPreferences("dotloop_bluetooth", Context.MODE_PRIVATE)
     private val candidates = linkedMapOf<String, BluetoothDevice>()
     private val connectTimeout = Runnable { fail("未找到可连接的 P4 蓝牙设备，请确认设备已开机且未被其他手机占用") }
     private val commandTimeout = Runnable { commandError("设备未确认游戏指令，请重试") }
     private val finishScan = Runnable {
         stopScan()
-        if (candidates.size != 1) fail(if (candidates.isEmpty()) "未发现 DotLoop 蓝牙设备" else "附近有多个 DotLoop，请只保留目标设备开机后重试")
-        else gatt = candidates.values.single().connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        val previous = preferences.getString("last_device_address", null)
+        val target = previous?.let { candidates[it] }
+            ?: if (automaticConnect && previous != null) null else candidates.values.singleOrNull()
+        if (target == null) fail(if (automaticConnect && previous != null) "未发现上次连接的 DotLoop" else if (candidates.isEmpty()) "未发现 DotLoop 蓝牙设备" else "附近有多个 DotLoop，请只保留目标设备开机后重试")
+        else gatt = target.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
     }
 
-    fun connect(result: MethodChannel.Result) {
+    fun connect(result: MethodChannel.Result, automatic: Boolean = false) {
         if (ready && gatt != null) { result.success(info()); return }
         if (connectResult != null) { result.error("bluetooth_busy", "正在连接蓝牙，请稍候", null); return }
         val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (adapter?.isEnabled != true) { result.error("bluetooth_off", "请先打开手机蓝牙", null); return }
         connectResult = result
+        automaticConnect = automatic
         candidates.clear()
         scanner = adapter.bluetoothLeScanner
         main.postDelayed(connectTimeout, 15000)
         try {
-            scanner?.startScan(null, ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCallback)
+            val filter = ScanFilter.Builder().setServiceUuid(android.os.ParcelUuid(serviceId)).build()
+            scanner?.startScan(listOf(filter), ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCallback)
             main.postDelayed(finishScan, 2500)
         } catch (error: Exception) { fail(error.message ?: "无法启动蓝牙扫描") }
     }
@@ -96,6 +103,9 @@ class GameBluetoothController(private val context: Context) {
     fun status(result: MethodChannel.Result) {
         if (ready) result.success(lastStatus) else result.error("bluetooth_disconnected", "蓝牙已断开", null)
     }
+    fun setInteractive(active: Boolean) {
+        runCatching { gatt?.requestConnectionPriority(if (active) BluetoothGatt.CONNECTION_PRIORITY_HIGH else BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
+    }
     fun connectionInfo(result: MethodChannel.Result) { result.success(if (ready) info() else mapOf("connected" to false)) }
     private fun info() = mapOf("connected" to true, "name" to "DotLoop", "address" to gatt?.device?.address,
         "status" to lastStatus, "transport" to "bluetooth")
@@ -116,7 +126,14 @@ class GameBluetoothController(private val context: Context) {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (result.scanRecord?.serviceUuids?.any { it.uuid == serviceId } == true) {
-                main.post { candidates[result.device.address] = result.device }
+                main.post {
+                    candidates[result.device.address] = result.device
+                    val remembered = preferences.getString("last_device_address", null)
+                    if (automaticConnect && remembered == result.device.address && connectResult != null && gatt == null) {
+                        stopScan()
+                        gatt = result.device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+                    }
+                }
             }
         }
         override fun onScanFailed(errorCode: Int) { main.post { fail("蓝牙扫描失败：$errorCode") } }
@@ -163,6 +180,7 @@ class GameBluetoothController(private val context: Context) {
             val text = value.toString(Charsets.UTF_8)
             if (status != BluetoothGatt.GATT_SUCCESS || !text.contains("hardware=esp32p4")) { fail("蓝牙设备身份校验失败"); return@post }
             lastStatus = text; ready = true; main.removeCallbacks(connectTimeout)
+            if (text.contains("dc=1")) preferences.edit().putString("last_device_address", active.device.address).apply()
             connectResult?.success(info()); connectResult = null
         } }
         @Deprecated("Deprecated in Java")

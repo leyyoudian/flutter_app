@@ -484,8 +484,9 @@ class _AlignmentDialPainter extends CustomPainter {
     final center = size.center(Offset.zero);
     final radius = math.min(size.width, size.height) * 0.43;
     final tickPaint = Paint()
+      ..isAntiAlias = true
       ..strokeCap = StrokeCap.round
-      ..strokeWidth = 2;
+      ..strokeWidth = math.max(1.0, size.shortestSide / 220);
     for (var index = 0; index < 120; index++) {
       final angle = index * math.pi * 2 / 120 - math.pi / 2;
       final major = index % 10 == 0;
@@ -502,11 +503,18 @@ class _AlignmentDialPainter extends CustomPainter {
     final handEnd =
         center + Offset(math.cos(angle), math.sin(angle)) * (radius * 0.58);
     final handPaint = Paint()
+      ..isAntiAlias = true
       ..color = Colors.white.withValues(alpha: 0.30)
-      ..strokeWidth = 4
+      ..strokeWidth = math.max(2.5, size.shortestSide / 70)
       ..strokeCap = StrokeCap.round;
     canvas.drawLine(center, handEnd, handPaint);
-    canvas.drawCircle(handEnd, 7, Paint()..color = Colors.white);
+    canvas.drawCircle(
+      handEnd,
+      math.max(5.5, size.shortestSide / 40),
+      Paint()
+        ..isAntiAlias = true
+        ..color = Colors.white,
+    );
   }
 
   @override

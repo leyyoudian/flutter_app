@@ -21,17 +21,26 @@ class _PackBundle extends CachingAssetBundle {
 }
 
 void main() {
-  test('Faceit contains exactly 8 through 18 and Sharingan stays empty', () {
-    expect(factoryPacks.map((pack) => pack.name), ['Sharingan', 'Faceit']);
-    expect(factoryPacks.first.materialIds, isEmpty);
-    expect(
-      factoryPacks.last.materialIds,
-      List.generate(
-        11,
-        (index) => 'F${(index + 8).toString().padLeft(3, '0')}',
-      ),
-    );
-  });
+  test(
+    'Sharingan contains the ten backpack animations and Faceit contains 8 through 18',
+    () {
+      expect(factoryPacks.map((pack) => pack.name), ['Sharingan', 'Faceit']);
+      expect(
+        factoryPacks.first.materialIds,
+        List.generate(
+          10,
+          (index) => 'S${(index + 1).toString().padLeft(3, '0')}',
+        ),
+      );
+      expect(
+        factoryPacks.last.materialIds,
+        List.generate(
+          11,
+          (index) => 'F${(index + 8).toString().padLeft(3, '0')}',
+        ),
+      );
+    },
+  );
 
   testWidgets('pack names stay English in all app languages', (tester) async {
     addTearDown(() => LanguageSettings.current.value = AppLanguage.system);
@@ -53,6 +62,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('Sharingan'), findsOneWidget);
       expect(find.text('Faceit'), findsOneWidget);
+      expect(find.byKey(const ValueKey('custom-pack-add')), findsNothing);
       expect(tester.takeException(), isNull);
     }
   });
@@ -99,9 +109,28 @@ void main() {
       expect(find.byKey(const ValueKey('fac_F008')), findsNothing);
       await tester.tap(find.text('Sharingan'));
       await tester.pumpAndSettle();
-      expect(find.byKey(const ValueKey('fac_F003')), findsNothing);
+      expect(find.byKey(const ValueKey('fac_S001')), findsOneWidget);
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('fac_S010')),
+        360,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.byKey(const ValueKey('fac_S008')), findsOneWidget);
+      expect(find.byKey(const ValueKey('fac_S009')), findsOneWidget);
+      expect(find.byKey(const ValueKey('fac_S010')), findsOneWidget);
       expect(find.byKey(const ValueKey('fac_F008')), findsNothing);
-      expect(find.text('Faceit'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('fac_S010')));
+      await tester.pumpAndSettle();
+      final sharinganPreview = tester.widget<StaticMaterialPreview>(
+        find.descendant(
+          of: find.byKey(const ValueKey('fixed-home-preview')),
+          matching: find.byType(StaticMaterialPreview),
+        ),
+      );
+      expect(
+        (sharinganPreview.image as AssetImage).assetName,
+        'assets/sharingan/S010.png',
+      );
     },
     variant: platforms,
   );

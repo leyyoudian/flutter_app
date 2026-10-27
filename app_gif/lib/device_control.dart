@@ -50,7 +50,7 @@ class DeviceControl {
         }
         return match.group(1)!;
       }
-      if (id == null || !RegExp(r'^[FU][0-9]{3}$').hasMatch(id)) {
+      if (id == null || !RegExp(r'^[FSU][0-9]{3}$').hasMatch(id)) {
         _invalid();
       }
       if (id.startsWith('U')) {
