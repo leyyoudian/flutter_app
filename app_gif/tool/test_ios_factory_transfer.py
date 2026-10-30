@@ -94,7 +94,7 @@ let gameArgs: [String: Any] = ["assetPath": gameFile.path, "id": "fixture_game",
 check((install(FactoryHarness(host + "/game"), gameArgs, game: true) as? [String: Any])?["installed"] as? Bool == true,
   "Generic game transport uses the same installation pipeline")
 
-var meter = RelayInstallProgress()
+private var meter = RelayInstallProgress()
 check(meter.update(sent: 10, total: 0, now: 0) == nil, "Unknown length ignored")
 check(meter.update(sent: -1, total: 1000, now: 0) == nil, "Negative count ignored")
 check(meter.update(sent: 0, total: 1000, now: 0) == 0.45, "Upload begins at 45 percent")
