@@ -383,6 +383,34 @@ void main() {
   );
 
   testWidgets(
+    'still image saves a cover with the same framing as the device package',
+    (tester) async {
+      final calls = <MethodCall>[];
+      await openVideoMaker(tester, calls, mime: 'image/png');
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      tester
+          .widget<Slider>(find.byKey(const ValueKey('maker-zoom-slider')))
+          .onChanged!(.5);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('maker-cover-mode')), findsNothing);
+      await tester.ensureVisible(find.byKey(const ValueKey('maker-save')));
+      await tester.tap(find.byKey(const ValueKey('maker-save')));
+      await tester.pumpAndSettle();
+      final coverCalls = calls.where((c) => c.method == 'videoFramePreview');
+      expect(coverCalls, isNotEmpty);
+      final args = coverCalls.last.arguments as Map;
+      expect(args['cropScale'], .5);
+      final entry =
+          (calls.lastWhere((c) => c.method == 'saveHistory').arguments as List)
+                  .single
+              as Map;
+      expect(entry['previewPath'], '/app/material_covers/selected.png');
+      expect(entry['previewCropApplied'], isTrue);
+    },
+    variant: platforms,
+  );
+
+  testWidgets(
     'cover save failure does not report success and can be retried',
     (tester) async {
       final calls = <MethodCall>[];

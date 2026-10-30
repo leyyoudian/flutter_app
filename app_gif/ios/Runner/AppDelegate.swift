@@ -425,6 +425,12 @@ struct BadgeTcpLineBuffer {
       } catch {
         result(FlutterError(code: "factory_cache_failed", message: error.localizedDescription, details: nil))
       }
+    case "gameCacheRoot":
+      do {
+        result(try userGameDirectory().path)
+      } catch {
+        result(FlutterError(code: "game_cache_failed", message: error.localizedDescription, details: nil))
+      }
     case "switchToAsset":
       guard let id = args["id"] as? String, !id.isEmpty else {
         result(FlutterError(code: "bad_id", message: "素材ID为空", details: nil))
@@ -2328,6 +2334,13 @@ struct BadgeTcpLineBuffer {
   private func cacheDirectory(_ name: String) throws -> URL {
     let base = try assetRootDirectory()
     let directory = base.appendingPathComponent(name, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+  }
+
+  private func userGameDirectory() throws -> URL {
+    let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent("badge_user/game_data", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     return directory
   }

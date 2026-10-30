@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:app_gif/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'repository_firmware.dart';
+
 void main() {
   test(
     'factory manifest maps only F006 and F007 mutual third-half previews',
@@ -106,19 +108,20 @@ void main() {
   });
 
   test(
-    'esp32 switch uses target-named third-half for F006/F007 mutual switches only',
+    'P4 switch resolves target-named third-half for F006/F007 mutual switches',
     () {
       final source = latin1.decode(
-        File(
-          '../ESP32-S3-LCD-2.8C-Test/main/Badge/BadgeAnimMgr.c',
-        ).readAsBytesSync(),
+        repositoryFirmwareFile('main/Badge/BadgeAnimMgr.c').readAsBytesSync(),
       );
 
       expect(source, contains('is_factory_six_seven_pair'));
       expect(
         source,
-        contains(
-          'snprintf(third_path, sizeof(third_path), BADGE_ANIM_FOLDER_THIRD "/%s.eb4", new_id);',
+        anyOf(
+          contains('resolve_asset_path(BADGE_ANIM_FOLDER_THIRD, new_id,'),
+          contains(
+            'snprintf(third_path, sizeof(third_path), BADGE_ANIM_FOLDER_THIRD "/%s.eb4", new_id);',
+          ),
         ),
       );
       expect(source, isNot(contains('F006->F007: skipping exit')));

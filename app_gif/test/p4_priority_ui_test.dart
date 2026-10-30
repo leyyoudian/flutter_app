@@ -15,7 +15,7 @@ void main() {
         binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null),
   );
 
-  testWidgets('settings opens device status and a separate game card library', (
+  testWidgets('settings opens device status and the original game controller', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(400, 900));
@@ -35,7 +35,9 @@ void main() {
     expect(find.text('未连接'), findsOneWidget);
     await tester.tap(find.text('完成'));
     await tester.pumpAndSettle();
-    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (call) async {
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+      call,
+    ) async {
       if (call.method == 'factoryCacheRoot') {
         throw PlatformException(code: 'cache_unavailable');
       }
@@ -44,7 +46,8 @@ void main() {
     await tester.ensureVisible(find.byKey(const ValueKey('settings-games')));
     await tester.tap(find.byKey(const ValueKey('settings-games')));
     await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('game-card-flappy-bird')), findsOneWidget);
+    expect(find.byType(FlyBirdPage), findsOneWidget);
+    expect(find.byKey(const ValueKey('game-card-flappy-bird')), findsNothing);
     expect(find.text('Flappy Bird'), findsOneWidget);
   });
 
@@ -116,12 +119,19 @@ void main() {
     await tester.pumpAndSettle();
     final search = tester.widget<TextField>(find.byType(TextField));
     expect(search.decoration?.hintText, 'Search by name or ID');
-      for (final language in [AppLanguage.traditionalChinese, AppLanguage.japanese, AppLanguage.russian]) {
-        LanguageSettings.current.value = language;
-        await tester.pumpAndSettle();
-        expect(find.byTooltip(tr('设置')), findsOneWidget);
-        expect(tester.widget<TextField>(find.byType(TextField)).decoration?.hintText, tr('搜索名称或编号'));
-        expect(tester.takeException(), isNull);
-      }
+    for (final language in [
+      AppLanguage.traditionalChinese,
+      AppLanguage.japanese,
+      AppLanguage.russian,
+    ]) {
+      LanguageSettings.current.value = language;
+      await tester.pumpAndSettle();
+      expect(find.byTooltip(tr('设置')), findsOneWidget);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).decoration?.hintText,
+        tr('搜索名称或编号'),
+      );
+      expect(tester.takeException(), isNull);
+    }
   });
 }

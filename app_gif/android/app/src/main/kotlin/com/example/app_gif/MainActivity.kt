@@ -597,6 +597,9 @@ class MainActivity : FlutterActivity() {
             "factoryCacheRoot" -> {
                 result.success(persistentAssetDirectory("factory_catalog").absolutePath)
             }
+            "gameCacheRoot" -> {
+                result.success(File(filesDir, "badge_user/game_data").apply { mkdirs() }.absolutePath)
+            }
             "switchToAsset" -> {
                 val id = call.argument<String>("id")
                 if (id.isNullOrBlank()) {

@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
+import 'repository_firmware.dart';
+
 void main() {
   test('app exposes reviewer demo mode and simulates device workflows', () {
     final source = File('lib/main.dart').readAsStringSync();
@@ -53,21 +55,24 @@ void main() {
     final source = File('lib/main.dart').readAsStringSync();
     final pubspec = File('pubspec.yaml').readAsStringSync();
 
-    final packageVersion = RegExp(r'^version:\s*(\d+\.\d+\.\d+)\+\d+', multiLine: true)
-        .firstMatch(pubspec)?.group(1);
+    final packageVersion = RegExp(
+      r'^version:\s*(\d+\.\d+\.\d+)\+\d+',
+      multiLine: true,
+    ).firstMatch(pubspec)?.group(1);
     expect(packageVersion, isNotNull);
     expect(source, contains("static const _appVersion = '$packageVersion';"));
   });
 
-  test('firmware project version is aligned with OTA release version', () {
-    final cmake = File(
-      '../ESP32-S3-LCD-2.8C-Test/CMakeLists.txt',
-    ).readAsStringSync();
-    final mainCmake = File(
-      '../ESP32-S3-LCD-2.8C-Test/main/CMakeLists.txt',
+  test('P4 firmware injects its project version into the device build', () {
+    final cmake = repositoryFirmwareFile('CMakeLists.txt').readAsStringSync();
+    final mainCmake = repositoryFirmwareFile(
+      'main/CMakeLists.txt',
     ).readAsStringSync();
 
-    expect(cmake, contains('set(PROJECT_VER "0.1.53")'));
+    final projectVersion = RegExp(
+      r'set\(PROJECT_VER\s+"(\d+\.\d+\.\d+)"\)',
+    ).firstMatch(cmake)?.group(1);
+    expect(projectVersion, isNotNull);
     expect(
       mainCmake,
       contains(
@@ -81,7 +86,10 @@ void main() {
     () {
       final source = File('lib/main.dart').readAsStringSync();
       final saveStart = source.indexOf('Future<void> _saveMakerAsset()');
-      final submitAtSave = source.indexOf('_submitAssetForReview(asset)', saveStart);
+      final submitAtSave = source.indexOf(
+        '_submitAssetForReview(asset)',
+        saveStart,
+      );
       final insertHistory = source.indexOf(
         '_history.insert(0, entry)',
         submitAtSave,
@@ -143,8 +151,8 @@ void main() {
   });
 
   test('firmware holds single-frame assets instead of loop-rendering them', () {
-    final display = File(
-      '../ESP32-S3-LCD-2.8C-Test/main/Badge/BadgeDisplay.c',
+    final display = repositoryFirmwareFile(
+      'main/Badge/BadgeDisplay.c',
     ).readAsStringSync();
 
     expect(display, contains('BADGE_PLAYER_YIELD_EVERY_FRAMES'));

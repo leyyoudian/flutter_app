@@ -110,6 +110,14 @@ void main() {
               'reviewStatus': 'approved',
               'fps': 80,
             };
+          case 'videoFramePreview':
+            return {
+              'previewBytes': File(
+                'test/fixtures/static_preview.gif',
+              ).readAsBytesSync(),
+            };
+          case 'saveMaterialCover':
+            return '/app/material_covers/sample.png';
           case 'loadHistory':
           case 'loadPendingDeviceDeletes':
             return <dynamic>[];

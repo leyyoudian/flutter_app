@@ -22,7 +22,6 @@ import 'calibration.dart';
 import 'reference_ui.dart';
 import 'app_language.dart';
 import 'fly_bird.dart';
-import 'remote_games.dart';
 import 'firmware_update.dart';
 import 'p4_asset_target.dart';
 import 'preview_player.dart';
@@ -112,7 +111,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.50';
+  static const _appVersion = '1.0.53';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -1470,14 +1469,14 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           }
           final actualFps = resolveServerTranscodeFps(transcodeResult['fps']);
           var previewPath = _readNullableString(transcodeResult['previewPath']);
-          if (_supportsCoverFrames(media.mime)) {
-            previewPath = await _saveMakerAnimatedCover(media, _cropTransform);
+          if (_supportsMaterialCover(media.mime)) {
+            previewPath = await _saveMakerCover(media, _cropTransform);
           }
           if (!mounted) return;
           final asset = PreparedAsset(
             assetPath: '',
             previewPath: previewPath,
-            previewCropApplied: _supportsCoverFrames(media.mime),
+            previewCropApplied: _supportsMaterialCover(media.mime),
             animatedPreviewPath: media.animatedPreviewPath,
             sourceUri: media.uri,
             mime: media.mime,
@@ -1547,8 +1546,8 @@ class _BadgeHomePageState extends State<BadgeHomePage>
           return;
         }
       }
-      if (_supportsCoverFrames(media.mime)) {
-        final coverPath = await _saveMakerAnimatedCover(media, _cropTransform);
+      if (_supportsMaterialCover(media.mime)) {
+        final coverPath = await _saveMakerCover(media, _cropTransform);
         asset = asset.copyWith(
           previewPath: coverPath,
           previewCropApplied: true,
@@ -1598,7 +1597,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     }
   }
 
-  Future<String?> _saveMakerAnimatedCover(
+  Future<String?> _saveMakerCover(
     SelectedMedia media,
     CropTransform transform,
   ) async {
@@ -3106,14 +3105,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
         demoMode: _demoMode,
         onDemo: () => _demoMode ? _exitDemoMode() : _enterDemoMode(),
         onLanguage: _openLanguage,
-        onGame: () => Navigator.of(context).push<void>(
-          MaterialPageRoute(
-            builder: (_) => RemoteGamesPage(
-              backendBases: _backendBases,
-              onFlyBird: () => unawaited(_openGame()),
-            ),
-          ),
-        ),
+        onGame: () => unawaited(_openGame()),
         onDeviceStatus: _openDeviceStatus,
       ),
     ];
@@ -4360,9 +4352,11 @@ class _HistoryGridTile extends StatelessWidget {
               active: active,
               entry: entry,
               previewPath: previewPath,
-              transform: entry.previewCropApplied && entry.previewPath != null
-                  ? const CropTransform()
-                  : entry.cropTransform,
+              transform: _savedPreviewTransform(
+                previewPath: entry.previewPath,
+                cropApplied: entry.previewCropApplied,
+                transform: entry.cropTransform,
+              ),
             ),
             if (overlayColor != null) ColoredBox(color: overlayColor),
             if (reviewLabel != null)
@@ -4733,7 +4727,16 @@ class _PreviewDial extends StatelessWidget {
             if (media?.previewBytes != null)
               StaticMaterialPreview(image: MemoryImage(media!.previewBytes!))
             else if (_hasPreviewPath(asset?.previewPath))
-              StaticMaterialPreview(image: FileImage(File(asset!.previewPath!)))
+              _CropTransformView(
+                transform: _savedPreviewTransform(
+                  previewPath: asset!.previewPath,
+                  cropApplied: asset!.previewCropApplied,
+                  transform: transform,
+                ),
+                child: StaticMaterialPreview(
+                  image: FileImage(File(asset!.previewPath!)),
+                ),
+              )
             else if (_hasPreviewPath(media?.animatedPreviewPath))
               StaticMaterialPreview(
                 image: FileImage(File(media!.animatedPreviewPath!)),
@@ -5408,6 +5411,23 @@ Widget _blackPreviewFallback(
 
 bool _supportsCoverFrames(String mime) =>
     _isVideoMime(mime) || mime == 'image/gif';
+
+bool _supportsMaterialCover(String mime) =>
+    _isVideoMime(mime) || mime.startsWith('image/');
+
+CropTransform _savedPreviewTransform({
+  required String? previewPath,
+  required bool cropApplied,
+  required CropTransform transform,
+}) {
+  // Both native encoders render PNG thumbnails on the final square canvas.
+  // Older histories lack cropApplied; applying the saved crop to those PNGs
+  // again changes their framing. Original GIF fallbacks still need the crop.
+  final rendered =
+      _hasPreviewPath(previewPath) &&
+      (cropApplied || previewPath!.toLowerCase().endsWith('.png'));
+  return rendered ? const CropTransform() : transform;
+}
 
 bool _isVideoMime(String mime) => mime.toLowerCase().startsWith('video/');
 
