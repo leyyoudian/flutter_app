@@ -111,7 +111,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.54';
+  static const _appVersion = '1.0.55';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -737,7 +737,9 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       final switched = await _invokeNative<dynamic>('switchToAsset', {
         'id': anim.id,
       });
-      if (switched != true) throw const FormatException('素材已安装，请重新点选动画');
+      if (!switchResultAccepted(switched)) {
+        throw const FormatException('设备已确认安装，但未能找到或切换素材，请检查设备固件');
+      }
       debugPrint('DotLoop INSTALL ${anim.id}: installed and switched');
       debugPrint(
         'FACTORY ${anim.id} UI complete ${installWatch.elapsedMilliseconds}ms',
@@ -745,7 +747,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
       if (mounted) {
         setState(() {
           _uploadProgress = 1;
-          _status = '已切换';
+          _status = switched is Map ? '切换已提交' : '已切换';
         });
       }
     } catch (error) {

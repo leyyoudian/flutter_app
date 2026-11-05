@@ -65,3 +65,6 @@ bool historyEntriesMatch({
 bool switchResultNeedsUpload(Object? result) {
   return result is Map && result['needsUpload'] == true;
 }
+
+bool switchResultAccepted(Object? result) =>
+    result == true || (result is Map && result['pending'] == true);
