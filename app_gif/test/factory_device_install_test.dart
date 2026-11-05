@@ -6,6 +6,20 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:app_gif/factory_device_install.dart';
 
 void main() {
+  test('F024 loop install accepts one body file without an entrance clip', () {
+    expect(
+      () => FactoryDeviceInstall.validateFiles('F024', 'loop', [
+        {
+          'path': 'factory_loop/F024.eb5',
+          'hardware': 'esp32p4',
+          'size': 9581680,
+          'sha256': 'c' * 64,
+        },
+      ]),
+      returnsNormally,
+    );
+  });
+
   test('loop install accepts its matching one-time entrance clip', () {
     final pair = ['factory_loop', 'loop_intro']
         .map(
