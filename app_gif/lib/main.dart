@@ -111,7 +111,7 @@ class _BadgeHomePageState extends State<BadgeHomePage>
     'ESP_BAJI_API_BASE',
     defaultValue: '',
   );
-  static const _appVersion = '1.0.55';
+  static const _appVersion = '1.0.56';
 
   final List<BadgeDevice> _devices = [];
   final List<HistoryEntry> _history = [];
@@ -2098,13 +2098,13 @@ class _BadgeHomePageState extends State<BadgeHomePage>
               _firmwareCheckedAt = DateTime.now();
             });
           },
-          prepareTransfer: () async {
-            await _channel.invokeMethod<void>('gameCommand', {
+          prepareTransfer: () => prepareFirmwareTransfer(
+            stopGame: () => _channel.invokeMethod<void>('gameCommand', {
               'action': 'stop',
-            });
-            await _invokeNative<void>('cancelCalibration');
-            return _prepareDeviceTransfer(firmware: true);
-          },
+            }),
+            cancelCalibration: () => _invokeNative<void>('cancelCalibration'),
+            connectTransfer: () => _prepareDeviceTransfer(firmware: true),
+          ),
           setBusy: (busy) {
             if (mounted) setState(() => _uploading = busy);
           },

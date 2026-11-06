@@ -6,6 +6,27 @@ import 'package:flutter/services.dart';
 import 'backend_failover.dart';
 import 'app_language.dart';
 
+/// The released 0.2.8 disabled game commands, including stop. Only that
+/// explicit unsupported response is optional; later transfer guards still run.
+Future<bool> prepareFirmwareTransfer({
+  required Future<void> Function() stopGame,
+  required Future<void> Function() cancelCalibration,
+  required Future<bool> Function() connectTransfer,
+}) async {
+  try {
+    await stopGame();
+  } on PlatformException catch (error) {
+    final message = error.message?.trim() ?? '';
+    final unsupported =
+        error.code == 'game_rejected' &&
+        (message == '106' ||
+            RegExp(r'(?:^|[^A-Za-z0-9])GB:[0-9]+:ERR:106$').hasMatch(message));
+    if (!unsupported) rethrow;
+  }
+  await cancelCalibration();
+  return connectTransfer();
+}
+
 /// Firmware releases use board-specific channels; a P4 chip alone is not enough.
 class FirmwareManifest {
   FirmwareManifest.fromMap(Map<dynamic, dynamic> map, String target)
